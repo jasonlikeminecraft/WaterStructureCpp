@@ -1,0 +1,14 @@
+github.com/TriM-Organization/bedrock-world-operator v1.4.0 h1:3XCdg4h4MiRLHVit9a7wbFs9jVvEQrw4UUv1Z86hj8k=
+github.com/TriM-Organization/bedrock-world-operator v1.4.0/go.mod h1:o8KPtoPwyu6BaUilaNXzzLll6+bOixeWG2qWrZicZhc=
+github.com/Yeah114/blocks v0.0.0-20251025181709-54ab0b294dfe h1:tM1/at8t3o9pAO4Zqnn5TsUXY6tWGY5BYQXWCBtkubc=
+github.com/Yeah114/blocks v0.0.0-20251025181709-54ab0b294dfe/go.mod h1:Wc2E9Z5NMOPEsGcGx+IAGoSmTWwk7INO1U1WEzNyJOY=
+github.com/andybalholm/brotli v1.1.1 h1:PR2pgnyFznKEugtsUo0xLdDop5SKXd5Qf5ysW+7XdTA=
+github.com/andybalholm/brotli v1.1.1/go.mod h1:05ib4cKhjx3OQYUY22hTVd34Bc8upXjOLL2rKwwZBoA=
+github.com/go-gl/mathgl v1.2.0 h1:v2eOj/y1B2afDxF6URV1qCYmo1KW08lAMtTbOn3KXCY=
+github.com/go-gl/mathgl v1.2.0/go.mod h1:pf9+b5J3LFP7iZ4XXaVzZrCle0Q/vNpB/vDe5+3ulRE=
+github.com/google/uuid v1.6.0 h1:NIvaJDMOsjHA8n1jAhLSgzrAzy1Hgr+hNrb57e+94F0=
+github.com/google/uuid v1.6.0/go.mod h1:TIyPZe4MgqvfeYDBFedMoGGpEw/LqOeaOT+nhxU+yHo=
+github.com/sandertv/gophertunnel v1.37.0 h1:yPzOp4W1GahLjtxldXa5K25saJK/XG7SiyEt6oMjm0I=
+github.com/sandertv/gophertunnel v1.37.0/go.mod h1:4El8ZfEpUmOMIJhPt5SCc1PyLNiuQ2+grWczrBvSGVs=
+github.com/xyproto/randomstring v1.0.5 h1:YtlWPoRdgMu3NZtP45drfy1GKoojuR7hmRcnhZqKjWU=
+github.com/xyproto/randomstring v1.0.5/go.mod h1:rgmS5DeNXLivK7YprL0pY+lTuhNQW3iGxZ18UQApw/E=

@@ -1,0 +1,23 @@
+{
+    "maxVersionMajor": 1,
+    "maxVersionMinor": 21,
+    "maxVersionPatch": 1,
+    "maxVersionRevision": 0,
+    "addedProperties": {
+        "minecraft:lit_furnace": {
+            "custom_appearance": {
+                "byte": 0
+            }
+        },
+        "minecraft:furnace": {
+            "custom_appearance": {
+                "byte": 0
+            }
+        },
+        "minecraft:crafting_table": {
+            "custom_appearance": {
+                "byte": 0
+            }
+        }
+    }
+}
