@@ -40,6 +40,45 @@ struct PackedIndices {
     std::uint8_t bits = 1;
 };
 
+class PackedIndexCursor {
+public:
+    PackedIndexCursor(
+        std::span<const std::uint64_t> words,
+        std::uint8_t bits,
+        std::size_t index) noexcept
+        : mWords(words),
+          mBits(bits),
+          mMask((std::uint64_t{1} << bits) - 1)
+    {
+        const auto bit_position = static_cast<std::uint64_t>(index) * bits;
+        mWordIndex = static_cast<std::size_t>(bit_position / 64);
+        mBitOffset = static_cast<unsigned>(bit_position % 64);
+    }
+
+    std::uint32_t next() noexcept
+    {
+        std::uint64_t value = mWords[mWordIndex] >> mBitOffset;
+        if (mBitOffset + mBits > 64) {
+            value |= mWords[mWordIndex + 1] << (64 - mBitOffset);
+        }
+        mBitOffset += mBits;
+        if (mBitOffset >= 64) {
+            mBitOffset -= 64;
+            ++mWordIndex;
+        }
+        return static_cast<std::uint32_t>(value & mMask);
+    }
+
+private:
+    std::span<const std::uint64_t> mWords;
+    std::size_t mWordIndex = 0;
+    std::uint64_t mMask = 0;
+    unsigned mBitOffset = 0;
+    unsigned mBits = 1;
+};
+
+constexpr std::uint32_t kMaxDensePaletteIndex = (1u << 20) - 1;
+
 std::uint8_t bits_required(std::uint32_t value)
 {
     std::uint8_t bits = 1;
@@ -70,6 +109,9 @@ Result<PackedIndices> decode_varints(
             if (value > max_palette_index) {
                 return Result<PackedIndices>::failure("Schem BlockData 引用了 palette 范围外的索引");
             }
+            if (count >= expected_count) {
+                return Result<PackedIndices>::failure("Schem BlockData 方块数超过 size");
+            }
             const auto bit_position = static_cast<std::uint64_t>(count) * result.bits;
             const auto word_index = static_cast<std::size_t>(bit_position / 64);
             const auto bit_offset = static_cast<unsigned>(bit_position % 64);
@@ -80,9 +122,6 @@ Result<PackedIndices> decode_varints(
             ++count;
             value = 0;
             shift = 0;
-            if (count > expected_count) {
-                return Result<PackedIndices>::failure("Schem BlockData 方块数超过 size");
-            }
         } else {
             shift += 7;
             if (shift >= 35) {
@@ -109,19 +148,6 @@ void SchemStructure::set_offset(BlockPos offset) noexcept
         mOriginalSize.height + std::abs(offset.y),
         mOriginalSize.length + std::abs(offset.z)
     };
-}
-
-std::uint32_t SchemStructure::block_index_at(std::size_t index) const noexcept
-{
-    const auto bit_position = static_cast<std::uint64_t>(index) * mBitsPerIndex;
-    const auto word_index = static_cast<std::size_t>(bit_position / 64);
-    const auto bit_offset = static_cast<unsigned>(bit_position % 64);
-    std::uint64_t value = mPackedIndices[word_index] >> bit_offset;
-    if (bit_offset + mBitsPerIndex > 64) {
-        value |= mPackedIndices[word_index + 1] << (64 - bit_offset);
-    }
-    const auto mask = (std::uint64_t{1} << mBitsPerIndex) - 1;
-    return static_cast<std::uint32_t>(value & mask);
 }
 
 Result<void> SchemStructure::read(const std::filesystem::path& path)
@@ -182,6 +208,7 @@ Result<void> SchemStructure::read(const std::filesystem::path& path)
         mUnknownRuntimeId = known_unknown ? *known_unknown :
             mRegistry.register_state(BlockState{ "minecraft:unknown", {}, 0 });
         mPalette.clear();
+        mDensePalette.clear();
         std::uint32_t max_palette_index = 0;
         for (const auto& [java_state, palette_value] : *palette) {
             const auto index = int_value(&palette_value);
@@ -191,6 +218,14 @@ Result<void> SchemStructure::read(const std::filesystem::path& path)
             mPalette[static_cast<std::uint32_t>(*index)] =
                 mRegistry.compatible_java_runtime_id(java_state).value_or(mUnknownRuntimeId);
             max_palette_index = std::max(max_palette_index, static_cast<std::uint32_t>(*index));
+        }
+        if (max_palette_index <= kMaxDensePaletteIndex) {
+            mDensePalette.assign(
+                static_cast<std::size_t>(max_palette_index) + 1,
+                mUnknownRuntimeId);
+            for (const auto& [index, runtime_id] : mPalette) {
+                mDensePalette[index] = runtime_id;
+            }
         }
         auto decoded = decode_varints(
             *data,
@@ -216,32 +251,75 @@ Result<ChunkMap> SchemStructure::get_chunks(std::span<const ChunkPos> positions)
     for (const auto pos : positions) {
         result.emplace(pos, ChunkData{});
     }
-    for (std::size_t index = 0; index < mBlockCount; ++index) {
-        const auto palette_it = mPalette.find(block_index_at(index));
-        const auto runtime_id = palette_it == mPalette.end() ? mUnknownRuntimeId : palette_it->second;
-        if (runtime_id == mRegistry.air_runtime_id()) {
+
+    const auto width = mOriginalSize.width;
+    const auto height = mOriginalSize.height;
+    const auto length = mOriginalSize.length;
+    const auto layer_stride = static_cast<std::size_t>(width) * length;
+    const auto air_runtime_id = mRegistry.air_runtime_id();
+    const auto* dense_palette = mDensePalette.empty() ? nullptr : mDensePalette.data();
+    const auto runtime_id_for = [this, dense_palette](std::uint32_t palette_index) noexcept {
+        if (dense_palette) return dense_palette[palette_index];
+        const auto found = mPalette.find(palette_index);
+        return found == mPalette.end() ? mUnknownRuntimeId : found->second;
+    };
+
+    // Materialize only the source X/Z range covered by each requested chunk.
+    // Iterating the deduplicated result map preserves the previous behaviour for
+    // repeated positions while avoiding a full structure scan for every batch.
+    for (auto& [chunk_pos, chunk] : result) {
+        const auto chunk_min_x = static_cast<std::int64_t>(chunk_pos.x) * 16;
+        const auto chunk_min_z = static_cast<std::int64_t>(chunk_pos.z) * 16;
+        const auto source_min_x = std::max<std::int64_t>(0, chunk_min_x - mOffset.x);
+        const auto source_max_x = std::min<std::int64_t>(
+            static_cast<std::int64_t>(width) - 1,
+            chunk_min_x + 15 - mOffset.x);
+        const auto source_min_z = std::max<std::int64_t>(0, chunk_min_z - mOffset.z);
+        const auto source_max_z = std::min<std::int64_t>(
+            static_cast<std::int64_t>(length) - 1,
+            chunk_min_z + 15 - mOffset.z);
+        if (source_min_x > source_max_x || source_min_z > source_max_z) {
             continue;
         }
-        const int x = static_cast<int>(index % mOriginalSize.width);
-        const int z = static_cast<int>((index / mOriginalSize.width) % mOriginalSize.length);
-        const int y = static_cast<int>(index /
-            (static_cast<std::size_t>(mOriginalSize.width) * mOriginalSize.length));
-        const int structure_x = x + mOffset.x;
-        const int structure_y = y + mOffset.y;
-        const int structure_z = z + mOffset.z;
-        const ChunkPos chunk_pos{ floor_div(structure_x, 16), floor_div(structure_z, 16) };
-        const auto chunk_it = result.find(chunk_pos);
-        if (chunk_it == result.end()) continue;
-        const int sub_y = floor_div(structure_y - 64, 16);
-        auto [sub_it, inserted] = chunk_it->second.sub_chunks.try_emplace(sub_y);
-        if (inserted) {
-            sub_it->second.layer0.fill(mRegistry.air_runtime_id());
-            sub_it->second.layer1.fill(mRegistry.air_runtime_id());
+
+        const auto min_x = static_cast<int>(source_min_x);
+        const auto max_x = static_cast<int>(source_max_x);
+        const auto min_z = static_cast<int>(source_min_z);
+        const auto max_z = static_cast<int>(source_max_z);
+        for (int y = 0; y < height; ++y) {
+            const int structure_y = y + mOffset.y;
+            const int sub_y = floor_div(structure_y - 64, 16);
+            const int local_y = structure_y - (sub_y * 16 + 64);
+            SubChunkData* sub_chunk = nullptr;
+            for (int z = min_z; z <= max_z; ++z) {
+                const auto local_z = static_cast<int>(
+                    static_cast<std::int64_t>(z) + mOffset.z - chunk_min_z);
+                const auto row_start = static_cast<std::size_t>(y) * layer_stride +
+                    static_cast<std::size_t>(z) * width;
+                PackedIndexCursor indices(
+                    mPackedIndices,
+                    mBitsPerIndex,
+                    row_start + static_cast<std::size_t>(min_x));
+                for (int x = min_x; x <= max_x; ++x) {
+                    const auto runtime_id = runtime_id_for(indices.next());
+                    if (runtime_id == air_runtime_id) {
+                        continue;
+                    }
+                    if (!sub_chunk) {
+                        auto [sub_it, inserted] = chunk.sub_chunks.try_emplace(sub_y);
+                        if (inserted) {
+                            sub_it->second.layer0.fill(air_runtime_id);
+                            sub_it->second.layer1.fill(air_runtime_id);
+                        }
+                        sub_chunk = &sub_it->second;
+                    }
+                    const auto local_x = static_cast<int>(
+                        static_cast<std::int64_t>(x) + mOffset.x - chunk_min_x);
+                    sub_chunk->layer0[static_cast<std::size_t>(
+                        (local_y * 16 + local_z) * 16 + local_x)] = runtime_id;
+                }
+            }
         }
-        const int local_x = structure_x - chunk_pos.x * 16;
-        const int local_y = structure_y - (sub_y * 16 + 64);
-        const int local_z = structure_z - chunk_pos.z * 16;
-        sub_it->second.layer0[static_cast<std::size_t>((local_y * 16 + local_z) * 16 + local_x)] = runtime_id;
     }
     return Result<ChunkMap>::success(std::move(result));
 }
@@ -256,10 +334,17 @@ Result<NbtChunkMap> SchemStructure::get_chunk_nbt(std::span<const ChunkPos> posi
 Result<std::size_t> SchemStructure::count_non_air_blocks() const
 {
     std::size_t result = 0;
+    PackedIndexCursor indices(mPackedIndices, mBitsPerIndex, 0);
+    const auto* dense_palette = mDensePalette.empty() ? nullptr : mDensePalette.data();
+    const auto air_runtime_id = mRegistry.air_runtime_id();
     for (std::size_t position = 0; position < mBlockCount; ++position) {
-        const auto index = block_index_at(position);
-        const auto it = mPalette.find(index);
-        if (it == mPalette.end() || it->second != mRegistry.air_runtime_id()) ++result;
+        const auto palette_index = indices.next();
+        if (dense_palette) {
+            if (dense_palette[palette_index] != air_runtime_id) ++result;
+            continue;
+        }
+        const auto it = mPalette.find(palette_index);
+        if (it == mPalette.end() || it->second != air_runtime_id) ++result;
     }
     return Result<std::size_t>::success(result);
 }

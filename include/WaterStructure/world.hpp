@@ -40,6 +40,11 @@ public:
     const std::filesystem::path& directory() const noexcept { return mDirectory; }
 
     Result<ChunkData> load_chunk(ChunkPos pos) const override;
+    Result<ChunkData> load_chunk_range(
+        ChunkPos pos,
+        std::int32_t min_sub_y,
+        std::int32_t max_sub_y,
+        bool include_layer1 = true) const;
     Result<std::vector<BlockEntity>> load_chunk_nbt(ChunkPos pos) const override;
     Result<void> save_chunk(ChunkPos pos, const ChunkData& chunk) override;
     Result<void> save_chunk_nbt(ChunkPos pos, std::span<const BlockEntity> entities) override;

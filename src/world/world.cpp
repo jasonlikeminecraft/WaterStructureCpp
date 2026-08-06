@@ -207,12 +207,26 @@ bool BedrockWorldAdapter::valid() const noexcept
 
 Result<ChunkData> BedrockWorldAdapter::load_chunk(ChunkPos pos) const
 {
+    return load_chunk_range(pos, kMinSubChunkY, kMaxSubChunkY, true);
+}
+
+Result<ChunkData> BedrockWorldAdapter::load_chunk_range(
+    ChunkPos pos,
+    std::int32_t min_sub_y,
+    std::int32_t max_sub_y,
+    bool include_layer1) const
+{
     if (!valid()) {
         return Result<ChunkData>::failure("世界未打开");
     }
+    min_sub_y = std::max(min_sub_y, kMinSubChunkY);
+    max_sub_y = std::min(max_sub_y, kMaxSubChunkY);
+    if (min_sub_y > max_sub_y) {
+        return Result<ChunkData>::success({});
+    }
 
     ChunkData result;
-    for (std::int32_t sub_y = kMinSubChunkY; sub_y <= kMaxSubChunkY; ++sub_y) {
+    for (std::int32_t sub_y = min_sub_y; sub_y <= max_sub_y; ++sub_y) {
         auto loaded = mWorld->loadSubChunk(
             BedrockWorldOperator::Dimension::Overworld,
             { pos.x, sub_y, pos.z }
@@ -222,8 +236,11 @@ Result<ChunkData> BedrockWorldAdapter::load_chunk(ChunkPos pos) const
         }
 
         const auto blocks0 = loaded.value.blocks(0);
-        const auto blocks1 = loaded.value.blocks(1);
-        if (blocks0.size() != 4096 || blocks1.size() != 4096) {
+        if (blocks0.size() != 4096) {
+            return Result<ChunkData>::failure(error_for("读取 subchunk 失败", "方块数量不是 4096"));
+        }
+        const auto blocks1 = include_layer1 ? loaded.value.blocks(1) : BedrockWorldOperator::BlockRuntimeList{};
+        if (include_layer1 && blocks1.size() != 4096) {
             return Result<ChunkData>::failure(error_for("读取 subchunk 失败", "方块数量不是 4096"));
         }
         SubChunkData data;
@@ -233,7 +250,7 @@ Result<ChunkData> BedrockWorldAdapter::load_chunk(ChunkPos pos) const
                     const auto native_index = static_cast<std::size_t>(x * 256 + y * 16 + z);
                     const auto internal_index = static_cast<std::size_t>((y * 16 + z) * 16 + x);
                     data.layer0[internal_index] = blocks0[native_index];
-                    data.layer1[internal_index] = blocks1[native_index];
+                    if (include_layer1) data.layer1[internal_index] = blocks1[native_index];
                 }
             }
         }

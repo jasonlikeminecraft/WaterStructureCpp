@@ -3,6 +3,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <charconv>
 #include <cctype>
 #include <fstream>
 #include <limits>
@@ -364,6 +365,139 @@ std::string normalize_java_state(std::string_view encoded)
         result << ']';
     }
     return result.str();
+}
+
+std::unordered_map<std::string, std::string> java_properties(std::string_view encoded)
+{
+    std::unordered_map<std::string, std::string> result;
+    const auto begin = encoded.find('[');
+    if (begin == std::string_view::npos) return result;
+    const auto end = encoded.find_last_of(']');
+    const auto contents = encoded.substr(begin + 1,
+        (end == std::string_view::npos ? encoded.size() : end) - begin - 1);
+    std::size_t offset = 0;
+    while (offset <= contents.size()) {
+        const auto comma = contents.find(',', offset);
+        const auto part = contents.substr(offset,
+            comma == std::string_view::npos ? contents.size() - offset : comma - offset);
+        if (const auto equal = part.find('='); equal != std::string_view::npos) {
+            result.emplace(std::string(part.substr(0, equal)), std::string(part.substr(equal + 1)));
+        }
+        if (comma == std::string_view::npos) break;
+        offset = comma + 1;
+    }
+    return result;
+}
+
+std::vector<std::pair<std::string_view, std::string_view>> java_property_views(
+    std::string_view encoded)
+{
+    std::vector<std::pair<std::string_view, std::string_view>> result;
+    const auto begin = encoded.find('[');
+    if (begin == std::string_view::npos) return result;
+    const auto end = encoded.find_last_of(']');
+    const auto contents = encoded.substr(begin + 1,
+        (end == std::string_view::npos ? encoded.size() : end) - begin - 1);
+    std::size_t offset = 0;
+    while (offset <= contents.size()) {
+        const auto comma = contents.find(',', offset);
+        const auto part = contents.substr(offset,
+            comma == std::string_view::npos ? contents.size() - offset : comma - offset);
+        if (const auto equal = part.find('='); equal != std::string_view::npos) {
+            const auto name = part.substr(0, equal);
+            const auto duplicate = std::ranges::find_if(result, [name](const auto& property) {
+                return property.first == name;
+            });
+            if (duplicate == result.end()) {
+                result.emplace_back(name, part.substr(equal + 1));
+            }
+        }
+        if (comma == std::string_view::npos) break;
+        offset = comma + 1;
+    }
+    return result;
+}
+
+bool ascii_equal_ignore_case(std::string_view left, std::string_view right)
+{
+    if (left.size() != right.size()) return false;
+    for (std::size_t index = 0; index < left.size(); ++index) {
+        if (std::tolower(static_cast<unsigned char>(left[index])) !=
+            std::tolower(static_cast<unsigned char>(right[index]))) return false;
+    }
+    return true;
+}
+
+std::optional<std::int64_t> fuzzy_java_integer(std::string_view value)
+{
+    if (ascii_equal_ignore_case(value, "true") || ascii_equal_ignore_case(value, "1b") || value == "1") {
+        return 1;
+    }
+    if (ascii_equal_ignore_case(value, "false") || ascii_equal_ignore_case(value, "0b") || value == "0") {
+        return 0;
+    }
+    if (value.empty()) return std::nullopt;
+    const auto* first = value.data();
+    const auto* last = first + value.size();
+    if (*first == '+') {
+        ++first;
+        if (first == last) return std::nullopt;
+    }
+    std::int64_t result = 0;
+    const auto parsed = std::from_chars(first, last, result);
+    if (parsed.ec != std::errc{} || parsed.ptr != last) return std::nullopt;
+    return result;
+}
+
+bool fuzzy_java_equal(std::string_view left, std::string_view right)
+{
+    const auto left_integer = fuzzy_java_integer(left);
+    const auto right_integer = fuzzy_java_integer(right);
+    if (left_integer || right_integer) {
+        return left_integer && right_integer && *left_integer == *right_integer;
+    }
+    return ascii_equal_ignore_case(left, right);
+}
+
+std::string fuzzy_java_value(std::string value)
+{
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    if (value == "true" || value == "1b" || value == "1") return "1";
+    if (value == "false" || value == "0b" || value == "0") return "0";
+    try {
+        std::size_t consumed = 0;
+        const auto number = std::stoll(value, &consumed);
+        if (consumed == value.size()) return std::to_string(number);
+    } catch (const std::exception&) {
+        // Non-numeric strings compare by their literal value.
+    }
+    return value;
+}
+
+std::string canonical_java_order_key(std::string_view encoded)
+{
+    const auto normalized = normalize_java_state(encoded);
+    const auto open = normalized.find('[');
+    const auto name = normalized.substr(0, open);
+    const auto properties = java_properties(normalized);
+    std::vector<std::string> entries;
+    entries.reserve(properties.size());
+    for (const auto& [property, value] : properties) {
+        entries.push_back(property + "=" + fuzzy_java_value(value));
+    }
+    std::sort(entries.begin(), entries.end());
+    std::string result = name;
+    if (!entries.empty()) {
+        result += '[';
+        for (std::size_t index = 0; index < entries.size(); ++index) {
+            if (index != 0) result += ',';
+            result += entries[index];
+        }
+        result += ']';
+    }
+    return result;
 }
 
 std::string legacy_state_search_key(std::span<const BlockStateProperty> states)
@@ -902,8 +1036,22 @@ Result<void> RuntimeRegistry::load_block_mappings(const std::filesystem::path& p
             mLegacyPools[117] = std::move(bdx117);
         }
         mJavaMapping = std::move(java_mapping);
-		mJavaDefaultByName = std::move(java_defaults);
+        mJavaDefaultByName = std::move(java_defaults);
         mJavaOrder = std::move(java_order);
+        mJavaCandidatesByName.clear();
+        mJavaCandidatesByName.reserve(mJavaDefaultByName.size());
+        for (const auto& [encoded, runtime_id] : mJavaMapping) {
+            const auto open = encoded.find('[');
+            JavaCandidate candidate;
+            candidate.encoded = encoded;
+            candidate.runtime_id = runtime_id;
+            const auto properties = java_property_views(encoded);
+            candidate.properties.reserve(properties.size());
+            for (const auto& [name, value] : properties) {
+                candidate.properties.push_back({ name, value });
+            }
+            mJavaCandidatesByName[encoded.substr(0, open)].push_back(std::move(candidate));
+        }
         mJavaByRuntimeId = std::move(java_by_runtime);
         mLegacyByName = std::move(legacy_by_name);
         mLegacyDefaultByName = std::move(legacy_defaults);
@@ -998,120 +1146,81 @@ std::optional<std::uint32_t> RuntimeRegistry::compatible_java_runtime_id(
     const auto requested = normalize_java_state(block_state);
     const auto open = requested.find('[');
     const auto requested_name = requested.substr(0, open);
-    auto parse_properties = [](std::string_view encoded) {
-        std::unordered_map<std::string, std::string> result;
-        const auto begin = encoded.find('[');
-        if (begin == std::string_view::npos) return result;
-        const auto end = encoded.find_last_of(']');
-        const auto contents = encoded.substr(begin + 1,
-            (end == std::string_view::npos ? encoded.size() : end) - begin - 1);
-        std::size_t offset = 0;
-        while (offset <= contents.size()) {
-            const auto comma = contents.find(',', offset);
-            const auto part = contents.substr(offset,
-                comma == std::string_view::npos ? contents.size() - offset : comma - offset);
-            if (const auto equal = part.find('='); equal != std::string_view::npos) {
-                result.emplace(std::string(part.substr(0, equal)), std::string(part.substr(equal + 1)));
-            }
-            if (comma == std::string_view::npos) break;
-            offset = comma + 1;
-        }
-        return result;
-    };
-    const auto requested_properties = parse_properties(requested);
-    if (requested_properties.empty()) {
+    const auto requested_property_views = java_property_views(requested);
+    if (requested_property_views.empty()) {
         std::lock_guard lock(mMutex);
-		const auto java_default = mJavaDefaultByName.find(requested_name);
-		if (java_default != mJavaDefaultByName.end()) return java_default->second;
+        const auto java_default = mJavaDefaultByName.find(requested_name);
+        if (java_default != mJavaDefaultByName.end()) return java_default->second;
     }
-    auto fuzzy_value = [](std::string value) {
-        std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
-            return static_cast<char>(std::tolower(c));
-        });
-        if (value == "true" || value == "1b" || value == "1") return std::string("1");
-        if (value == "false" || value == "0b" || value == "0") return std::string("0");
-        try {
-            std::size_t consumed = 0;
-            const auto number = std::stoll(value, &consumed);
-            if (consumed == value.size()) return std::to_string(number);
-        } catch (const std::exception&) {
-            // Non-numeric strings compare by their literal value.
-        }
-        return value;
-    };
-    auto canonical_order_key = [&](std::string_view encoded) {
-        const auto normalized = normalize_java_state(encoded);
-        const auto open = normalized.find('[');
-        const auto name = normalized.substr(0, open);
-        const auto properties = parse_properties(normalized);
-        std::vector<std::string> entries;
-        entries.reserve(properties.size());
-        for (const auto& [property, value] : properties) {
-            entries.push_back(property + "=" + fuzzy_value(value));
-        }
-        std::sort(entries.begin(), entries.end());
-        std::string result = name;
-        if (!entries.empty()) {
-            result += '[';
-            for (std::size_t index = 0; index < entries.size(); ++index) {
-                if (index != 0) result += ',';
-                result += entries[index];
-            }
-            result += ']';
-        }
-        return result;
-    };
-
     std::lock_guard lock(mMutex);
     const auto exact = mJavaMapping.find(requested);
     if (exact != mJavaMapping.end()) return exact->second;
+    const JavaCandidate* best_candidate = nullptr;
+    std::size_t java_best_same = 0;
+    std::size_t java_best_penalty = std::numeric_limits<std::size_t>::max();
+    const auto candidate_order = [this](const JavaCandidate& candidate) {
+        if (!candidate.order) {
+            const auto order = mJavaOrder.find(canonical_java_order_key(candidate.encoded));
+            candidate.order = order == mJavaOrder.end()
+                ? std::numeric_limits<std::size_t>::max() : order->second;
+        }
+        return *candidate.order;
+    };
+    const auto indexed_candidates = mJavaCandidatesByName.find(requested_name);
+    if (indexed_candidates != mJavaCandidatesByName.end()) {
+        for (const auto& candidate : indexed_candidates->second) {
+            std::size_t same = 0;
+            std::size_t penalty = 0;
+            for (const auto& [name, value] : requested_property_views) {
+                const auto found = std::ranges::find_if(candidate.properties, [name](const auto& property) {
+                    return property.name == name;
+                });
+                if (found == candidate.properties.end()) {
+                    ++penalty;
+                } else if (fuzzy_java_equal(found->value, value)) {
+                    ++same;
+                } else {
+                    ++penalty;
+                }
+            }
+            for (const auto& property : candidate.properties) {
+                const auto found = std::ranges::find_if(
+                    requested_property_views,
+                    [&property](const auto& requested) {
+                        return requested.first == property.name;
+                    });
+                if (found == requested_property_views.end()) ++penalty;
+            }
+
+            // Resolve canonical conversion order only for a primary-score tie.
+            // This preserves same/penalty/order/runtime ordering without
+            // canonicalizing every candidate during registry startup.
+            auto better = !best_candidate || same > java_best_same ||
+                (same == java_best_same && penalty < java_best_penalty);
+            if (!better && best_candidate &&
+                same == java_best_same && penalty == java_best_penalty) {
+                const auto order = candidate_order(candidate);
+                const auto best_order = candidate_order(*best_candidate);
+                better = order < best_order ||
+                    (order == best_order && candidate.runtime_id < best_candidate->runtime_id);
+            }
+            if (better) {
+                java_best_same = same;
+                java_best_penalty = penalty;
+                best_candidate = &candidate;
+            }
+        }
+    }
+
+    if (best_candidate) return best_candidate->runtime_id;
+    const auto requested_properties = java_properties(requested);
+    const auto legacy = mLegacyByState.find(requested_name);
+    if (legacy == mLegacyByState.end()) return std::nullopt;
+    const auto legacy_order = mLegacyStateOrder.find(requested_name);
     std::optional<std::uint32_t> best_runtime;
     std::size_t best_same = 0;
     std::size_t best_penalty = std::numeric_limits<std::size_t>::max();
     std::size_t best_order = std::numeric_limits<std::size_t>::max();
-    for (const auto& [candidate, runtime] : mJavaMapping) {
-        const auto candidate_open = candidate.find('[');
-        if (candidate.substr(0, candidate_open) != requested_name) continue;
-        const auto candidate_properties = parse_properties(candidate);
-        std::size_t same = 0;
-        std::size_t penalty = 0;
-        for (const auto& [name, value] : requested_properties) {
-            const auto found = candidate_properties.find(name);
-            if (found == candidate_properties.end()) {
-                ++penalty;
-            } else if (fuzzy_value(found->second) == fuzzy_value(value)) {
-                ++same;
-            } else {
-                ++penalty;
-            }
-        }
-        for (const auto& [name, _] : candidate_properties) {
-            if (!requested_properties.contains(name)) ++penalty;
-        }
-        const auto order = mJavaOrder.find(canonical_order_key(candidate));
-        const auto candidate_order = order == mJavaOrder.end()
-            ? std::numeric_limits<std::size_t>::max() : order->second;
-        // Go's fuzzy search keeps the first equally-scored conversion record.
-        // The generated sidecar preserves that order; runtime ID is only the
-        // deterministic fallback for assets created without the sidecar.
-        const auto better = !best_runtime || same > best_same ||
-            (same == best_same &&
-                (penalty < best_penalty ||
-                    (penalty == best_penalty &&
-                        (candidate_order < best_order ||
-                            (candidate_order == best_order && runtime < *best_runtime)))));
-        if (better) {
-            best_same = same;
-            best_penalty = penalty;
-            best_order = candidate_order;
-            best_runtime = runtime;
-        }
-    }
-
-    if (best_runtime) return best_runtime;
-    const auto legacy = mLegacyByState.find(requested_name);
-    if (legacy == mLegacyByState.end()) return std::nullopt;
-    const auto legacy_order = mLegacyStateOrder.find(requested_name);
     auto parse_legacy_properties = [](std::string_view encoded) {
         std::unordered_map<std::string, std::string> result;
         if (encoded.size() >= 2 && encoded.front() == '{' && encoded.back() == '}') {
@@ -1138,7 +1247,7 @@ std::optional<std::uint32_t> RuntimeRegistry::compatible_java_runtime_id(
         for (const auto& [name, value] : requested_properties) {
             const auto found = candidate_properties.find(name);
             if (found == candidate_properties.end()) ++penalty;
-            else if (fuzzy_value(found->second) == fuzzy_value(value)) ++same;
+            else if (fuzzy_java_value(found->second) == fuzzy_java_value(value)) ++same;
             else ++penalty;
         }
         for (const auto& [name, _] : candidate_properties) {

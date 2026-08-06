@@ -77,6 +77,14 @@ public:
 
     virtual Result<void> read(const std::filesystem::path& path) = 0;
     virtual Result<ChunkMap> get_chunks(std::span<const ChunkPos> positions) const = 0;
+    // Schem-like writers only serialize the primary block layer. Other formats
+    // keep the full get_chunks behavior through this default implementation;
+    // for an optimized override, layer1 is unspecified and must not be consumed.
+    virtual Result<ChunkMap> get_chunks_layer0(std::span<const ChunkPos> positions) const {
+        return get_chunks(positions);
+    }
+    // Allows streaming consumers to release source-side chunk caches between batches.
+    virtual void release_cached_chunks() const noexcept {}
     virtual Result<NbtChunkMap> get_chunk_nbt(std::span<const ChunkPos> positions) const = 0;
     virtual Result<std::size_t> count_non_air_blocks() const = 0;
     virtual Result<void> write_to_world(WorldTarget& world, SubChunkPos start, ConversionCallbacks callbacks) const = 0;

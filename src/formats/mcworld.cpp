@@ -7,13 +7,23 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <fstream>
+#include <iostream>
 #include <regex>
 
 namespace water_structure {
 
 namespace {
+
+using Clock = std::chrono::steady_clock;
+
+double elapsed_ms(const Clock::time_point start)
+{
+    return std::chrono::duration<double, std::milli>(Clock::now() - start).count();
+}
 
 std::optional<std::pair<BlockPos, BlockPos>> selection_from_text(const std::string& text)
 {
@@ -56,6 +66,15 @@ const BlockLayer* layer_for(const ChunkData& chunk, std::int32_t sub_y, int laye
     return layer == 0 ? &it->second.layer0 : &it->second.layer1;
 }
 
+bool has_non_air(const SubChunkData& sub_chunk, const std::uint32_t air_runtime_id)
+{
+    return std::ranges::any_of(sub_chunk.layer0, [air_runtime_id](const auto runtime_id) {
+        return runtime_id != air_runtime_id;
+    }) || std::ranges::any_of(sub_chunk.layer1, [air_runtime_id](const auto runtime_id) {
+        return runtime_id != air_runtime_id;
+    });
+}
+
 } // namespace
 
 void McWorldStructure::set_offset(BlockPos offset) noexcept
@@ -95,28 +114,93 @@ Result<void> McWorldStructure::read(const std::filesystem::path& path)
     };
     mWorld.emplace(std::move(opened).value());
     mChunkCache.clear();
+    mChunkCacheHasLayer1 = false;
     set_offset({});
     return Result<void>::success();
 }
 
-Result<const ChunkData*> McWorldStructure::source_chunk(ChunkPos pos) const
+Result<const ChunkData*> McWorldStructure::source_chunk(ChunkPos pos, bool include_layer1) const
 {
     if (const auto it = mChunkCache.find(pos); it != mChunkCache.end()) {
-        return Result<const ChunkData*>::success(&it->second);
+        if (!include_layer1 || mChunkCacheHasLayer1) {
+            return Result<const ChunkData*>::success(&it->second);
+        }
+        mChunkCache.erase(it);
     }
     if (!mWorld) return Result<const ChunkData*>::failure("MCWorld 尚未打开");
-    auto loaded = mWorld->load_chunk(pos);
+    auto loaded = mWorld->load_chunk_range(
+        pos,
+        floor_div(mMin.y, 16),
+        floor_div(mMax.y, 16),
+        include_layer1);
     if (!loaded) return Result<const ChunkData*>::failure(loaded.error());
     const auto [it, inserted] = mChunkCache.emplace(pos, std::move(loaded).value());
+    if (include_layer1) mChunkCacheHasLayer1 = true;
     return Result<const ChunkData*>::success(&it->second);
 }
 
 Result<ChunkMap> McWorldStructure::get_chunks(std::span<const ChunkPos> positions) const
 {
+    return get_chunks_impl(positions, true);
+}
+
+Result<ChunkMap> McWorldStructure::get_chunks_layer0(std::span<const ChunkPos> positions) const
+{
+    return get_chunks_impl(positions, false);
+}
+
+Result<ChunkMap> McWorldStructure::get_chunks_impl(
+    std::span<const ChunkPos> positions,
+    bool include_layer1) const
+{
+    const bool profile = std::getenv("WATER_STRUCTURE_PROFILE") != nullptr;
+    double source_load_ms = 0.0;
+    double direct_copy_ms = 0.0;
+    double boundary_crop_ms = 0.0;
+    std::size_t direct_chunks = 0;
+    std::size_t boundary_chunks = 0;
     ChunkMap result;
     for (const auto pos : positions) result.emplace(pos, ChunkData{});
+    const bool aligned_fast_path = mOffset == BlockPos{} &&
+        floor_mod(mMin.x, 16) == 0 && floor_mod(mMin.y, 16) == 0 && floor_mod(mMin.z, 16) == 0 &&
+        mSize.height % 16 == 0;
+    const auto complete_chunk_x_count = mSize.width / 16;
+    const auto complete_chunk_z_count = mSize.length / 16;
+    const auto source_chunk_base_x = floor_div(mMin.x, 16);
+    const auto source_chunk_base_z = floor_div(mMin.z, 16);
+    const auto source_sub_y_delta = floor_div(mMin.y + 64, 16);
+    const auto output_min_sub_y = floor_div(-64, 16);
+    const auto output_max_sub_y = floor_div(mSize.height - 1 - 64, 16);
+    const auto air_runtime_id = mRegistry.air_runtime_id();
     for (const auto local_chunk_pos : positions) {
         auto& output = result.at(local_chunk_pos);
+        if (aligned_fast_path && local_chunk_pos.x >= 0 && local_chunk_pos.z >= 0 &&
+            local_chunk_pos.x < complete_chunk_x_count && local_chunk_pos.z < complete_chunk_z_count) {
+            const auto source_load_start = Clock::now();
+            const auto source = source_chunk({
+                source_chunk_base_x + local_chunk_pos.x,
+                source_chunk_base_z + local_chunk_pos.z
+            }, include_layer1);
+            source_load_ms += elapsed_ms(source_load_start);
+            if (!source) return Result<ChunkMap>::failure(source.error());
+            const auto direct_copy_start = Clock::now();
+            for (const auto& [source_sub_y, sub_chunk] : source.value()->sub_chunks) {
+                const auto output_sub_y = source_sub_y - source_sub_y_delta;
+                if (output_sub_y < output_min_sub_y || output_sub_y > output_max_sub_y ||
+                    !has_non_air(sub_chunk, air_runtime_id)) continue;
+                if (include_layer1) {
+                    output.sub_chunks.emplace(output_sub_y, sub_chunk);
+                } else {
+                    SubChunkData primary_only;
+                    primary_only.layer0 = sub_chunk.layer0;
+                    output.sub_chunks.emplace(output_sub_y, std::move(primary_only));
+                }
+            }
+            direct_copy_ms += elapsed_ms(direct_copy_start);
+            ++direct_chunks;
+            continue;
+        }
+        const auto boundary_crop_start = Clock::now();
         const auto local_x_begin = std::max(0, local_chunk_pos.x * 16);
         const auto local_x_end = std::min(mSize.width - 1, local_chunk_pos.x * 16 + 15);
         const auto local_z_begin = std::max(0, local_chunk_pos.z * 16);
@@ -131,7 +215,7 @@ Result<ChunkMap> McWorldStructure::get_chunks(std::span<const ChunkPos> position
                 if (original_z < 0 || original_z >= mOriginalSize.length) continue;
                 const auto source_z = mMin.z + original_z;
                 const ChunkPos source_chunk_pos{ floor_div(source_x, 16), floor_div(source_z, 16) };
-                const auto source = source_chunk(source_chunk_pos);
+                const auto source = source_chunk(source_chunk_pos, include_layer1);
                 if (!source) return Result<ChunkMap>::failure(source.error());
                 for (int local_y = 0; local_y < mSize.height; ++local_y) {
                     const auto original_y = local_y - mOffset.y;
@@ -144,15 +228,15 @@ Result<ChunkMap> McWorldStructure::get_chunks(std::span<const ChunkPos> position
                     const auto output_index = static_cast<std::size_t>(
                         ((local_y - (output_sub_y * 16 + 64)) * 16 + floor_mod(local_z, 16)) * 16 +
                         floor_mod(local_x, 16));
-                    for (int layer = 0; layer < 2; ++layer) {
+                for (int layer = 0; layer < (include_layer1 ? 2 : 1); ++layer) {
                         const auto* source_layer = layer_for(*source.value(), source_sub_y, layer);
                         if (!source_layer) continue;
                         const auto runtime_id = (*source_layer)[source_index];
-                        if (runtime_id == mRegistry.air_runtime_id()) continue;
+                        if (runtime_id == air_runtime_id) continue;
                         auto [sub_it, inserted] = output.sub_chunks.try_emplace(output_sub_y);
                         if (inserted) {
-                            sub_it->second.layer0.fill(mRegistry.air_runtime_id());
-                            sub_it->second.layer1.fill(mRegistry.air_runtime_id());
+                            sub_it->second.layer0.fill(air_runtime_id);
+                            if (include_layer1) sub_it->second.layer1.fill(air_runtime_id);
                         }
                         auto& target = layer == 0 ? sub_it->second.layer0 : sub_it->second.layer1;
                         target[output_index] = runtime_id;
@@ -160,8 +244,24 @@ Result<ChunkMap> McWorldStructure::get_chunks(std::span<const ChunkPos> position
                 }
             }
         }
+        boundary_crop_ms += elapsed_ms(boundary_crop_start);
+        ++boundary_chunks;
+    }
+    if (profile) {
+        std::cerr << "mcworld_get_chunks_profile source_load_ms=" << source_load_ms
+                  << " direct_copy_ms=" << direct_copy_ms
+                  << " boundary_crop_ms=" << boundary_crop_ms
+                  << " direct_chunks=" << direct_chunks
+                  << " boundary_chunks=" << boundary_chunks << '\n';
     }
     return Result<ChunkMap>::success(std::move(result));
+}
+
+void McWorldStructure::release_cached_chunks() const noexcept
+{
+    mChunkCache.clear();
+    mChunkCache.rehash(0);
+    mChunkCacheHasLayer1 = false;
 }
 
 Result<NbtChunkMap> McWorldStructure::get_chunk_nbt(std::span<const ChunkPos> positions) const

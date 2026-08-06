@@ -76,8 +76,20 @@ private:
     std::unordered_map<std::string, std::uint32_t> mLegacyDefaultByName;
     std::unordered_map<std::string, std::unordered_map<std::string, std::uint32_t>> mLegacyByState;
     std::unordered_map<std::string, std::unordered_map<std::string, std::size_t>> mLegacyStateOrder;
+    struct JavaCandidateProperty {
+        std::string_view name;
+        std::string_view value;
+    };
+    struct JavaCandidate {
+        std::string_view encoded;
+        std::uint32_t runtime_id = 0;
+        mutable std::optional<std::size_t> order;
+        std::vector<JavaCandidateProperty> properties;
+    };
+
     std::unordered_map<std::string, std::uint32_t> mJavaMapping;
-	std::unordered_map<std::string, std::uint32_t> mJavaDefaultByName;
+    std::unordered_map<std::string, std::vector<JavaCandidate>> mJavaCandidatesByName;
+    std::unordered_map<std::string, std::uint32_t> mJavaDefaultByName;
     std::unordered_map<std::string, std::size_t> mJavaOrder;
     std::vector<std::uint32_t> mSchematicMapping;
     std::unordered_map<std::uint32_t, std::pair<std::uint8_t, std::uint8_t>> mSchematicReverse;

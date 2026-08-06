@@ -38,9 +38,8 @@ private:
     std::size_t mBlockCount = 0;
     std::uint8_t mBitsPerIndex = 1;
     std::unordered_map<std::uint32_t, std::uint32_t> mPalette;
+    std::vector<std::uint32_t> mDensePalette;
     std::uint32_t mUnknownRuntimeId = 0;
-
-    std::uint32_t block_index_at(std::size_t index) const noexcept;
 };
 
 } // namespace water_structure

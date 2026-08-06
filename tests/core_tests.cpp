@@ -88,6 +88,65 @@ std::filesystem::path write_schem_v2_sample()
     return path;
 }
 
+std::filesystem::path write_schem_v1_sample(
+    std::string_view filename,
+    std::int16_t width,
+    std::vector<std::int8_t> block_data)
+{
+    const auto path = std::filesystem::temp_directory_path() / filename;
+    std::ofstream file(path, std::ios::binary | std::ios::trunc);
+    if (!file) throw std::runtime_error("create SchemV1 sample");
+
+    nbt::tag_compound palette;
+    palette["minecraft:air"] = std::int32_t{ 0 };
+    palette["minecraft:stone"] = std::int32_t{ 1 };
+    nbt::tag_compound document;
+    document.emplace<nbt::tag_short>("Width", width);
+    document.emplace<nbt::tag_short>("Height", 1);
+    document.emplace<nbt::tag_short>("Length", 1);
+    document["Palette"] = std::move(palette);
+    document["BlockData"] = nbt::tag_byte_array(std::move(block_data));
+
+    zlib::ozlibstream compressed(file, Z_DEFAULT_COMPRESSION, true);
+    nbt::io::write_tag("Schematic", document, compressed, endian::big);
+    compressed.close();
+    file.close();
+    return path;
+}
+
+std::filesystem::path write_schem_v1_multibit_sample()
+{
+    constexpr std::int16_t width = 130;
+    std::vector<std::int8_t> block_data;
+    block_data.reserve(width);
+    for (std::int16_t index = 0; index < width; ++index) {
+        block_data.push_back(static_cast<std::int8_t>(index % 4));
+    }
+
+    const auto path = std::filesystem::temp_directory_path() /
+        "water_structure_cpp_schem_multibit.schem";
+    std::ofstream file(path, std::ios::binary | std::ios::trunc);
+    if (!file) throw std::runtime_error("create multibit SchemV1 sample");
+
+    nbt::tag_compound palette;
+    palette["minecraft:air"] = std::int32_t{ 0 };
+    palette["minecraft:stone"] = std::int32_t{ 1 };
+    palette["minecraft:dirt"] = std::int32_t{ 2 };
+    palette["minecraft:cobblestone"] = std::int32_t{ 3 };
+    nbt::tag_compound document;
+    document.emplace<nbt::tag_short>("Width", width);
+    document.emplace<nbt::tag_short>("Height", 1);
+    document.emplace<nbt::tag_short>("Length", 1);
+    document["Palette"] = std::move(palette);
+    document["BlockData"] = nbt::tag_byte_array(std::move(block_data));
+
+    zlib::ozlibstream compressed(file, Z_DEFAULT_COMPRESSION, true);
+    nbt::io::write_tag("Schematic", document, compressed, endian::big);
+    compressed.close();
+    file.close();
+    return path;
+}
+
 std::filesystem::path write_mcfunction_sample()
 {
     const auto path = std::filesystem::temp_directory_path() / "water_structure_cpp_test.mcfunction";
@@ -1377,6 +1436,76 @@ int main()
             "SchemV2 trial detection");
         check(schem_v2.value()->count_non_air_blocks().value() == 1, "synthetic SchemV2 non-air count");
         std::filesystem::remove(schem_v2_path);
+
+        std::vector<std::int8_t> boundary_block_data(17, 0);
+        boundary_block_data.front() = 1;
+        boundary_block_data.back() = 1;
+        const auto schem_boundary_path = write_schem_v1_sample(
+            "water_structure_cpp_schem_boundary.schem", 17, std::move(boundary_block_data));
+        const auto schem_boundary = water_structure::FormatRegistry::open_as(
+            schem_boundary_path, water_structure::StructureId::SchemV1, registry);
+        check(schem_boundary.ok(), "SchemV1 boundary sample parses");
+        check(schem_boundary.value()->count_non_air_blocks().value() == 2,
+            "SchemV1 boundary sample non-air count");
+        schem_boundary.value()->set_offset({ -1, -1, -1 });
+        const auto boundary_offset = schem_boundary.value()->offset();
+        check(boundary_offset.x == -1 && boundary_offset.y == -1 && boundary_offset.z == -1,
+            "SchemV1 preserves negative offset");
+        const std::vector<water_structure::ChunkPos> repeated_boundary_positions{
+            { -1, -1 }, { 0, -1 }, { -1, -1 }
+        };
+        const auto boundary_chunks =
+            schem_boundary.value()->get_chunks(repeated_boundary_positions);
+        check(boundary_chunks.ok() && boundary_chunks.value().size() == 2,
+            "SchemV1 get_chunks deduplicates repeated positions");
+        const auto stone_runtime =
+            registry.compatible_java_runtime_id("minecraft:stone").value();
+        check(boundary_chunks.value().at({ -1, -1 }).sub_chunks.at(-5).layer0[4095] ==
+                stone_runtime &&
+            boundary_chunks.value().at({ 0, -1 }).sub_chunks.at(-5).layer0[4095] ==
+                stone_runtime,
+            "SchemV1 negative offset materializes across chunk boundaries");
+        std::filesystem::remove(schem_boundary_path);
+
+        const auto schem_extra_varint_path = write_schem_v1_sample(
+            "water_structure_cpp_schem_extra_varint.schem", 1, { 1, 0 });
+        const auto schem_extra_varint = water_structure::FormatRegistry::open_as(
+            schem_extra_varint_path, water_structure::StructureId::SchemV1, registry);
+        check(!schem_extra_varint.ok() &&
+                schem_extra_varint.error().find("方块数超过 size") != std::string::npos,
+            "SchemV1 rejects an extra complete varint");
+        std::filesystem::remove(schem_extra_varint_path);
+
+        const auto schem_multibit_path = write_schem_v1_multibit_sample();
+        const auto schem_multibit = water_structure::FormatRegistry::open_as(
+            schem_multibit_path, water_structure::StructureId::SchemV1, registry);
+        check(schem_multibit.ok(), "SchemV1 multi-bit sample parses");
+        check(schem_multibit.value()->count_non_air_blocks().value() == 97,
+            "SchemV1 multi-bit sample non-air count");
+        const std::vector<water_structure::ChunkPos> multibit_positions{
+            { 0, 0 }, { 1, 0 }, { 2, 0 }, { 3, 0 }, { 4, 0 },
+            { 5, 0 }, { 6, 0 }, { 7, 0 }, { 8, 0 }
+        };
+        const auto multibit_chunks = schem_multibit.value()->get_chunks(multibit_positions);
+        const auto multibit_stone =
+            registry.compatible_java_runtime_id("minecraft:stone").value();
+        const auto multibit_dirt =
+            registry.compatible_java_runtime_id("minecraft:dirt").value();
+        const auto multibit_cobblestone =
+            registry.compatible_java_runtime_id("minecraft:cobblestone").value();
+        check(multibit_chunks.ok() &&
+                multibit_chunks.value().at({ 0, 0 }).sub_chunks.at(-4).layer0[1] ==
+                    multibit_stone &&
+                multibit_chunks.value().at({ 0, 0 }).sub_chunks.at(-4).layer0[2] ==
+                    multibit_dirt &&
+                multibit_chunks.value().at({ 0, 0 }).sub_chunks.at(-4).layer0[3] ==
+                    multibit_cobblestone &&
+                multibit_chunks.value().at({ 4, 0 }).sub_chunks.at(-4).layer0[1] ==
+                    multibit_stone &&
+                multibit_chunks.value().at({ 4, 0 }).sub_chunks.at(-4).layer0[0] ==
+                    registry.air_runtime_id(),
+            "SchemV1 multi-bit cursor crosses packed words");
+        std::filesystem::remove(schem_multibit_path);
 
         const auto mcfunction_path = write_mcfunction_sample();
         const auto mcfunction = water_structure::FormatRegistry::open(mcfunction_path, registry);
