@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <fstream>
 #include <limits>
+#include <map>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -71,10 +72,30 @@ void put_property(nbt::tag_compound& states, const BlockStateProperty& property)
     }
 }
 
-nbt::tag_compound palette_entry(RuntimeRegistry& registry, std::uint32_t runtime_id)
+BlockState java_palette_state(RuntimeRegistry& registry, std::uint32_t runtime_id)
 {
     auto state = registry.java_state(runtime_id).value_or(BlockState{ "minecraft:air", {}, 0 });
     if (state.name.find(':') == std::string::npos) state.name = "minecraft:" + state.name;
+    return state;
+}
+
+std::string palette_key(const BlockState& state)
+{
+    auto properties = state.states;
+    std::ranges::sort(properties, {}, &BlockStateProperty::name);
+    std::string key = state.name;
+    for (const auto& property : properties) {
+        key.push_back('\0');
+        key += property.name;
+        key.push_back(static_cast<char>(property.type));
+        key.push_back('\0');
+        key += property.value;
+    }
+    return key;
+}
+
+nbt::tag_compound palette_entry(const BlockState& state)
+{
     nbt::tag_compound result;
     result["Name"] = nbt::tag_string(state.name);
     if (!state.states.empty()) {
@@ -105,17 +126,19 @@ Result<void> write_litematic(
     auto chunks = structure.get_chunks(positions);
     if (!chunks) return Result<void>::failure("生成 Litematic chunks 失败: " + chunks.error());
 
-    std::unordered_map<std::uint32_t, std::int32_t> palette_indices;
-    std::vector<std::uint32_t> palette{ registry.air_runtime_id() };
-    palette_indices.emplace(registry.air_runtime_id(), 0);
+    std::map<std::string, std::int32_t, std::less<>> palette_indices;
+    std::vector<BlockState> palette{ java_palette_state(registry, registry.air_runtime_id()) };
+    palette_indices.emplace(palette_key(palette.front()), 0);
     for (int y = 0; y < size.height; ++y) {
         for (int z = 0; z < size.length; ++z) {
             for (int x = 0; x < size.width; ++x) {
                 const auto runtime_id = block_at(chunks.value(), registry, x, y, z);
-                if (!palette_indices.contains(runtime_id)) {
+                auto state = java_palette_state(registry, runtime_id);
+                auto key = palette_key(state);
+                if (!palette_indices.contains(key)) {
                     const auto index = static_cast<std::int32_t>(palette.size());
-                    palette_indices.emplace(runtime_id, index);
-                    palette.push_back(runtime_id);
+                    palette_indices.emplace(std::move(key), index);
+                    palette.push_back(std::move(state));
                 }
             }
         }
@@ -128,7 +151,8 @@ Result<void> write_litematic(
         for (int z = 0; z < size.length; ++z) {
             for (int x = 0; x < size.width; ++x, ++block_index) {
                 const auto runtime_id = block_at(chunks.value(), registry, x, y, z);
-                const auto value = static_cast<std::uint64_t>(palette_indices.at(runtime_id));
+                const auto state = java_palette_state(registry, runtime_id);
+                const auto value = static_cast<std::uint64_t>(palette_indices.at(palette_key(state)));
                 const auto start_bit = static_cast<std::uint64_t>(block_index) * bits;
                 const auto word = static_cast<std::size_t>(start_bit / 64);
                 const auto offset = static_cast<unsigned>(start_bit % 64);
@@ -167,8 +191,8 @@ Result<void> write_litematic(
     region_size["y"] = nbt::tag_int(size.height);
     region_size["z"] = nbt::tag_int(size.length);
     nbt::tag_list encoded_palette(nbt::tag_type::Compound);
-    for (const auto runtime_id : palette) {
-        encoded_palette.push_back(nbt::value_initializer(palette_entry(registry, runtime_id)));
+    for (const auto& state : palette) {
+        encoded_palette.push_back(nbt::value_initializer(palette_entry(state)));
     }
     nbt::tag_compound region;
     region["Position"] = std::move(position);

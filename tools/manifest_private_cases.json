@@ -1,0 +1,17 @@
+[
+  { "name": "fuhong-v1-minimal", "input": "project:tests/fixtures/private_formats/fuhong-v1-minimal.json", "format": "FuHongV1" },
+  { "name": "fuhong-v1-truncated", "input": "project:tests/fixtures/private_formats/fuhong-v1-minimal-truncated.json", "format": "FuHongV1" },
+  { "name": "fuhong-v2-minimal", "input": "project:tests/fixtures/private_formats/fuhong-v2-minimal.json", "format": "FuHongV2" },
+  { "name": "fuhong-v2-truncated", "input": "project:tests/fixtures/private_formats/fuhong-v2-minimal-truncated.json", "format": "FuHongV2" },
+  { "name": "bds-minimal", "input": "project:tests/fixtures/private_formats/bds-minimal.bds", "format": "BDS" },
+  { "name": "bds-truncated", "input": "project:tests/fixtures/private_formats/bds-minimal-truncated.bds", "format": "BDS" },
+  { "name": "bcf-minimal", "input": "project:tests/fixtures/private_formats/bcf-minimal.bcf", "format": "BCF" },
+  { "name": "bcf-truncated", "input": "project:tests/fixtures/private_formats/bcf-minimal-truncated.bcf", "format": "BCF" },
+  { "name": "tibi-minimal", "input": "project:tests/fixtures/private_formats/tibi-minimal.tibi", "format": "TIBI" },
+  { "name": "tibi-truncated", "input": "project:tests/fixtures/private_formats/tibi-minimal-truncated.tibi", "format": "TIBI" },
+  { "name": "cov-minimal", "input": "project:tests/fixtures/private_formats/cov-minimal.covstructure", "format": "CovStructure" },
+  { "name": "cov-truncated", "input": "project:tests/fixtures/private_formats/cov-minimal-truncated.covstructure", "format": "CovStructure" },
+  { "name": "nexus-minimal", "input": "project:tests/fixtures/private_formats/nexus-minimal.np", "format": "NexusNP" },
+  { "name": "nexus-truncated", "input": "project:tests/fixtures/private_formats/nexus-minimal-truncated.np", "format": "NexusNP" },
+  { "name": "sibi-unsupported", "input": "project:tests/fixtures/private_formats/sibi-unsupported.sibi", "format": "SIBI" }
+]

@@ -715,7 +715,7 @@ void preserve_msgpack_fixture(const std::filesystem::path& path)
         std::filesystem::copy_options::overwrite_existing);
 }
 
-std::filesystem::path write_bcf_sample(bool truncated)
+std::filesystem::path write_bcf_sample(bool truncated, bool zero_z_span = false)
 {
     std::vector<std::uint8_t> bytes{ 'B', 'C', 'F', 1 };
     auto u16 = [&](std::uint16_t value) {
@@ -746,7 +746,7 @@ std::filesystem::path write_bcf_sample(bool truncated)
     const auto section_offset = bytes.size();
     u64(50); u16(static_cast<std::uint16_t>(-2)); u16(3); u16(4); u32(2);
     u32(1); for (int index = 0; index < 6; ++index) u16(0);
-    u32(2); u16(1); u16(0); u16(0); u16(1); u16(0); u16(0);
+    u32(2); u16(1); u16(0); u16(zero_z_span ? 1 : 0); u16(1); u16(0); u16(0);
 
     const auto offsets_offset = bytes.size();
     u64(1); u64(section_offset);
@@ -764,7 +764,9 @@ std::filesystem::path write_bcf_sample(bool truncated)
     patch_u64(pointer_position + 32, state_value_offset);
     if (truncated) bytes.pop_back();
     const auto path = std::filesystem::temp_directory_path() /
-        (truncated ? "water_structure_cpp_bcf_truncated.bcf" : "water_structure_cpp_bcf.bcf");
+        (truncated ? "water_structure_cpp_bcf_truncated.bcf" :
+            zero_z_span ? "water_structure_cpp_bcf_zero_z_span.bcf" :
+                "water_structure_cpp_bcf.bcf");
     std::ofstream file(path, std::ios::binary | std::ios::trunc);
     file.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
     return path;
@@ -1169,6 +1171,31 @@ int main()
             registry.legacy_runtime_id("minecraft:stone_block_slab", 0),
             "legacy names are case-normalized");
         check(water_structure::FormatRegistry::formats().size() == 37, "format count");
+        for (const auto format_id : {
+            water_structure::StructureId::Schematic,
+            water_structure::StructureId::SchemV1,
+            water_structure::StructureId::SchemV2,
+            water_structure::StructureId::Litematic,
+            water_structure::StructureId::MCStructure,
+            water_structure::StructureId::BDX,
+            water_structure::StructureId::AxiomBP,
+            water_structure::StructureId::IBImport,
+            water_structure::StructureId::FuHongV4,
+            water_structure::StructureId::FuHongV5 }) {
+            const auto format = std::ranges::find_if(
+                water_structure::FormatRegistry::formats(),
+                [format_id](const auto& value) { return value.id == format_id; });
+            check(format != water_structure::FormatRegistry::formats().end() &&
+                format->writer_implemented && format->world_export_implemented,
+                "Go FromMCWorld writer capability");
+        }
+        const auto sibi_format = std::ranges::find_if(
+            water_structure::FormatRegistry::formats(),
+            [](const auto& value) { return value.id == water_structure::StructureId::SIBI; });
+        check(sibi_format != water_structure::FormatRegistry::formats().end() &&
+            !sibi_format->reader_implemented && !sibi_format->writer_implemented &&
+            !sibi_format->magic_signatures.empty() && sibi_format->magic_signatures.front() == "H4/Go oracle unsupported",
+            "SIBI capability and magic metadata");
         for (const auto version : {
             water_structure::StructureId::MianYangV1,
             water_structure::StructureId::MianYangV2,
@@ -1672,6 +1699,11 @@ int main()
         check(bcf_format != water_structure::FormatRegistry::formats().end() &&
             bcf_format->reader_implemented && bcf_format->world_import_implemented,
             "BCF capabilities");
+        const auto zero_span_bcf_path = write_bcf_sample(false, true);
+        const auto zero_span_bcf = water_structure::FormatRegistry::open(zero_span_bcf_path, registry);
+        check(zero_span_bcf.ok() && zero_span_bcf.value()->count_non_air_blocks().value() == 1,
+            "BCF Go-compatible zero reversed span count");
+        std::filesystem::remove(zero_span_bcf_path);
         const auto truncated_bcf = write_bcf_sample(true);
         const auto invalid_bcf = water_structure::FormatRegistry::open(truncated_bcf, registry);
         check(!invalid_bcf.ok() && invalid_bcf.error().find("offset") != std::string::npos,

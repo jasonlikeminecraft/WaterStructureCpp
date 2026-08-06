@@ -5,6 +5,7 @@
 
 #include <array>
 #include <filesystem>
+#include <unordered_map>
 #include <vector>
 
 namespace water_structure {
@@ -17,7 +18,7 @@ public:
     std::string_view name() const noexcept override { return "KBDX"; }
     Size size() const noexcept override { return mSize; }
     BlockPos offset() const noexcept override { return mOffset; }
-    void set_offset(BlockPos offset) noexcept override { mOffset = offset; }
+    void set_offset(BlockPos offset) noexcept override;
 
     Result<void> read(const std::filesystem::path& path) override;
     Result<ChunkMap> get_chunks(std::span<const ChunkPos> positions) const override;
@@ -36,8 +37,10 @@ private:
 
     RuntimeRegistry& mRegistry;
     Size mSize{};
+    Size mOriginalSize{};
     BlockPos mOffset{};
     std::vector<Block> mBlocks;
+    std::unordered_map<BlockPos, NbtPayload, BlockPosHash> mBlockEntities;
     std::size_t mNonAirBlocks = 0;
 };
 

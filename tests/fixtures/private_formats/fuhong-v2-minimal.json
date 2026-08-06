@@ -1,0 +1,1 @@
+{"Build_Info":{},"FuHongBuild_FinalFormat":[{"block":[{"a":[0],"d":[{"d":[{"count":1,"damage":0,"name":"stone","slot":0}]}],"n":"minecraft:chest","x":[-1],"y":[2],"z":[3]},{"a":0,"c":{"a":[true],"c":["say v2"],"n":["Tester"],"t":[2]},"n":"minecraft:command_block","state":["conditional_bit=true"],"x":[0],"y":[2],"z":[3]}]}]}

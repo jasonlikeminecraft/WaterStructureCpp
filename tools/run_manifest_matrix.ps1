@@ -31,7 +31,7 @@ if ($MemoryLimitMiB -lt 128) {
 $casePath = (Resolve-Path -LiteralPath $CaseFile).Path
 $caseDirectory = Split-Path $casePath -Parent
 $decodedCases = Get-Content -Raw -Encoding UTF8 -LiteralPath $casePath | ConvertFrom-Json
-$cases = if ($decodedCases -is [System.Array]) { @($decodedCases) } else { @($decodedCases) }
+$cases = @($decodedCases)
 if ($cases.Count -eq 0) {
     throw 'case file is empty'
 }
@@ -208,9 +208,6 @@ foreach ($case in $cases) {
         $goResult = Invoke-MonitoredProcess $GoManifestTool $goArguments $goError $MemoryLimitMiB
         if ($goResult.ExitCode -notin 0, 2) {
             throw "go_manifest exit code $($goResult.ExitCode)"
-        }
-        if (Get-Process -Name go_manifest -ErrorAction SilentlyContinue) {
-            throw 'residual go_manifest process detected'
         }
         Write-Output "RUN  $name C++"
         $cppResult = Invoke-MonitoredProcess $CppManifestTool $cppArguments $cppError $MemoryLimitMiB

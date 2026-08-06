@@ -4,12 +4,20 @@
 #include <WaterStructure/world.hpp>
 
 #include <nlohmann/json.hpp>
+#include <io/stream_writer.h>
+#include <tag_compound.h>
+#include <tag_primitive.h>
+#include <tag_string.h>
 
 #include <algorithm>
 #include <array>
+#include <cctype>
+#include <cmath>
 #include <cstdint>
 #include <fstream>
 #include <limits>
+#include <optional>
+#include <regex>
 #include <sstream>
 #include <unordered_map>
 
@@ -51,7 +59,96 @@ std::uint32_t& block_at(SubChunkData& chunk, int layer, int x, int y, int z)
     return layer == 0 ? chunk.layer0[index] : chunk.layer1[index];
 }
 
+std::optional<std::int32_t> json_int(const nlohmann::json& object, const char* key)
+{
+    const auto found = object.find(key);
+    if (found == object.end()) return std::nullopt;
+    if (found->is_number_integer()) {
+        const auto value = found->get<std::int64_t>();
+        if (value < std::numeric_limits<std::int32_t>::min() ||
+            value > std::numeric_limits<std::int32_t>::max()) return std::nullopt;
+        return static_cast<std::int32_t>(value);
+    }
+    if (found->is_number_unsigned()) {
+        const auto value = found->get<std::uint64_t>();
+        if (value > static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max())) {
+            return std::nullopt;
+        }
+        return static_cast<std::int32_t>(value);
+    }
+    if (found->is_number_float()) {
+        const auto value = found->get<double>();
+        if (!std::isfinite(value) || value < std::numeric_limits<std::int32_t>::min() ||
+            value > std::numeric_limits<std::int32_t>::max()) return std::nullopt;
+        return static_cast<std::int32_t>(value);
+    }
+    return std::nullopt;
+}
+
+bool json_bool(const nlohmann::json& object, const char* key)
+{
+    const auto found = object.find(key);
+    if (found == object.end()) return false;
+    if (found->is_boolean()) return found->get<bool>();
+    if (found->is_number_integer()) return found->get<std::int64_t>() != 0;
+    if (found->is_number_unsigned()) return found->get<std::uint64_t>() != 0;
+    if (found->is_number_float()) return found->get<double>() != 0;
+    if (found->is_string()) {
+        auto value = found->get<std::string>();
+        std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        });
+        return value == "true" || value == "1";
+    }
+    return false;
+}
+
+std::string json_string(const nlohmann::json& object, const char* key)
+{
+    const auto found = object.find(key);
+    if (found == object.end() || found->is_null()) return "<nil>";
+    if (found->is_string()) return found->get<std::string>();
+    if (found->is_boolean()) return found->get<bool>() ? "true" : "false";
+    return found->dump();
+}
+
+NbtPayload command_block_nbt(const nlohmann::json& entity)
+{
+    static const std::regex execute_regex(
+        R"([ ]*?/?[ ]*?execute[ ]*?(as|at|align|anchored|facing|in|positioned|rotated|if|unless|run))");
+
+    const auto command = json_string(entity, "Command");
+    nbt::tag_compound root;
+    root["id"] = nbt::tag_string("CommandBlock");
+    root["Command"] = nbt::tag_string(command);
+    root["CustomName"] = nbt::tag_string(json_string(entity, "CustomName"));
+    root["ExecuteOnFirstTick"] = nbt::tag_byte(json_bool(entity, "ExecuteOnFirstTick") ? 1 : 0);
+    root["TrackOutput"] = nbt::tag_byte(json_bool(entity, "TrackOutput") ? 1 : 0);
+    root["conditionalMode"] = nbt::tag_byte(json_bool(entity, "isConditional") ? 1 : 0);
+    root["auto"] = nbt::tag_byte(json_bool(entity, "redstone") ? 0 : 1);
+    root["TickDelay"] = nbt::tag_int(json_int(entity, "TickDelay").value_or(0));
+    root["Powered"] = nbt::tag_byte(0);
+    root["LPCommandMode"] = nbt::tag_int(json_int(entity, "Mode").value_or(0));
+    root["LastOutput"] = nbt::tag_string(json_string(entity, "LastOutput"));
+    root["Version"] = nbt::tag_int(std::regex_search(command, execute_regex) ? 38 : 19);
+
+    std::ostringstream output(std::ios::binary);
+    nbt::io::write_tag("", root, output, endian::little);
+    const auto bytes = output.str();
+    return { bytes.begin(), bytes.end() };
+}
+
 } // namespace
+
+void KbdxStructure::set_offset(BlockPos offset) noexcept
+{
+    mOffset = offset;
+    mSize = {
+        mOriginalSize.width + std::abs(offset.x),
+        mOriginalSize.height + std::abs(offset.y),
+        mOriginalSize.length + std::abs(offset.z)
+    };
+}
 
 Result<void> KbdxStructure::read(const std::filesystem::path& path)
 {
@@ -101,6 +198,22 @@ Result<void> KbdxStructure::read(const std::filesystem::path& path)
             return Result<void>::failure("KBDX 元数据根节点不是对象");
         }
 
+        std::unordered_map<BlockPos, NbtPayload, BlockPosHash> block_entities;
+        if (const auto entities = root.find("BlockEntityData");
+            entities != root.end() && entities->is_array()) {
+            for (const auto& entity : *entities) {
+                if (!entity.is_object()) continue;
+                const auto x = json_int(entity, "x");
+                const auto y = json_int(entity, "y");
+                const auto z = json_int(entity, "z");
+                if (!x || !y || !z) continue;
+                const auto id = json_string(entity, "id");
+                if (id.ends_with("command_block")) {
+                    block_entities[{ *x, *y, *z }] = command_block_nbt(entity);
+                }
+            }
+        }
+
         std::unordered_map<std::uint32_t, std::string> palette;
         for (const auto& [name, value] : root.items()) {
             if (value.is_number_integer()) {
@@ -119,13 +232,21 @@ Result<void> KbdxStructure::read(const std::filesystem::path& path)
         int max_z = std::numeric_limits<int>::min();
 
         mBlocks.clear();
+        mBlockEntities.clear();
         mNonAirBlocks = 0;
         for (const auto& item : raw) {
             const auto palette_it = palette.find(item.index);
-            const auto name = palette_it == palette.end() ? "minecraft:unknown" : palette_it->second;
-            const auto existing_runtime = mRegistry.find(name);
-            const auto runtime_id = existing_runtime ? *existing_runtime :
-                mRegistry.register_state(BlockState{ name, {}, 0 });
+            auto name = palette_it == palette.end() ? std::string{} : palette_it->second;
+            name.erase(name.begin(), std::find_if(name.begin(), name.end(), [](unsigned char c) {
+                return !std::isspace(c);
+            }));
+            name.erase(std::find_if(name.rbegin(), name.rend(), [](unsigned char c) {
+                return !std::isspace(c);
+            }).base(), name.end());
+            if (!name.empty() && name.find(':') == std::string::npos) name = "minecraft:" + name;
+            const auto runtime_id = mRegistry.legacy_runtime_id(name, static_cast<std::uint16_t>(item.aux))
+                .or_else([&] { return mRegistry.compatible_java_runtime_id(name); })
+                .value_or(mRegistry.find("minecraft:unknown").value_or(mRegistry.air_runtime_id()));
             min_x = std::min(min_x, static_cast<int>(item.x));
             min_y = std::min(min_y, static_cast<int>(item.y));
             min_z = std::min(min_z, static_cast<int>(item.z));
@@ -146,12 +267,17 @@ Result<void> KbdxStructure::read(const std::filesystem::path& path)
             block.y -= min_y;
             block.z -= min_z;
         }
-        mSize = {
+        for (auto& [position, payload] : block_entities) {
+            mBlockEntities.emplace(
+                BlockPos{ position.x - min_x, position.y - min_y, position.z - min_z },
+                std::move(payload));
+        }
+        mOriginalSize = {
             max_x - min_x + 1,
             max_y - min_y + 1,
             max_z - min_z + 1
         };
-        mOffset = {};
+        set_offset({});
         return Result<void>::success();
     } catch (const std::exception& error) {
         return Result<void>::failure(std::string("解析 KBDX 失败: ") + error.what());
@@ -193,6 +319,24 @@ Result<NbtChunkMap> KbdxStructure::get_chunk_nbt(std::span<const ChunkPos> posit
     NbtChunkMap result;
     for (const auto pos : positions) {
         result.emplace(pos, std::vector<BlockEntity>{});
+    }
+    for (const auto& [source, payload] : mBlockEntities) {
+        const BlockPos position{
+            source.x + mOffset.x,
+            source.y + mOffset.y,
+            source.z + mOffset.z
+        };
+        const auto chunk = block_to_chunk(position);
+        const auto found = result.find(chunk);
+        if (found == result.end()) continue;
+        found->second.push_back({
+            {
+                floor_mod(position.x, 16),
+                structure_y_to_chunk_local(position.y),
+                floor_mod(position.z, 16)
+            },
+            payload
+        });
     }
     return Result<NbtChunkMap>::success(std::move(result));
 }

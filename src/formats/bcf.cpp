@@ -224,8 +224,29 @@ Result<void> BcfStructure::read(const std::filesystem::path& path)
                         static_cast<std::uint64_t>(region.maximum.z - region.minimum.z + 1);
                     if (expanded > kMaxExpandedBlocks - volume) throw std::runtime_error("expanded block count exceeds limit");
                     expanded += volume;
-                    mNonAirBlocks = mNonAirBlocks > std::numeric_limits<std::size_t>::max() - volume
-                        ? std::numeric_limits<std::size_t>::max() : mNonAirBlocks + static_cast<std::size_t>(volume);
+                    // The Go oracle counts reversed BCF regions using abs(end-start+1),
+                    // even though materialization normalizes the endpoints with min/max.
+                    // Keep that historical quirk in the manifest count.
+                    const auto go_span = [](std::int32_t first_value, std::int32_t second_value) {
+                        const auto value = static_cast<std::int64_t>(second_value) - first_value + 1;
+                        return static_cast<std::uint64_t>(value < 0 ? -value : value);
+                    };
+                    const auto count_x = go_span(first.x, second.x);
+                    const auto count_y = go_span(first.y, second.y);
+                    const auto count_z = go_span(first.z, second.z);
+                    const auto saturating_multiply = [](std::uint64_t left, std::uint64_t right) {
+                        if (left == 0 || right == 0) return std::uint64_t{ 0 };
+                        if (left > std::numeric_limits<std::uint64_t>::max() / right) {
+                            return std::numeric_limits<std::uint64_t>::max();
+                        }
+                        return left * right;
+                    };
+                    const auto counted_volume = saturating_multiply(
+                        saturating_multiply(count_x, count_y), count_z);
+                    mNonAirBlocks = mNonAirBlocks > std::numeric_limits<std::size_t>::max() -
+                        std::min<std::uint64_t>(counted_volume, std::numeric_limits<std::size_t>::max())
+                        ? std::numeric_limits<std::size_t>::max()
+                        : mNonAirBlocks + static_cast<std::size_t>(counted_volume);
                     if (!populated) { populated = true; bounds_min = region.minimum; bounds_max = region.maximum; }
                     else {
                         bounds_min.x = std::min(bounds_min.x, region.minimum.x); bounds_min.y = std::min(bounds_min.y, region.minimum.y);

@@ -44,8 +44,18 @@ std::optional<std::vector<BlockStateProperty>> states(std::string_view text)
     std::vector<BlockStateProperty> result;
     std::size_t begin = 0;
     while (begin <= text.size()) {
-        const auto comma = text.find(',', begin);
-        const auto part = text.substr(begin, comma == std::string_view::npos ? text.size() - begin : comma - begin);
+        auto comma = std::string_view::npos;
+        bool quoted = false;
+        for (auto index = begin; index < text.size(); ++index) {
+            if (text[index] == '"') quoted = !quoted;
+            if (text[index] == ',' && !quoted) {
+                comma = index;
+                break;
+            }
+        }
+        const auto part = text.substr(
+            begin,
+            comma == std::string_view::npos ? text.size() - begin : comma - begin);
         if (!part.empty()) {
             const auto equal = part.find('=');
             if (equal == std::string_view::npos || equal == 0) return std::nullopt;
@@ -60,7 +70,10 @@ std::optional<std::vector<BlockStateProperty>> states(std::string_view text)
             BlockStateProperty property;
             property.name = std::move(name);
             property.value = std::move(value);
-            if (property.value == "true" || property.value == "false") property.type = BlockStateValueType::Byte;
+            if (property.value == "true" || property.value == "false") {
+                property.type = BlockStateValueType::Byte;
+                property.value = property.value == "true" ? "1" : "0";
+            }
             else {
                 std::int32_t numeric = 0;
                 const auto parsed = std::from_chars(property.value.data(), property.value.data() + property.value.size(), numeric);
@@ -103,8 +116,20 @@ Result<void> McFunctionStructure::read(const std::filesystem::path& path)
     auto add = [&](std::int32_t x, std::int32_t y, std::int32_t z, std::string name, std::string state_text) -> Result<void> {
         auto parsed_states = states(state_text);
         if (!parsed_states) return Result<void>::failure("第 " + std::to_string(line_number) + " 行: 状态格式无效");
-        const auto runtime = mRegistry.find(name, *parsed_states);
-        const auto runtime_id = runtime.value_or(mRegistry.register_state(BlockState{ std::move(name), std::move(*parsed_states), 0 }));
+        std::optional<std::uint32_t> runtime;
+        if (!parsed_states->empty()) {
+            runtime = mRegistry.legacy_state_runtime_id(name, *parsed_states);
+        } else {
+            runtime = mRegistry.legacy_state_runtime_id(name, {});
+            if (!runtime) runtime = mRegistry.legacy_runtime_id(name, 0);
+        }
+        if (!runtime) {
+            std::string encoded = name;
+            if (!state_text.empty()) encoded += state_text;
+            runtime = mRegistry.compatible_java_runtime_id(encoded);
+        }
+        const auto runtime_id = runtime.value_or(
+            mRegistry.find("minecraft:unknown").value_or(mRegistry.air_runtime_id()));
         blocks[{ x, y, z }] = { x, y, z, runtime_id };
         min_x = std::min(min_x, x); min_y = std::min(min_y, y); min_z = std::min(min_z, z);
         max_x = std::max(max_x, x); max_y = std::max(max_y, y); max_z = std::max(max_z, z);
@@ -118,6 +143,16 @@ Result<void> McFunctionStructure::read(const std::filesystem::path& path)
         auto command = line.substr(0, lower_end);
         std::transform(command.begin(), command.end(), command.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
         if (command != "setblock" && command != "fill") continue;
+
+        std::string state_text;
+        if (const auto open = line.find('['); open != std::string::npos) {
+            if (const auto close = line.find_last_of(']');
+                close != std::string::npos && close > open) {
+                state_text = line.substr(open, close - open + 1);
+                line = trim(line.substr(0, open) + line.substr(close + 1));
+            }
+        }
+
         const auto fields = split_fields(line);
         const bool fill = command == "fill";
         const std::size_t name_index = fill ? 7 : 4;
@@ -129,10 +164,7 @@ Result<void> McFunctionStructure::read(const std::filesystem::path& path)
             if (fields.size() < 8) continue;
             const auto x1 = parse_coord(1), y1 = parse_coord(2), z1 = parse_coord(3), x2 = parse_coord(4), y2 = parse_coord(5), z2 = parse_coord(6);
             if (!x1 || !y1 || !z1 || !x2 || !y2 || !z2) return Result<void>::failure("第 " + std::to_string(line_number) + " 行: 坐标无效");
-            const auto name_and_state = fields[name_index];
-            const auto open = name_and_state.find('[');
-            const auto block_name = open == std::string::npos ? name_and_state : name_and_state.substr(0, open);
-            const auto state_text = open == std::string::npos ? std::string{} : name_and_state.substr(open);
+            const auto& block_name = fields[name_index];
             for (auto x = std::min(*x1, *x2); x <= std::max(*x1, *x2); ++x)
                 for (auto y = std::min(*y1, *y2); y <= std::max(*y1, *y2); ++y)
                     for (auto z = std::min(*z1, *z2); z <= std::max(*z1, *z2); ++z) {
@@ -141,9 +173,7 @@ Result<void> McFunctionStructure::read(const std::filesystem::path& path)
         } else {
             const auto x = parse_coord(1), y = parse_coord(2), z = parse_coord(3);
             if (!x || !y || !z) return Result<void>::failure("第 " + std::to_string(line_number) + " 行: 坐标无效");
-            const auto name_and_state = fields[name_index];
-            const auto open = name_and_state.find('[');
-            auto result = add(*x, *y, *z, open == std::string::npos ? name_and_state : name_and_state.substr(0, open), open == std::string::npos ? std::string{} : name_and_state.substr(open));
+            auto result = add(*x, *y, *z, fields[name_index], state_text);
             if (!result) return result;
         }
     }
