@@ -226,20 +226,24 @@ Result<ChunkData> BedrockWorldAdapter::load_chunk_range(
     }
 
     ChunkData result;
-    for (std::int32_t sub_y = min_sub_y; sub_y <= max_sub_y; ++sub_y) {
-        auto loaded = mWorld->loadSubChunk(
-            BedrockWorldOperator::Dimension::Overworld,
-            { pos.x, sub_y, pos.z }
-        );
-        if (!loaded) {
-            continue;
-        }
+    auto loaded = mWorld->loadSubChunks(
+        BedrockWorldOperator::Dimension::Overworld,
+        { pos.x, pos.z },
+        min_sub_y,
+        max_sub_y
+    );
+    if (!loaded) {
+        return Result<ChunkData>::failure(loaded.error);
+    }
 
-        const auto blocks0 = loaded.value.blocks(0);
+    for (auto& decoded : loaded.value) {
+        const auto sub_y = decoded.index;
+        auto& loaded_subchunk = decoded.subChunk;
+        const auto blocks0 = loaded_subchunk.blocks(0);
         if (blocks0.size() != 4096) {
             return Result<ChunkData>::failure(error_for("读取 subchunk 失败", "方块数量不是 4096"));
         }
-        const auto blocks1 = include_layer1 ? loaded.value.blocks(1) : BedrockWorldOperator::BlockRuntimeList{};
+        const auto blocks1 = include_layer1 ? loaded_subchunk.blocks(1) : BedrockWorldOperator::BlockRuntimeList{};
         if (include_layer1 && blocks1.size() != 4096) {
             return Result<ChunkData>::failure(error_for("读取 subchunk 失败", "方块数量不是 4096"));
         }

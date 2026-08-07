@@ -147,6 +147,11 @@ private:
     friend Result<Bytes> encodeSubChunkPayload(const SubChunk& subChunk, Encoding encoding, int rangeStart, int rangeEnd, int index);
 };
 
+struct PositionedSubChunkWrite {
+    SubChunkPos position;
+    std::optional<SubChunk> subChunk;
+};
+
 class Chunk {
 public:
     Chunk();
@@ -161,6 +166,8 @@ private:
     explicit Chunk(std::shared_ptr<Impl> impl);
     std::shared_ptr<Impl> mImpl;
 };
+
+struct DecodedSubChunk;
 
 struct DecodedSubChunk {
     SubChunk subChunk;
@@ -182,9 +189,11 @@ public:
     Result<void> close();
     Result<Bytes> levelDat() const;
     Result<SubChunk> loadSubChunk(Dimension dim, SubChunkPos pos) const;
+    Result<std::vector<DecodedSubChunk>> loadSubChunks(Dimension dim, ChunkPos chunk, int minSubY, int maxSubY) const;
     Result<BlockStateList> loadSubChunkBlockStates(Dimension dim, SubChunkPos pos) const;
     Result<std::vector<SubChunkPos>> listSubChunks(Dimension dim) const;
     Result<void> saveSubChunk(Dimension dim, SubChunkPos pos, const SubChunk& subChunk);
+    Result<void> saveSubChunksBatch(Dimension dim, std::span<const PositionedSubChunkWrite> writes);
     Result<Bytes> loadNbt(Dimension dim, ChunkPos pos) const;
     Result<std::vector<ChunkPos>> listNbtChunks(Dimension dim) const;
     Result<void> saveNbt(Dimension dim, ChunkPos pos, std::span<const std::uint8_t> payload);

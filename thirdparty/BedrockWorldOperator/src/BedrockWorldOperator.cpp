@@ -23,6 +23,7 @@
 #include <mutex>
 #include <optional>
 #include <sstream>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -566,6 +567,7 @@ public:
         if (name.rfind("minecraft:", 0) != 0) {
             name = "minecraft:" + name;
         }
+
         if (mResolver.stateToRuntimeId) {
             BedrockWorldOperator::BlockState state;
             state.name = name;
@@ -581,7 +583,11 @@ public:
                     break;
                 case TagType::Short:
                     property.type = BedrockWorldOperator::BlockStateValueType::Short;
-                    property.intValue = source.intValue;
+                    property.intValue = static_cast<int16_t>(source.intValue);
+                    break;
+                case TagType::Int:
+                    property.type = BedrockWorldOperator::BlockStateValueType::Int;
+                    property.intValue = static_cast<int32_t>(source.intValue);
                     break;
                 case TagType::Long:
                     property.type = BedrockWorldOperator::BlockStateValueType::Long;
@@ -591,11 +597,8 @@ public:
                     property.type = BedrockWorldOperator::BlockStateValueType::String;
                     property.stringValue = source.stringValue;
                     break;
-                case TagType::Int:
                 default:
-                    property.type = BedrockWorldOperator::BlockStateValueType::Int;
-                    property.intValue = source.intValue;
-                    break;
+                    continue;
                 }
                 state.states.push_back(std::move(property));
             }
@@ -603,6 +606,7 @@ public:
                 return runtime;
             }
         }
+
         if (!mResolver.nameToRuntimeId) {
             return std::nullopt;
         }
@@ -1144,7 +1148,7 @@ public:
         return world;
     }
 
-    std::string get(const std::vector<uint8_t>& key) {
+    std::string get(const std::vector<uint8_t>& key) const {
         std::string value;
         auto status = mDb->Get(leveldb::ReadOptions(), slice(key), &value);
         if (status.IsNotFound()) {
@@ -1286,6 +1290,60 @@ public:
         const int fixed = ((y << 4) - rangeStartForDim(dm)) >> 4;
         auto payload = encodeSubChunk(sub, rangeStartForDim(dm), fixed, EncodingKind::Disk);
         return put(subChunkKey(dm, x, y, z), std::string(reinterpret_cast<const char*>(payload.data()), payload.size()));
+    }
+
+    std::string saveSubChunksBatch(int dm, std::span<const BedrockWorldOperator::PositionedSubChunkWrite> writes) {
+        if (!mDb) {
+            return "database is not open";
+        }
+        leveldb::WriteBatch batch;
+        std::set<std::pair<int, int>> metadata;
+        for (const auto& write : writes) {
+            const auto& pos = write.position;
+            if (!metadata.emplace(pos.x, pos.z).second) {
+                continue;
+            }
+            const auto metaKey = makeChunkKey(dm, pos.x, pos.z, {','});
+            batch.Put(slice(metaKey), leveldb::Slice(std::string(1, static_cast<char>(kChunkVersion))));
+            std::vector<uint8_t> finalisation;
+            writeLe32(finalisation, kFinalisationGenerated);
+            const auto finalKey = makeChunkKey(dm, pos.x, pos.z, {'6'});
+            batch.Put(slice(finalKey), slice(finalisation));
+        }
+        for (const auto& write : writes) {
+            const auto& pos = write.position;
+            const auto key = subChunkKey(dm, pos.x, pos.y, pos.z);
+            if (!write.subChunk || !write.subChunk->valid()) {
+                batch.Delete(slice(key));
+                continue;
+            }
+            const int fixed = ((pos.y << 4) - rangeStartForDim(dm)) >> 4;
+            const auto encoded = BedrockWorldOperator::encodeSubChunkPayload(
+                *write.subChunk,
+                BedrockWorldOperator::Encoding::Disk,
+                rangeStartForDim(dm),
+                rangeEndForDim(dm),
+                fixed);
+            if (!encoded.ok) {
+                return encoded.error;
+            }
+            batch.Put(slice(key), leveldb::Slice(reinterpret_cast<const char*>(encoded.value.data()), encoded.value.size()));
+        }
+        const auto status = mDb->Write(leveldb::WriteOptions(), &batch);
+        return status.ok() ? "" : status.ToString();
+    }
+
+    std::vector<std::pair<std::string, int>> loadSubChunkPayloads(int dm, int x, int z, int minSubY, int maxSubY) const {
+        std::vector<std::pair<std::string, int>> result;
+        if (!mDb) return result;
+        const int minY = std::max(minSubY, rangeStartForDim(dm) >> 4);
+        const int maxY = std::min(maxSubY, rangeEndForDim(dm) >> 4);
+        result.reserve(static_cast<size_t>(std::max(0, maxY - minY + 1)));
+        for (int y = minY; y <= maxY; ++y) {
+            const auto data = get(subChunkKey(dm, x, y, z));
+            if (!data.empty()) result.emplace_back(data, y);
+        }
+        return result;
     }
 
     std::vector<std::string> loadChunkPayloadOnly(int dm, int x, int z, bool& exists) {
@@ -1633,6 +1691,28 @@ Result<SubChunk> World::loadSubChunk(Dimension dim, SubChunkPos pos) const
     return Result<SubChunk>::success(SubChunk(std::move(impl)));
 }
 
+Result<std::vector<DecodedSubChunk>> World::loadSubChunks(Dimension dim, ChunkPos chunk, int minSubY, int maxSubY) const
+{
+    if (!valid()) {
+        return Result<std::vector<DecodedSubChunk>>::failure("World::loadSubChunks: world is not open");
+    }
+    if (minSubY > maxSubY) {
+        return Result<std::vector<DecodedSubChunk>>::success({});
+    }
+    const int dimensionId = toDimensionId(dim);
+    const auto payloads = mImpl->native->loadSubChunkPayloads(dimensionId, chunk.x, chunk.z, minSubY, maxSubY);
+    std::vector<DecodedSubChunk> result;
+    result.reserve(payloads.size());
+    for (const auto& [payload, y] : payloads) {
+        const auto bytes = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(payload.data()), payload.size());
+        auto decoded = decodeSubChunkPayload(bytes, Encoding::Disk, rangeStartForDim(dimensionId), rangeEndForDim(dimensionId));
+        if (!decoded.ok) continue;
+        decoded.value.index = y;
+        result.push_back(std::move(decoded.value));
+    }
+    return Result<std::vector<DecodedSubChunk>>::success(std::move(result));
+}
+
 Result<BlockStateList> World::loadSubChunkBlockStates(Dimension dim, SubChunkPos pos) const
 {
     if (!valid()) {
@@ -1677,6 +1757,21 @@ Result<void> World::saveSubChunk(Dimension dim, SubChunkPos pos, const SubChunk&
     const auto err = mImpl->native->saveSubChunk(toDimensionId(dim), pos.x, pos.y, pos.z, *subChunk.mImpl->native);
     if (!err.empty()) {
         return Result<void>::failure("World::saveSubChunk: " + err);
+    }
+    return Result<void>::success();
+}
+
+Result<void> World::saveSubChunksBatch(Dimension dim, std::span<const PositionedSubChunkWrite> writes)
+{
+    if (!valid()) {
+        return Result<void>::failure("World::saveSubChunksBatch: world is not open");
+    }
+    if (writes.empty()) {
+        return Result<void>::success();
+    }
+    const auto err = mImpl->native->saveSubChunksBatch(toDimensionId(dim), writes);
+    if (!err.empty()) {
+        return Result<void>::failure("World::saveSubChunksBatch: " + err);
     }
     return Result<void>::success();
 }
