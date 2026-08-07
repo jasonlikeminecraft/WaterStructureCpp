@@ -33,17 +33,14 @@ double elapsed_ms(const Clock::time_point start)
     return std::chrono::duration<double, std::milli>(Clock::now() - start).count();
 }
 
-std::size_t append_varint(std::vector<char>& output, std::uint32_t value)
+void append_varint(char* output, std::size_t& cursor, std::uint32_t value)
 {
-    std::size_t written = 0;
     do {
         auto byte = static_cast<std::uint8_t>(value & 0x7fu);
         value >>= 7u;
         if (value != 0) byte |= 0x80u;
-        output.push_back(static_cast<char>(byte));
-        ++written;
+        output[cursor++] = static_cast<char>(byte);
     } while (value != 0);
-    return written;
 }
 
 std::string java_state_string(RuntimeRegistry& registry, std::uint32_t runtime_id)
@@ -160,12 +157,18 @@ Result<void> write_schem(
     }
 
     std::unordered_map<std::uint32_t, std::int32_t> palette_indices;
+    constexpr std::size_t kRuntimePaletteCacheSize = 1u << 16;
+    std::vector<std::int32_t> runtime_palette_cache(
+        kRuntimePaletteCacheSize, static_cast<std::int32_t>(-1));
     std::unordered_map<std::string, std::int32_t> palette_state_indices;
     std::vector<std::uint32_t> palette;
     std::vector<std::string> palette_state_strings;
     palette.reserve(1024);
     if (format == StructureId::SchemV1) {
         palette_indices.emplace(registry.air_runtime_id(), 0);
+        if (registry.air_runtime_id() < runtime_palette_cache.size()) {
+            runtime_palette_cache[registry.air_runtime_id()] = 0;
+        }
         palette.push_back(registry.air_runtime_id());
         palette_state_indices.emplace("minecraft:air", 0);
         palette_state_strings.emplace_back("minecraft:air");
@@ -199,11 +202,20 @@ Result<void> write_schem(
         std::uint64_t stripe_size = 0;
         std::vector<const BlockLayer*> layers(static_cast<std::size_t>(chunk_x_count));
         std::vector<char> row_buffer;
-        row_buffer.reserve(static_cast<std::size_t>(size.width) *
-            static_cast<std::size_t>(z_end - z_begin) * 2);
+        row_buffer.resize(static_cast<std::size_t>(size.width) *
+            static_cast<std::size_t>(z_end - z_begin) * 5);
         const auto palette_index_for = [&](const std::uint32_t runtime_id) {
+            if (runtime_id < runtime_palette_cache.size()) {
+                const auto cached = runtime_palette_cache[runtime_id];
+                if (cached >= 0) return cached;
+            }
             auto found = palette_indices.find(runtime_id);
-            if (found != palette_indices.end()) return found->second;
+            if (found != palette_indices.end()) {
+                if (runtime_id < runtime_palette_cache.size()) {
+                    runtime_palette_cache[runtime_id] = found->second;
+                }
+                return found->second;
+            }
             const auto state_string = java_state_string(registry, runtime_id);
             const auto state_found = palette_state_indices.find(state_string);
             const auto index = state_found == palette_state_indices.end()
@@ -214,6 +226,9 @@ Result<void> write_schem(
                 palette.push_back(runtime_id);
             }
             palette_indices.emplace(runtime_id, index);
+            if (runtime_id < runtime_palette_cache.size()) {
+                runtime_palette_cache[runtime_id] = index;
+            }
             return index;
         };
         for (int y = 0; y < size.height; ++y) {
@@ -229,7 +244,7 @@ Result<void> write_schem(
                     layers[static_cast<std::size_t>(chunk_x)] = &sub->second.layer0;
                 }
             }
-            row_buffer.clear();
+            std::size_t row_size = 0;
             for (int z = z_begin; z < z_end; ++z) {
                 const auto local_z = floor_mod(z, 16);
                 for (int chunk_x = 0; chunk_x < chunk_x_count; ++chunk_x) {
@@ -240,19 +255,20 @@ Result<void> write_schem(
                         const auto air_index = palette_index_for(registry.air_runtime_id());
                         for (int x = x_begin; x < x_end; ++x) {
                             static_cast<void>(x);
-                            stripe_size += append_varint(row_buffer, static_cast<std::uint32_t>(air_index));
+                            append_varint(row_buffer.data(), row_size, static_cast<std::uint32_t>(air_index));
                         }
                         continue;
                     }
                     const auto row_start = static_cast<std::size_t>(local_y * 16 + local_z) * 16;
                     for (int x = x_begin; x < x_end; ++x) {
                         const auto runtime_id = (*layer)[row_start + static_cast<std::size_t>(x - x_begin)];
-                        stripe_size += append_varint(row_buffer,
+                        append_varint(row_buffer.data(), row_size,
                             static_cast<std::uint32_t>(palette_index_for(runtime_id)));
                     }
                 }
             }
-            output.write(row_buffer.data(), static_cast<std::streamsize>(row_buffer.size()));
+            stripe_size += row_size;
+            output.write(row_buffer.data(), static_cast<std::streamsize>(row_size));
             if (!output) return Result<void>::failure("写入 Schem 临时 BlockData 失败");
         }
         stripe.row_offsets[static_cast<std::size_t>(size.height)] = stripe_size;

@@ -66,11 +66,15 @@ const BlockLayer* layer_for(const ChunkData& chunk, std::int32_t sub_y, int laye
     return layer == 0 ? &it->second.layer0 : &it->second.layer1;
 }
 
-bool has_non_air(const SubChunkData& sub_chunk, const std::uint32_t air_runtime_id)
+bool has_non_air(
+    const SubChunkData& sub_chunk,
+    const std::uint32_t air_runtime_id,
+    const bool include_layer1)
 {
-    return std::ranges::any_of(sub_chunk.layer0, [air_runtime_id](const auto runtime_id) {
+    if (std::ranges::any_of(sub_chunk.layer0, [air_runtime_id](const auto runtime_id) {
         return runtime_id != air_runtime_id;
-    }) || std::ranges::any_of(sub_chunk.layer1, [air_runtime_id](const auto runtime_id) {
+    })) return true;
+    return include_layer1 && std::ranges::any_of(sub_chunk.layer1, [air_runtime_id](const auto runtime_id) {
         return runtime_id != air_runtime_id;
     });
 }
@@ -187,14 +191,8 @@ Result<ChunkMap> McWorldStructure::get_chunks_impl(
             for (const auto& [source_sub_y, sub_chunk] : source.value()->sub_chunks) {
                 const auto output_sub_y = source_sub_y - source_sub_y_delta;
                 if (output_sub_y < output_min_sub_y || output_sub_y > output_max_sub_y ||
-                    !has_non_air(sub_chunk, air_runtime_id)) continue;
-                if (include_layer1) {
-                    output.sub_chunks.emplace(output_sub_y, sub_chunk);
-                } else {
-                    SubChunkData primary_only;
-                    primary_only.layer0 = sub_chunk.layer0;
-                    output.sub_chunks.emplace(output_sub_y, std::move(primary_only));
-                }
+                    !has_non_air(sub_chunk, air_runtime_id, include_layer1)) continue;
+                output.sub_chunks.emplace(output_sub_y, sub_chunk);
             }
             direct_copy_ms += elapsed_ms(direct_copy_start);
             ++direct_chunks;
