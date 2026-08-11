@@ -3,6 +3,7 @@
 #include "result.hpp"
 #include "types.hpp"
 
+#include <array>
 #include <filesystem>
 #include <functional>
 #include <memory>
@@ -56,6 +57,8 @@ enum class StructureId : std::uint8_t {
 
 using ChunkMap = std::unordered_map<ChunkPos, ChunkData, ChunkPosHash>;
 using NbtChunkMap = std::unordered_map<ChunkPos, std::vector<BlockEntity>, ChunkPosHash>;
+using ChunkVisitor = std::function<Result<void>(ChunkPos, const ChunkData&)>;
+using ChunkNbtVisitor = std::function<Result<void>(ChunkPos, std::span<const BlockEntity>)>;
 
 struct ConversionCallbacks {
     std::function<void(std::size_t)> start;
@@ -77,11 +80,44 @@ public:
 
     virtual Result<void> read(const std::filesystem::path& path) = 0;
     virtual Result<ChunkMap> get_chunks(std::span<const ChunkPos> positions) const = 0;
-    // Schem-like writers only serialize the primary block layer. Other formats
-    // keep the full get_chunks behavior through this default implementation;
-    // for an optimized override, layer1 is unspecified and must not be consumed.
+    // Schem-like writers only serialize the primary block layer and should call
+    // get_chunks_layer0(). General consumers, including world conversion, use
+    // get_chunks()/visit_chunks() and receive both layers.
     virtual Result<ChunkMap> get_chunks_layer0(std::span<const ChunkPos> positions) const {
         return get_chunks(positions);
+    }
+    // Streaming compatibility extension. The default deliberately asks for one
+    // chunk at a time, so readers without a specialized override still keep the
+    // materialized map bounded to a single chunk.
+    virtual Result<void> visit_chunks(
+        std::span<const ChunkPos> positions,
+        const ChunkVisitor& visitor) const {
+        if (!visitor) return Result<void>::failure("chunk visitor is empty");
+        for (const auto position : positions) {
+            const std::array<ChunkPos, 1> request{ position };
+            auto chunks = get_chunks(request);
+            if (!chunks) return Result<void>::failure(chunks.error());
+            const auto found = chunks.value().find(position);
+            if (found == chunks.value().end()) continue;
+            auto visited = visitor(position, found->second);
+            if (!visited) return visited;
+        }
+        return Result<void>::success();
+    }
+    virtual Result<void> visit_chunk_nbt(
+        std::span<const ChunkPos> positions,
+        const ChunkNbtVisitor& visitor) const {
+        if (!visitor) return Result<void>::failure("chunk NBT visitor is empty");
+        for (const auto position : positions) {
+            const std::array<ChunkPos, 1> request{ position };
+            auto entities = get_chunk_nbt(request);
+            if (!entities) return Result<void>::failure(entities.error());
+            const auto found = entities.value().find(position);
+            if (found == entities.value().end()) continue;
+            auto visited = visitor(position, found->second);
+            if (!visited) return visited;
+        }
+        return Result<void>::success();
     }
     // Allows streaming consumers to release source-side chunk caches between batches.
     virtual void release_cached_chunks() const noexcept {}

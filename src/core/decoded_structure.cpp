@@ -44,28 +44,67 @@ void SparseBlockStore::put_entity(BlockPos local, NbtPayload payload)
 
 Result<ChunkMap> SparseBlockStore::get_chunks(std::span<const ChunkPos> positions) const
 {
+    return get_chunks_impl(positions, true);
+}
+
+Result<ChunkMap> SparseBlockStore::get_chunks_layer0(std::span<const ChunkPos> positions) const
+{
+    return get_chunks_impl(positions, false);
+}
+
+Result<ChunkMap> SparseBlockStore::get_chunks_impl(
+    std::span<const ChunkPos> positions,
+    bool include_layer1) const
+{
     ChunkMap result;
     for (const auto pos : positions) result.emplace(pos, ChunkData{});
-    for (const auto& [local, runtime_id] : mBlocks) {
-        const auto x = local.x + mOffset.x;
-        const auto y = local.y + mOffset.y;
-        const auto z = local.z + mOffset.z;
-        const ChunkPos chunk_pos{ floor_div(x, 16), floor_div(z, 16) };
-        const auto chunk = result.find(chunk_pos);
-        if (chunk == result.end()) continue;
-        const auto sub_y = floor_div(y - 64, 16);
-        auto [sub, inserted] = chunk->second.sub_chunks.try_emplace(sub_y);
-        if (inserted) {
-            sub->second.layer0.fill(mRegistry.air_runtime_id());
-            sub->second.layer1.fill(mRegistry.air_runtime_id());
+    const auto width = mOriginalSize.width;
+    const auto height = mOriginalSize.height;
+    const auto length = mOriginalSize.length;
+    const auto air_runtime_id = mRegistry.air_runtime_id();
+    for (auto& [chunk_pos, chunk] : result) {
+        const auto chunk_min_x = static_cast<std::int64_t>(chunk_pos.x) * 16;
+        const auto chunk_min_z = static_cast<std::int64_t>(chunk_pos.z) * 16;
+        const auto source_min_x = std::max<std::int64_t>(0, chunk_min_x - mOffset.x);
+        const auto source_max_x = std::min<std::int64_t>(
+            static_cast<std::int64_t>(width) - 1,
+            chunk_min_x + 15 - mOffset.x);
+        const auto source_min_z = std::max<std::int64_t>(0, chunk_min_z - mOffset.z);
+        const auto source_max_z = std::min<std::int64_t>(
+            static_cast<std::int64_t>(length) - 1,
+            chunk_min_z + 15 - mOffset.z);
+        if (source_min_x > source_max_x || source_min_z > source_max_z) continue;
+
+        for (auto x = source_min_x; x <= source_max_x; ++x) {
+            for (std::int64_t y = 0; y < height; ++y) {
+                const auto begin = mBlocks.lower_bound({
+                    static_cast<std::int32_t>(x), static_cast<std::int32_t>(y),
+                    static_cast<std::int32_t>(source_min_z)});
+                const auto end = mBlocks.upper_bound({
+                    static_cast<std::int32_t>(x), static_cast<std::int32_t>(y),
+                    static_cast<std::int32_t>(source_max_z)});
+                for (auto block = begin; block != end; ++block) {
+                    const auto& local = block->first;
+                    const auto world_x = local.x + mOffset.x;
+                    const auto world_y = local.y + mOffset.y;
+                    const auto world_z = local.z + mOffset.z;
+                    const auto sub_y = floor_div(world_y - 64, 16);
+                    auto [sub, inserted] = chunk.sub_chunks.try_emplace(sub_y);
+                    if (inserted) {
+                        sub->second.layer0.fill(air_runtime_id);
+                        if (include_layer1) sub->second.layer1.fill(air_runtime_id);
+                    }
+                    const auto lx = world_x - static_cast<std::int32_t>(chunk_min_x);
+                    const auto ly = world_y - (sub_y * 16 + 64);
+                    const auto lz = world_z - static_cast<std::int32_t>(chunk_min_z);
+                    if (lx < 0 || lx >= 16 || ly < 0 || ly >= 16 || lz < 0 || lz >= 16) {
+                        return Result<ChunkMap>::failure("稀疏方块坐标 materialize 越界");
+                    }
+                    sub->second.layer0[static_cast<std::size_t>((ly * 16 + lz) * 16 + lx)] =
+                        block->second;
+                }
+            }
         }
-        const auto lx = x - chunk_pos.x * 16;
-        const auto ly = y - (sub_y * 16 + 64);
-        const auto lz = z - chunk_pos.z * 16;
-        if (lx < 0 || lx >= 16 || ly < 0 || ly >= 16 || lz < 0 || lz >= 16) {
-            return Result<ChunkMap>::failure("稀疏方块坐标 materialize 越界");
-        }
-        sub->second.layer0[static_cast<std::size_t>((ly * 16 + lz) * 16 + lx)] = runtime_id;
     }
     return Result<ChunkMap>::success(std::move(result));
 }

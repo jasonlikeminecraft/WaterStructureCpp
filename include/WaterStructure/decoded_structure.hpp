@@ -26,9 +26,14 @@ public:
     void put_entity(BlockPos local, NbtPayload payload);
     std::size_t count_non_air() const noexcept { return mNonAirBlocks; }
     Result<ChunkMap> get_chunks(std::span<const ChunkPos> positions) const;
+    Result<ChunkMap> get_chunks_layer0(std::span<const ChunkPos> positions) const;
     Result<NbtChunkMap> get_chunk_nbt(std::span<const ChunkPos> positions) const;
 
 private:
+    Result<ChunkMap> get_chunks_impl(
+        std::span<const ChunkPos> positions,
+        bool include_layer1) const;
+
     RuntimeRegistry& mRegistry;
     Size mOriginalSize{};
     Size mSize{};

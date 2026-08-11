@@ -180,7 +180,7 @@ Result<void> write_axiom_bp(
     for (int z = 0; z < size.chunk_z_count(); ++z) {
         for (int x = 0; x < size.chunk_x_count(); ++x) positions.push_back({ x, z });
     }
-    auto chunks = structure.get_chunks(positions);
+    auto chunks = structure.get_chunks_layer0(positions);
     if (!chunks) return Result<void>::failure("生成 AxiomBP chunks 失败: " + chunks.error());
 
     // This preserves the Go writer's inclusive end-subchunk calculation.

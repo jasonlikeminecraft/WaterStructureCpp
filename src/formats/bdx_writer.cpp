@@ -134,7 +134,7 @@ Result<void> write_bdx(
         for (std::int32_t x = 0; x < size.chunk_x_count(); ++x) {
             for (std::int32_t z = 0; z < size.chunk_z_count(); ++z) positions.push_back({ x, z });
         }
-        auto chunks = structure.get_chunks(positions);
+        auto chunks = structure.get_chunks_layer0(positions);
         if (!chunks) return Result<void>::failure("BDX writer 获取 chunks 失败: " + chunks.error());
 
         std::vector<std::uint8_t> decoded{ 'B', 'D', 'X', 0, 0 };

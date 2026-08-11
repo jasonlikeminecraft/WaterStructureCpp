@@ -123,7 +123,7 @@ Result<void> write_litematic(
     for (int x = 0; x < size.chunk_x_count(); ++x) {
         for (int z = 0; z < size.chunk_z_count(); ++z) positions.push_back({ x, z });
     }
-    auto chunks = structure.get_chunks(positions);
+    auto chunks = structure.get_chunks_layer0(positions);
     if (!chunks) return Result<void>::failure("生成 Litematic chunks 失败: " + chunks.error());
 
     std::map<std::string, std::int32_t, std::less<>> palette_indices;

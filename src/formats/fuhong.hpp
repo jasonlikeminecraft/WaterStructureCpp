@@ -24,6 +24,9 @@ public:
     Result<ChunkMap> get_chunks(std::span<const ChunkPos> positions) const override {
         return mStore.get_chunks(positions);
     }
+    Result<ChunkMap> get_chunks_layer0(std::span<const ChunkPos> positions) const override {
+        return mStore.get_chunks_layer0(positions);
+    }
     Result<NbtChunkMap> get_chunk_nbt(std::span<const ChunkPos> positions) const override {
         return mStore.get_chunk_nbt(positions);
     }

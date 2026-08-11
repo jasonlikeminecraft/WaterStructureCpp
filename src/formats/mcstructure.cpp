@@ -10,9 +10,11 @@
 #include <tag_primitive.h>
 
 #include <algorithm>
+#include <array>
 #include <charconv>
 #include <cmath>
 #include <fstream>
+#include <limits>
 #include <sstream>
 
 namespace water_structure {
@@ -93,7 +95,150 @@ NbtPayload serialize_compound(const nbt::tag_compound& compound)
     return NbtPayload(bytes.begin(), bytes.end());
 }
 
+using NbtReader = nbt::io::stream_reader;
+
+void skip_bytes(NbtReader& reader, std::int32_t count, std::size_t width)
+{
+    if (count < 0 || static_cast<std::uint64_t>(count) >
+            static_cast<std::uint64_t>(std::numeric_limits<std::streamsize>::max()) / width) {
+        throw nbt::io::input_error("Invalid MCStructure NBT payload length");
+    }
+    auto& input = reader.get_istr();
+    input.ignore(static_cast<std::streamsize>(count) * static_cast<std::streamsize>(width));
+    if (!input) throw nbt::io::input_error("Unexpected end of MCStructure NBT payload");
+}
+
+void skip_payload(NbtReader& reader, nbt::tag_type type)
+{
+    switch (type) {
+    case nbt::tag_type::Byte: skip_bytes(reader, 1, 1); break;
+    case nbt::tag_type::Short: skip_bytes(reader, 1, 2); break;
+    case nbt::tag_type::Int: skip_bytes(reader, 1, 4); break;
+    case nbt::tag_type::Long: skip_bytes(reader, 1, 8); break;
+    case nbt::tag_type::Float: skip_bytes(reader, 1, 4); break;
+    case nbt::tag_type::Double: skip_bytes(reader, 1, 8); break;
+    case nbt::tag_type::Byte_Array: {
+        std::int32_t count = 0;
+        reader.read_num(count);
+        skip_bytes(reader, count, 1);
+        break;
+    }
+    case nbt::tag_type::String:
+        (void)reader.read_string();
+        break;
+    case nbt::tag_type::List: {
+        const auto element_type = reader.read_type(true);
+        std::int32_t count = 0;
+        reader.read_num(count);
+        if (count < 0) throw nbt::io::input_error("Invalid MCStructure list length");
+        for (std::int32_t index = 0; index < count; ++index) {
+            skip_payload(reader, element_type);
+        }
+        break;
+    }
+    case nbt::tag_type::Compound:
+        while (true) {
+            const auto child_type = reader.read_type(true);
+            if (child_type == nbt::tag_type::End) break;
+            (void)reader.read_string();
+            skip_payload(reader, child_type);
+        }
+        break;
+    case nbt::tag_type::Int_Array: {
+        std::int32_t count = 0;
+        reader.read_num(count);
+        skip_bytes(reader, count, 4);
+        break;
+    }
+    case nbt::tag_type::Long_Array: {
+        std::int32_t count = 0;
+        reader.read_num(count);
+        skip_bytes(reader, count, 8);
+        break;
+    }
+    default:
+        throw nbt::io::input_error("Invalid MCStructure NBT payload type");
+    }
+}
+
+bool is_integer_type(nbt::tag_type type) noexcept
+{
+    return type == nbt::tag_type::Byte || type == nbt::tag_type::Short ||
+        type == nbt::tag_type::Int || type == nbt::tag_type::Long;
+}
+
+std::int32_t read_integer(NbtReader& reader, nbt::tag_type type)
+{
+    switch (type) {
+    case nbt::tag_type::Byte: {
+        std::int8_t value = 0;
+        reader.read_num(value);
+        return value;
+    }
+    case nbt::tag_type::Short: {
+        std::int16_t value = 0;
+        reader.read_num(value);
+        return value;
+    }
+    case nbt::tag_type::Int: {
+        std::int32_t value = 0;
+        reader.read_num(value);
+        return value;
+    }
+    case nbt::tag_type::Long: {
+        std::int64_t value = 0;
+        reader.read_num(value);
+        return static_cast<std::int32_t>(value);
+    }
+    default:
+        throw nbt::io::input_error("MCStructure NBT value is not an integer");
+    }
+}
+
 } // namespace
+
+void McStructure::BlockIndexArray::clear() noexcept
+{
+    std::visit([](auto& values) { values.clear(); }, mValues);
+}
+
+void McStructure::BlockIndexArray::reserve(std::size_t count)
+{
+    std::visit([count](auto& values) { values.reserve(count); }, mValues);
+}
+
+void McStructure::BlockIndexArray::push_back(std::int32_t value)
+{
+    if (auto* compact = std::get_if<CompactValues>(&mValues)) {
+        if (value >= -1 && value <= 65534) {
+            compact->push_back(value < 0 ? 65535u : static_cast<std::uint16_t>(value));
+            return;
+        }
+        FullValues expanded;
+        expanded.reserve(compact->size() + 1);
+        for (const auto encoded : *compact) {
+            expanded.push_back(encoded == 65535u ? -1 : static_cast<std::int32_t>(encoded));
+        }
+        expanded.push_back(value);
+        mValues = std::move(expanded);
+        return;
+    }
+    std::get<FullValues>(mValues).push_back(value);
+}
+
+std::size_t McStructure::BlockIndexArray::size() const noexcept
+{
+    return std::visit([](const auto& values) { return values.size(); }, mValues);
+}
+
+std::int32_t McStructure::BlockIndexArray::at(std::size_t index) const noexcept
+{
+    if (const auto* compact = std::get_if<CompactValues>(&mValues)) {
+        const auto encoded = (*compact)[index];
+        return encoded == 65535u ? -1 : static_cast<std::int32_t>(encoded);
+    }
+    return std::get<FullValues>(mValues)[index];
+}
 
 void McStructure::set_offset(BlockPos offset) noexcept
 {
@@ -112,70 +257,112 @@ Result<void> McStructure::read(const std::filesystem::path& path)
         return Result<void>::failure("无法打开 MCStructure 文件: " + path.string());
     }
 
+    mPrimaryIndices.clear();
+    mSecondaryIndices.clear();
+    mPalette.clear();
+    mBlockEntities.clear();
+    mNonAirBlocks = 0;
+
     try {
-        const auto [root_name, root] = nbt::io::read_compound(input, endian::little);
-        if (!root_name.empty()) {
+        NbtReader reader(input, endian::little);
+        if (reader.read_type() != nbt::tag_type::Compound || !reader.read_string().empty()) {
             return Result<void>::failure("MCStructure 根标签名称必须为空");
         }
 
-        const auto* size_value = find_value(*root, "size");
-        const auto* structure_value = find_value(*root, "structure");
-        if (!size_value || !structure_value || size_value->get_type() != nbt::tag_type::List ||
-            structure_value->get_type() != nbt::tag_type::Compound) {
-            return Result<void>::failure("MCStructure 缺少 size 或 structure");
-        }
-
-        const auto& size_list = size_value->as<nbt::tag_list>();
-        if (size_list.size() < 3) {
-            return Result<void>::failure("MCStructure size 长度不足");
-        }
-        mOriginalSize.width = int_value(size_list.at(0)).value_or(0);
-        mOriginalSize.height = int_value(size_list.at(1)).value_or(0);
-        mOriginalSize.length = int_value(size_list.at(2)).value_or(0);
-        if (mOriginalSize.width <= 0 || mOriginalSize.height <= 0 || mOriginalSize.length <= 0) {
-            return Result<void>::failure("MCStructure size 无效");
-        }
-        mSize = mOriginalSize;
-
-        const auto& structure = structure_value->as<nbt::tag_compound>();
-        const auto* indices_value = find_value(structure, "block_indices");
-        const auto* palette_value = find_value(structure, "palette");
-        if (!indices_value || !palette_value || indices_value->get_type() != nbt::tag_type::List ||
-            palette_value->get_type() != nbt::tag_type::Compound) {
-            return Result<void>::failure("MCStructure 缺少 block_indices 或 palette");
-        }
-
-        const auto& indices = indices_value->as<nbt::tag_list>();
-        if (indices.size() != 2 || indices.at(0).get_type() != nbt::tag_type::List ||
-            indices.at(1).get_type() != nbt::tag_type::List) {
-            return Result<void>::failure("MCStructure block_indices 格式无效");
-        }
-        const auto volume = static_cast<std::size_t>(mOriginalSize.volume());
-        auto read_indices = [volume](const nbt::tag_list& layer, std::vector<std::int32_t>& target) -> Result<void> {
-            if (layer.size() != volume) {
-                return Result<void>::failure("MCStructure block_indices 长度与 size 不一致");
+        bool has_size = false;
+        bool has_structure = false;
+        bool has_indices = false;
+        std::unique_ptr<nbt::tag> palette_holder;
+        auto read_size = [&]() -> Result<void> {
+            const auto element_type = reader.read_type(true);
+            std::int32_t count = 0;
+            reader.read_num(count);
+            if (count < 3 || count > 1024 || !is_integer_type(element_type)) {
+                return Result<void>::failure("MCStructure size 格式无效");
             }
-            target.clear();
-            target.reserve(layer.size());
-            for (const auto& value : layer) {
-                const auto index = int_value(value);
-                if (!index) {
-                    return Result<void>::failure("MCStructure block index 不是整数");
-                }
-                target.push_back(*index);
+            std::array<std::int32_t, 3> values{};
+            for (std::int32_t index = 0; index < count; ++index) {
+                const auto value = read_integer(reader, element_type);
+                if (index < 3) values[static_cast<std::size_t>(index)] = value;
             }
+            mOriginalSize = { values[0], values[1], values[2] };
+            if (mOriginalSize.width <= 0 || mOriginalSize.height <= 0 || mOriginalSize.length <= 0) {
+                return Result<void>::failure("MCStructure size 无效");
+            }
+            mSize = mOriginalSize;
+            has_size = true;
             return Result<void>::success();
         };
-        auto primary_result = read_indices(indices.at(0).as<nbt::tag_list>(), mPrimaryIndices);
-        if (!primary_result) {
-            return primary_result;
+        auto read_indices = [&]() -> Result<void> {
+            if (reader.read_type(true) != nbt::tag_type::List) {
+                return Result<void>::failure("MCStructure block_indices 格式无效");
+            }
+            std::int32_t layer_count = 0;
+            reader.read_num(layer_count);
+            if (layer_count != 2) {
+                return Result<void>::failure("MCStructure block_indices 层数无效");
+            }
+            for (std::int32_t layer = 0; layer < layer_count; ++layer) {
+                const auto element_type = reader.read_type(true);
+                if (!is_integer_type(element_type)) {
+                    return Result<void>::failure("MCStructure block index 不是整数列表");
+                }
+                std::int32_t count = 0;
+                reader.read_num(count);
+                if (count < 0) return Result<void>::failure("MCStructure block index 数量无效");
+                auto& current = layer == 0 ? mPrimaryIndices : mSecondaryIndices;
+                current.clear();
+                current.reserve(static_cast<std::size_t>(count));
+                for (std::int32_t index = 0; index < count; ++index) {
+                    const auto value = read_integer(reader, element_type);
+                    current.push_back(value);
+                }
+            }
+            has_indices = true;
+            return Result<void>::success();
+        };
+        auto read_structure = [&]() -> Result<void> {
+            while (true) {
+                const auto type = reader.read_type(true);
+                if (type == nbt::tag_type::End) break;
+                const auto key = reader.read_string();
+                if (key == "block_indices" && type == nbt::tag_type::List) {
+                    auto result = read_indices();
+                    if (!result) return result;
+                } else if (key == "palette" && type == nbt::tag_type::Compound) {
+                    palette_holder = reader.read_payload(type);
+                } else {
+                    skip_payload(reader, type);
+                }
+            }
+            has_structure = true;
+            return Result<void>::success();
+        };
+
+        while (true) {
+            const auto type = reader.read_type(true);
+            if (type == nbt::tag_type::End) break;
+            const auto key = reader.read_string();
+            if (key == "size" && type == nbt::tag_type::List) {
+                auto result = read_size();
+                if (!result) return result;
+            } else if (key == "structure" && type == nbt::tag_type::Compound) {
+                auto result = read_structure();
+                if (!result) return result;
+            } else {
+                skip_payload(reader, type);
+            }
         }
-        auto secondary_result = read_indices(indices.at(1).as<nbt::tag_list>(), mSecondaryIndices);
-        if (!secondary_result) {
-            return secondary_result;
+        if (!has_size || !has_structure || !has_indices || !palette_holder) {
+            return Result<void>::failure("MCStructure 缺少 size、structure、block_indices 或 palette");
+        }
+        const auto volume = static_cast<std::size_t>(mOriginalSize.volume());
+        if (mPrimaryIndices.size() != volume || mSecondaryIndices.size() != volume) {
+            return Result<void>::failure("MCStructure block_indices 长度与 size 不一致");
         }
 
-        const auto* default_value = find_value(palette_value->as<nbt::tag_compound>(), "default");
+        const auto& palette_root = palette_holder->as<nbt::tag_compound>();
+        const auto* default_value = find_value(palette_root, "default");
         if (!default_value || default_value->get_type() != nbt::tag_type::Compound) {
             return Result<void>::failure("MCStructure 缺少默认 palette");
         }
@@ -242,7 +429,8 @@ Result<void> McStructure::read(const std::filesystem::path& path)
         }
 
         mNonAirBlocks = 0;
-        for (const auto index : mPrimaryIndices) {
+        for (std::size_t flat_index = 0; flat_index < mPrimaryIndices.size(); ++flat_index) {
+            const auto index = mPrimaryIndices.at(flat_index);
             if (index < 0 || static_cast<std::size_t>(index) >= mPalette.size()) {
                 continue;
             }
@@ -259,49 +447,70 @@ Result<void> McStructure::read(const std::filesystem::path& path)
 
 Result<ChunkMap> McStructure::get_chunks(std::span<const ChunkPos> positions) const
 {
+    return get_chunks_impl(positions, true);
+}
+
+Result<ChunkMap> McStructure::get_chunks_layer0(std::span<const ChunkPos> positions) const
+{
+    return get_chunks_impl(positions, false);
+}
+
+Result<ChunkMap> McStructure::get_chunks_impl(
+    std::span<const ChunkPos> positions,
+    bool include_layer1) const
+{
     ChunkMap result;
     for (const auto pos : positions) {
         result.emplace(pos, ChunkData{});
     }
 
-    auto write_layer = [&](const std::vector<std::int32_t>& indices, int layer) {
-        for (std::size_t index = 0; index < indices.size(); ++index) {
-            const auto palette_index = indices[index];
-            if (palette_index < 0 || static_cast<std::size_t>(palette_index) >= mPalette.size()) {
-                continue;
+    const auto width = mOriginalSize.width;
+    const auto height = mOriginalSize.height;
+    const auto length = mOriginalSize.length;
+    const auto plane_size = static_cast<std::size_t>(height) * length;
+    const auto air_runtime_id = mRegistry.air_runtime_id();
+    auto write_layer = [&](const BlockIndexArray& indices, int layer) {
+        if (indices.size() == 0) return;
+        for (auto& [chunk_pos, chunk] : result) {
+            const auto chunk_min_x = static_cast<std::int64_t>(chunk_pos.x) * 16;
+            const auto chunk_min_z = static_cast<std::int64_t>(chunk_pos.z) * 16;
+            const auto min_x = std::max<std::int64_t>(0, chunk_min_x - mOffset.x);
+            const auto max_x = std::min<std::int64_t>(width - 1, chunk_min_x + 15 - mOffset.x);
+            const auto min_z = std::max<std::int64_t>(0, chunk_min_z - mOffset.z);
+            const auto max_z = std::min<std::int64_t>(length - 1, chunk_min_z + 15 - mOffset.z);
+            if (min_x > max_x || min_z > max_z) continue;
+            for (int x = static_cast<int>(min_x); x <= static_cast<int>(max_x); ++x) {
+                for (int y = 0; y < height; ++y) {
+                    for (int z = static_cast<int>(min_z); z <= static_cast<int>(max_z); ++z) {
+                        const auto index = static_cast<std::size_t>(x) * plane_size +
+                            static_cast<std::size_t>(y) * length + z;
+                        if (index >= indices.size()) continue;
+                        const auto palette_index = indices.at(index);
+                        if (palette_index < 0 || static_cast<std::size_t>(palette_index) >= mPalette.size()) continue;
+                        const auto runtime_id = mPalette[static_cast<std::size_t>(palette_index)];
+                        if (runtime_id == air_runtime_id) continue;
+                        const int world_x = x + mOffset.x;
+                        const int world_y = y + mOffset.y;
+                        const int world_z = z + mOffset.z;
+                        const int sub_y = floor_div(world_y - 64, 16);
+                        auto [sub_it, inserted] = chunk.sub_chunks.try_emplace(sub_y);
+                        if (inserted) {
+                            sub_it->second.layer0.fill(air_runtime_id);
+                            if (include_layer1) sub_it->second.layer1.fill(air_runtime_id);
+                        }
+                        const int local_x = world_x - static_cast<int>(chunk_min_x);
+                        const int local_y = world_y - (sub_y * 16 + 64);
+                        const int local_z = world_z - static_cast<int>(chunk_min_z);
+                        auto& target = layer == 0 ? sub_it->second.layer0 : sub_it->second.layer1;
+                        target[static_cast<std::size_t>((local_y * 16 + local_z) * 16 + local_x)] = runtime_id;
+                    }
+                }
             }
-            const auto runtime_id = mPalette[static_cast<std::size_t>(palette_index)];
-            if (runtime_id == mRegistry.air_runtime_id()) {
-                continue;
-            }
-            const int z = static_cast<int>(index % mOriginalSize.length);
-            const int y = static_cast<int>((index / mOriginalSize.length) % mOriginalSize.height);
-            const int x = static_cast<int>(index /
-                (static_cast<std::size_t>(mOriginalSize.height) * mOriginalSize.length));
-            const int world_x = x + mOffset.x;
-            const int world_y = y + mOffset.y;
-            const int world_z = z + mOffset.z;
-            const ChunkPos chunk_pos{ floor_div(world_x, 16), floor_div(world_z, 16) };
-            const auto chunk_it = result.find(chunk_pos);
-            if (chunk_it == result.end()) {
-                continue;
-            }
-            const int sub_y = floor_div(world_y - 64, 16);
-            auto [sub_it, inserted] = chunk_it->second.sub_chunks.try_emplace(sub_y);
-            if (inserted) {
-                sub_it->second.layer0.fill(mRegistry.air_runtime_id());
-                sub_it->second.layer1.fill(mRegistry.air_runtime_id());
-            }
-            const int local_x = world_x - chunk_pos.x * 16;
-            const int local_y = world_y - (sub_y * 16 + 64);
-            const int local_z = world_z - chunk_pos.z * 16;
-            auto& target = layer == 0 ? sub_it->second.layer0 : sub_it->second.layer1;
-            target[static_cast<std::size_t>((local_y * 16 + local_z) * 16 + local_x)] = runtime_id;
         }
     };
 
     write_layer(mPrimaryIndices, 0);
-    write_layer(mSecondaryIndices, 1);
+    if (include_layer1) write_layer(mSecondaryIndices, 1);
     return Result<ChunkMap>::success(std::move(result));
 }
 

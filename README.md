@@ -79,6 +79,9 @@ MCWorld 世界导出采用流式路径，避免把整个世界或完整 `BlockDa
 - BWO 通过一次范围查询读取 chunk 的 subchunk payload，再进行解码，减少逐层
   LevelDB 调用和重复查找。
 
+解析器逐项优化、基准命令、重复测试结果和未完成格式清单记录在
+[docs/parser_optimization.md](docs/parser_optimization.md)。
+
 可用以下命令查看阶段耗时：
 
 ```powershell

@@ -56,7 +56,7 @@ Result<void> write_schematic(
     for (int x = 0; x < size.chunk_x_count(); ++x) {
         for (int z = 0; z < size.chunk_z_count(); ++z) positions.push_back({ x, z });
     }
-    auto chunks = structure.get_chunks(positions);
+    auto chunks = structure.get_chunks_layer0(positions);
     if (!chunks) return Result<void>::failure("生成 Schematic chunks 失败: " + chunks.error());
 
     std::ofstream output(output_path, std::ios::binary | std::ios::trunc);

@@ -219,35 +219,62 @@ Result<void> LitematicStructure::read(const std::filesystem::path& path)
 
 Result<ChunkMap> LitematicStructure::get_chunks(std::span<const ChunkPos> positions) const
 {
+    return get_chunks_impl(positions, true);
+}
+
+Result<ChunkMap> LitematicStructure::get_chunks_layer0(std::span<const ChunkPos> positions) const
+{
+    return get_chunks_impl(positions, false);
+}
+
+Result<ChunkMap> LitematicStructure::get_chunks_impl(
+    std::span<const ChunkPos> positions,
+    bool include_layer1) const
+{
     ChunkMap result;
     for (const auto pos : positions) result.emplace(pos, ChunkData{});
-    const auto volume = static_cast<std::size_t>(mOriginalSize.volume());
-    const auto layer_size = static_cast<std::size_t>(mOriginalSize.width) * mOriginalSize.length;
-    for (std::size_t index = 0; index < volume; ++index) {
-        const auto palette_index = palette_index_at(index);
-        if (palette_index >= mPalette.size()) continue;
-        const auto runtime_id = mPalette[palette_index];
-        if (runtime_id == mRegistry.air_runtime_id()) continue;
-        const int y = static_cast<int>(index / layer_size);
-        const auto remaining = index % layer_size;
-        const int z = static_cast<int>(remaining / mOriginalSize.width);
-        const int x = static_cast<int>(remaining % mOriginalSize.width);
-        const int structure_x = x + mOffset.x;
-        const int structure_y = y + mOffset.y;
-        const int structure_z = z + mOffset.z;
-        const ChunkPos chunk_pos{ floor_div(structure_x, 16), floor_div(structure_z, 16) };
-        const auto chunk_it = result.find(chunk_pos);
-        if (chunk_it == result.end()) continue;
-        const int sub_y = floor_div(structure_y - 64, 16);
-        auto [sub_it, inserted] = chunk_it->second.sub_chunks.try_emplace(sub_y);
-        if (inserted) {
-            sub_it->second.layer0.fill(mRegistry.air_runtime_id());
-            sub_it->second.layer1.fill(mRegistry.air_runtime_id());
+    const auto width = mOriginalSize.width;
+    const auto length = mOriginalSize.length;
+    const auto layer_size = static_cast<std::size_t>(width) * length;
+    const auto air_runtime_id = mRegistry.air_runtime_id();
+    for (auto& [chunk_pos, chunk] : result) {
+        const auto chunk_min_x = static_cast<std::int64_t>(chunk_pos.x) * 16;
+        const auto chunk_min_z = static_cast<std::int64_t>(chunk_pos.z) * 16;
+        const auto min_x = std::max<std::int64_t>(0, chunk_min_x - mOffset.x);
+        const auto max_x = std::min<std::int64_t>(width - 1, chunk_min_x + 15 - mOffset.x);
+        const auto min_z = std::max<std::int64_t>(0, chunk_min_z - mOffset.z);
+        const auto max_z = std::min<std::int64_t>(length - 1, chunk_min_z + 15 - mOffset.z);
+        if (min_x > max_x || min_z > max_z) continue;
+        for (int y = 0; y < mOriginalSize.height; ++y) {
+            const int structure_y = y + mOffset.y;
+            const int sub_y = floor_div(structure_y - 64, 16);
+            const int local_y = structure_y - (sub_y * 16 + 64);
+            SubChunkData* sub_chunk = nullptr;
+            for (int z = static_cast<int>(min_z); z <= static_cast<int>(max_z); ++z) {
+                for (int x = static_cast<int>(min_x); x <= static_cast<int>(max_x); ++x) {
+                    const auto index = static_cast<std::size_t>(y) * layer_size +
+                        static_cast<std::size_t>(z) * width + x;
+                    const auto palette_index = palette_index_at(index);
+                    if (palette_index >= mPalette.size()) continue;
+                    const auto runtime_id = mPalette[palette_index];
+                    if (runtime_id == air_runtime_id) continue;
+                    if (!sub_chunk) {
+                        auto [sub_it, inserted] = chunk.sub_chunks.try_emplace(sub_y);
+                        if (inserted) {
+                            sub_it->second.layer0.fill(air_runtime_id);
+                            if (include_layer1) sub_it->second.layer1.fill(air_runtime_id);
+                        }
+                        sub_chunk = &sub_it->second;
+                    }
+                    const int local_x = static_cast<int>(
+                        static_cast<std::int64_t>(x) + mOffset.x - chunk_min_x);
+                    const int local_z = static_cast<int>(
+                        static_cast<std::int64_t>(z) + mOffset.z - chunk_min_z);
+                    sub_chunk->layer0[static_cast<std::size_t>(
+                        (local_y * 16 + local_z) * 16 + local_x)] = runtime_id;
+                }
+            }
         }
-        const int local_x = structure_x - chunk_pos.x * 16;
-        const int local_y = structure_y - (sub_y * 16 + 64);
-        const int local_z = structure_z - chunk_pos.z * 16;
-        sub_it->second.layer0[static_cast<std::size_t>((local_y * 16 + local_z) * 16 + local_x)] = runtime_id;
     }
     return Result<ChunkMap>::success(std::move(result));
 }

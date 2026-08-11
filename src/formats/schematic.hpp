@@ -20,12 +20,17 @@ public:
 
     Result<void> read(const std::filesystem::path& path) override;
     Result<ChunkMap> get_chunks(std::span<const ChunkPos> positions) const override;
+    Result<ChunkMap> get_chunks_layer0(std::span<const ChunkPos> positions) const override;
     Result<NbtChunkMap> get_chunk_nbt(std::span<const ChunkPos> positions) const override;
     Result<std::size_t> count_non_air_blocks() const override;
     Result<void> write_to_world(WorldTarget& world, SubChunkPos start, ConversionCallbacks callbacks) const override;
     Result<void> read_from_world(WorldSource&, BlockBox, ConversionCallbacks) override;
 
 private:
+    Result<ChunkMap> get_chunks_impl(
+        std::span<const ChunkPos> positions,
+        bool include_layer1) const;
+
     RuntimeRegistry& mRegistry;
     Size mSize{};
     Size mOriginalSize{};

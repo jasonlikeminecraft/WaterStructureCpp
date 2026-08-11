@@ -99,29 +99,35 @@ int main(int argc, char** argv)
 
     const auto size = structure.value()->size();
     std::vector<water_structure::ChunkPos> positions;
-    for (std::int32_t x = 0; x < size.chunk_x_count(); ++x) {
-        for (std::int32_t z = 0; z < size.chunk_z_count(); ++z) positions.push_back({ x, z });
+    for (std::int32_t z = 0; z < size.chunk_z_count(); ++z) {
+        for (std::int32_t x = 0; x < size.chunk_x_count(); ++x) positions.push_back({ x, z });
     }
 
     std::uint64_t checksum = 0;
     const auto chunks_start = Clock::now();
-    constexpr std::size_t batch_size = 64;
+    const std::size_t batch_size =
+        (detected.value().id == water_structure::StructureId::SchemV1 ||
+         detected.value().id == water_structure::StructureId::SchemV2)
+        ? static_cast<std::size_t>(size.chunk_x_count())
+        : 64;
     for (std::size_t begin = 0; begin < positions.size(); begin += batch_size) {
         const auto count = std::min(batch_size, positions.size() - begin);
-        const auto chunks = structure.value()->get_chunks(
-            std::span<const water_structure::ChunkPos>(positions).subspan(begin, count));
-        if (!chunks) {
-            std::cerr << chunks.error() << '\n';
+        const auto visited = structure.value()->visit_chunks(
+            std::span<const water_structure::ChunkPos>(positions).subspan(begin, count),
+            [&checksum](water_structure::ChunkPos pos, const water_structure::ChunkData& chunk) {
+                checksum += static_cast<std::uint32_t>(pos.x) + static_cast<std::uint32_t>(pos.z);
+                for (const auto& [sub_y, sub_chunk] : chunk.sub_chunks) {
+                    checksum += static_cast<std::uint32_t>(sub_y);
+                    for (const auto runtime_id : sub_chunk.layer0) checksum += runtime_id;
+                    for (const auto runtime_id : sub_chunk.layer1) checksum += runtime_id;
+                }
+                return water_structure::Result<void>::success();
+            });
+        if (!visited) {
+            std::cerr << visited.error() << '\n';
             return 3;
         }
-        for (const auto& [pos, chunk] : chunks.value()) {
-            checksum += static_cast<std::uint32_t>(pos.x) + static_cast<std::uint32_t>(pos.z);
-            for (const auto& [sub_y, sub_chunk] : chunk.sub_chunks) {
-                checksum += static_cast<std::uint32_t>(sub_y);
-                for (const auto runtime_id : sub_chunk.layer0) checksum += runtime_id;
-                for (const auto runtime_id : sub_chunk.layer1) checksum += runtime_id;
-            }
-        }
+        structure.value()->release_cached_chunks();
     }
     const auto chunks_elapsed = Clock::now() - chunks_start;
 
@@ -129,13 +135,16 @@ int main(int argc, char** argv)
     const auto nbt_start = Clock::now();
     for (std::size_t begin = 0; begin < positions.size(); begin += batch_size) {
         const auto count = std::min(batch_size, positions.size() - begin);
-        const auto entities = structure.value()->get_chunk_nbt(
-            std::span<const water_structure::ChunkPos>(positions).subspan(begin, count));
-        if (!entities) {
-            std::cerr << entities.error() << '\n';
+        const auto visited = structure.value()->visit_chunk_nbt(
+            std::span<const water_structure::ChunkPos>(positions).subspan(begin, count),
+            [&entity_count](water_structure::ChunkPos, std::span<const water_structure::BlockEntity> values) {
+                entity_count += values.size();
+                return water_structure::Result<void>::success();
+            });
+        if (!visited) {
+            std::cerr << visited.error() << '\n';
             return 3;
         }
-        for (const auto& [pos, values] : entities.value()) entity_count += values.size();
     }
     const auto nbt_elapsed = Clock::now() - nbt_start;
 

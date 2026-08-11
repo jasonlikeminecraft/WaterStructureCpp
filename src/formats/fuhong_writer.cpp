@@ -314,7 +314,7 @@ Result<void> write_fuhong(
         std::map<std::pair<std::string, std::int32_t>, Group> groups;
         for (const auto chunk_position : positions) {
             const std::array<ChunkPos, 1> request{ chunk_position };
-            auto chunks = structure.get_chunks(request);
+            auto chunks = structure.get_chunks_layer0(request);
             if (!chunks) throw std::runtime_error("生成 FuHong chunk 失败: " + chunks.error());
             const auto chunk_it = chunks.value().find(chunk_position);
             const ChunkData empty;

@@ -159,6 +159,26 @@ std::filesystem::path write_mcfunction_sample()
     return path;
 }
 
+std::filesystem::path write_kbdx_sample()
+{
+    const auto path = std::filesystem::temp_directory_path() / "water_structure_cpp_test.kbdx";
+    std::ofstream file(path, std::ios::binary | std::ios::trunc);
+    if (!file) throw std::runtime_error("create KBDX sample");
+    const auto write_u32 = [&](std::uint32_t value) {
+        for (unsigned shift = 0; shift < 32; shift += 8) {
+            file.put(static_cast<char>(value >> shift));
+        }
+    };
+    write_u32(1);
+    write_u32(0);
+    write_u32(0);
+    write_u32(0);
+    write_u32(0);
+    write_u32(0);
+    file << R"({"minecraft:stone":0})";
+    return path;
+}
+
 std::filesystem::path write_bdx_payload(std::vector<std::uint8_t> decoded, std::string_view filename)
 {
     const auto path = std::filesystem::temp_directory_path() / filename;
@@ -767,6 +787,16 @@ std::filesystem::path write_msgpack_structure_sample(
 void preserve_msgpack_fixture(const std::filesystem::path& path)
 {
     const auto* output = std::getenv("WATER_STRUCTURE_MSGPACK_FIXTURE_DIR");
+    if (output == nullptr || *output == '\0') return;
+    const auto directory = std::filesystem::path(output);
+    std::filesystem::create_directories(directory);
+    std::filesystem::copy_file(path, directory / path.filename(),
+        std::filesystem::copy_options::overwrite_existing);
+}
+
+void preserve_benchmark_fixture(const std::filesystem::path& path)
+{
+    const auto* output = std::getenv("WATER_STRUCTURE_BENCH_FIXTURE_DIR");
     if (output == nullptr || *output == '\0') return;
     const auto directory = std::filesystem::path(output);
     std::filesystem::create_directories(directory);
@@ -1508,6 +1538,7 @@ int main()
         std::filesystem::remove(schem_multibit_path);
 
         const auto mcfunction_path = write_mcfunction_sample();
+        preserve_benchmark_fixture(mcfunction_path);
         const auto mcfunction = water_structure::FormatRegistry::open(mcfunction_path, registry);
         check(mcfunction.ok(), "synthetic MCFunction parses");
         check(mcfunction.value()->id() == water_structure::StructureId::MCFunction,
@@ -1521,6 +1552,17 @@ int main()
         check(mcfunction_chunks.ok() && mcfunction_chunks.value().at({ 0, 0 }).sub_chunks.contains(-4),
             "MCFunction chunks");
         std::filesystem::remove(mcfunction_path);
+
+        const auto kbdx_path = write_kbdx_sample();
+        const auto kbdx = water_structure::FormatRegistry::open(kbdx_path, registry);
+        check(kbdx.ok() && kbdx.value()->id() == water_structure::StructureId::KBDX,
+            "synthetic KBDX parses");
+        check(kbdx.value()->size().width == 1 && kbdx.value()->size().height == 1 &&
+            kbdx.value()->size().length == 1 &&
+            kbdx.value()->count_non_air_blocks().value() == 1,
+            "KBDX dimensions and non-air count");
+        preserve_benchmark_fixture(kbdx_path);
+        std::filesystem::remove(kbdx_path);
 
         const auto bdx_path = write_bdx_sample();
         const auto bdx = water_structure::FormatRegistry::open(bdx_path, registry);
@@ -1548,6 +1590,7 @@ int main()
         std::filesystem::remove(truncated_bdx_path);
 
         const auto ibimport_path = write_ibimport_sample();
+        preserve_benchmark_fixture(ibimport_path);
         const auto ibimport = water_structure::FormatRegistry::open(ibimport_path, registry);
         check(ibimport.ok(), "synthetic IBImport parses");
         check(ibimport.value()->count_non_air_blocks().value() == 1, "IBImport non-air count");
@@ -1640,6 +1683,7 @@ int main()
         };
         const std::array<std::size_t, 7> gangban_entities{ 1, 0, 1, 1, 1, 1, 1 };
         for (std::size_t index = 0; index < gangban_paths.size(); ++index) {
+            preserve_benchmark_fixture(gangban_paths[index]);
             const auto opened = water_structure::FormatRegistry::open(gangban_paths[index], registry);
             check(opened.ok() && opened.value()->id() == gangban_ids[index],
                 "GangBan magic detection and parse");
@@ -1677,6 +1721,7 @@ int main()
         for (const auto& path : gangban_paths) std::filesystem::remove(path);
 
         const auto qingxu_path = write_qingxu_sample(false);
+        preserve_benchmark_fixture(qingxu_path);
         const auto qingxu = water_structure::FormatRegistry::open(qingxu_path, registry);
         check(qingxu.ok() && qingxu.value()->id() == water_structure::StructureId::QingXuV1,
             "QingXu nested JSON detection and parse");
@@ -1698,6 +1743,7 @@ int main()
         std::filesystem::remove(qingxu_path);
 
         const auto timebuilder_path = write_timebuilder_sample(false);
+        preserve_benchmark_fixture(timebuilder_path);
         const auto timebuilder = water_structure::FormatRegistry::open(timebuilder_path, registry);
         check(timebuilder.ok() &&
             timebuilder.value()->id() == water_structure::StructureId::TimeBuilderV1,
@@ -1728,6 +1774,7 @@ int main()
                 { { "name", "minecraft:dirt" }, { "aux", 0 },
                     { "x", -1 }, { "y", 3 }, { "z", 4 } }
             }));
+        preserve_benchmark_fixture(runaway_path);
         const auto runaway = water_structure::FormatRegistry::open(runaway_path, registry);
         check(runaway.ok() && runaway.value()->id() == water_structure::StructureId::RunAway,
             "RunAway scalar-coordinate detection");
@@ -1751,6 +1798,7 @@ int main()
         };
         const std::array<std::size_t, 5> fuhong_entities{ 0, 2, 1, 1, 1 };
         for (std::size_t index = 0; index < fuhong_paths.size(); ++index) {
+            preserve_benchmark_fixture(fuhong_paths[index]);
             const auto opened = water_structure::FormatRegistry::open_as(
                 fuhong_paths[index], fuhong_ids[index], registry);
             check(opened.ok() && opened.value()->id() == fuhong_ids[index],
@@ -1965,11 +2013,27 @@ int main()
 
         TestStructure structure;
         TestWorld world;
+        std::size_t visited_chunks = 0;
+        const auto visited = structure.visit_chunks(
+            std::array{ water_structure::ChunkPos{ 0, 0 } },
+            [&visited_chunks](water_structure::ChunkPos pos,
+                const water_structure::ChunkData& chunk) {
+                if (pos != water_structure::ChunkPos{ 0, 0 } ||
+                    !chunk.sub_chunks.contains(-4) ||
+                    chunk.sub_chunks.at(-4).layer0[0] != 7) {
+                    return water_structure::Result<void>::failure("visit_chunks payload mismatch");
+                }
+                ++visited_chunks;
+                return water_structure::Result<void>::success();
+            });
+        check(visited.ok() && visited_chunks == 1, "default visit_chunks compatibility path");
         const auto converted = structure.write_to_world(world, { 3, 2, -5 }, {});
         check(converted.ok(), "conversion succeeds");
         check(world.saved_pos == water_structure::ChunkPos{ 3, -5 }, "chunk X/Z translation");
         check(world.saved_chunk.sub_chunks.contains(2), "subchunk Y translation");
         check(world.saved_chunk.sub_chunks.at(2).layer0[0] == 7, "translated subchunk contents");
+        check(world.saved_chunk.sub_chunks.at(2).layer1[0] == 1,
+            "streaming conversion preserves secondary layer");
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;

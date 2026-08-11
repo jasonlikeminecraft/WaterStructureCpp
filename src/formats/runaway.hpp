@@ -1,5 +1,6 @@
 #pragma once
 
+#include <WaterStructure/chunk_index.hpp>
 #include <WaterStructure/runtime_registry.hpp>
 #include <WaterStructure/structure.hpp>
 
@@ -28,6 +29,7 @@ private:
     Size mSize{}, mOriginalSize{};
     BlockPos mOffset{};
     std::vector<Block> mBlocks;
+    mutable ChunkBlockIndex mChunkIndex;
     std::size_t mNonAirBlocks = 0;
 };
 

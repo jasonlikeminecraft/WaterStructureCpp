@@ -209,7 +209,7 @@ Result<void> write_ibimport(
             for (int chunk_x = 0; chunk_x < size.chunk_x_count(); ++chunk_x) {
                 const ChunkPos position{ chunk_x, chunk_z };
                 const std::array<ChunkPos, 1> requested{ position };
-                auto chunks = structure.get_chunks(requested);
+                auto chunks = structure.get_chunks_layer0(requested);
                 if (!chunks) throw std::runtime_error("生成 IBImport chunk 失败: " + chunks.error());
                 const auto found = chunks.value().find(position);
                 const ChunkData empty;
@@ -256,7 +256,7 @@ Result<void> write_ibimport(
                 const auto z = chunk_position.z * 16 + entity.pos.z;
                 if (x < 0 || x >= size.width || y < 0 || y >= size.height ||
                     z < 0 || z >= size.length) continue;
-                const auto chunk = structure.get_chunks(std::array<ChunkPos, 1>{ chunk_position });
+                const auto chunk = structure.get_chunks_layer0(std::array<ChunkPos, 1>{ chunk_position });
                 if (!chunk) throw std::runtime_error(chunk.error());
                 const auto chunk_it = chunk.value().find(chunk_position);
                 const auto runtime_id = chunk_it == chunk.value().end()

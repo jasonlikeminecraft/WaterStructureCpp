@@ -24,6 +24,7 @@ std::optional<std::int32_t> integer(const nlohmann::json& value)
 void RunAwayStructure::set_offset(BlockPos offset) noexcept
 {
     mOffset = offset;
+    mChunkIndex.clear();
     mSize = { mOriginalSize.width + std::abs(offset.x), mOriginalSize.height + std::abs(offset.y), mOriginalSize.length + std::abs(offset.z) };
 }
 
@@ -68,7 +69,27 @@ Result<void> RunAwayStructure::read(const std::filesystem::path& path)
 Result<ChunkMap> RunAwayStructure::get_chunks(std::span<const ChunkPos> positions) const
 {
     ChunkMap result; for (const auto pos : positions) result.emplace(pos, ChunkData{});
-    for (const auto& block : mBlocks) { const auto x=block.pos.x+mOffset.x,y=block.pos.y+mOffset.y,z=block.pos.z+mOffset.z; const ChunkPos chunk{floor_div(x,16),floor_div(z,16)}; auto it=result.find(chunk); if(it==result.end())continue; const auto sy=floor_div(y-64,16); auto [sub,inserted]=it->second.sub_chunks.try_emplace(sy); if(inserted){sub->second.layer0.fill(mRegistry.air_runtime_id());sub->second.layer1.fill(mRegistry.air_runtime_id());} const auto lx=x-chunk.x*16,ly=y-(sy*16+64),lz=z-chunk.z*16; sub->second.layer0[static_cast<std::size_t>((ly*16+lz)*16+lx)]=block.runtime_id; }
+    mChunkIndex.ensure(mBlocks, mOffset, [](const Block& block) { return block.pos; });
+    for (auto& [chunk_pos, chunk] : result) {
+        const auto* indexed = mChunkIndex.find(chunk_pos);
+        if (!indexed) continue;
+        for (const auto index : *indexed) {
+            const auto& block = mBlocks[index];
+            const auto x = block.pos.x + mOffset.x;
+            const auto y = block.pos.y + mOffset.y;
+            const auto z = block.pos.z + mOffset.z;
+            const auto sy = floor_div(y - 64, 16);
+            auto [sub, inserted] = chunk.sub_chunks.try_emplace(sy);
+            if (inserted) {
+                sub->second.layer0.fill(mRegistry.air_runtime_id());
+                sub->second.layer1.fill(mRegistry.air_runtime_id());
+            }
+            const auto lx = x - chunk_pos.x * 16;
+            const auto ly = y - (sy * 16 + 64);
+            const auto lz = z - chunk_pos.z * 16;
+            sub->second.layer0[static_cast<std::size_t>((ly * 16 + lz) * 16 + lx)] = block.runtime_id;
+        }
+    }
     return Result<ChunkMap>::success(std::move(result));
 }
 Result<NbtChunkMap> RunAwayStructure::get_chunk_nbt(std::span<const ChunkPos> positions) const { NbtChunkMap result; for(const auto pos:positions)result.emplace(pos,std::vector<BlockEntity>{}); return Result<NbtChunkMap>::success(std::move(result)); }

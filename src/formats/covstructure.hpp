@@ -18,6 +18,7 @@ public:
     void set_offset(BlockPos offset) noexcept override { mStore.set_offset(offset); }
     Result<void> read(const std::filesystem::path& path) override;
     Result<ChunkMap> get_chunks(std::span<const ChunkPos> positions) const override { return mStore.get_chunks(positions); }
+    Result<ChunkMap> get_chunks_layer0(std::span<const ChunkPos> positions) const override { return mStore.get_chunks_layer0(positions); }
     Result<NbtChunkMap> get_chunk_nbt(std::span<const ChunkPos> positions) const override { return mStore.get_chunk_nbt(positions); }
     Result<std::size_t> count_non_air_blocks() const override { return Result<std::size_t>::success(mNonAirBlocks); }
     Result<void> write_to_world(WorldTarget& world, SubChunkPos start, ConversionCallbacks callbacks) const override;

@@ -17,10 +17,23 @@ public:
     virtual Result<std::vector<BlockEntity>> load_chunk_nbt(ChunkPos pos) const = 0;
 };
 
+struct ChunkWrite {
+    ChunkPos pos{};
+    const ChunkData* chunk = nullptr;
+};
+
 class WorldTarget {
 public:
     virtual ~WorldTarget() = default;
     virtual Result<void> save_chunk(ChunkPos pos, const ChunkData& chunk) = 0;
+    virtual Result<void> save_chunks(std::span<const ChunkWrite> chunks) {
+        for (const auto& write : chunks) {
+            if (!write.chunk) return Result<void>::failure("chunk write is empty");
+            auto saved = save_chunk(write.pos, *write.chunk);
+            if (!saved) return saved;
+        }
+        return Result<void>::success();
+    }
     virtual Result<void> save_chunk_nbt(ChunkPos pos, std::span<const BlockEntity> entities) = 0;
 };
 
@@ -47,6 +60,7 @@ public:
         bool include_layer1 = true) const;
     Result<std::vector<BlockEntity>> load_chunk_nbt(ChunkPos pos) const override;
     Result<void> save_chunk(ChunkPos pos, const ChunkData& chunk) override;
+    Result<void> save_chunks(std::span<const ChunkWrite> chunks) override;
     Result<void> save_chunk_nbt(ChunkPos pos, std::span<const BlockEntity> entities) override;
 
 private:

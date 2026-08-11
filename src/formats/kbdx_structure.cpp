@@ -143,6 +143,7 @@ NbtPayload command_block_nbt(const nlohmann::json& entity)
 void KbdxStructure::set_offset(BlockPos offset) noexcept
 {
     mOffset = offset;
+    mChunkIndex.clear();
     mSize = {
         mOriginalSize.width + std::abs(offset.x),
         mOriginalSize.height + std::abs(offset.y),
@@ -291,25 +292,28 @@ Result<ChunkMap> KbdxStructure::get_chunks(std::span<const ChunkPos> positions) 
         result.emplace(pos, ChunkData{});
     }
 
-    for (const auto& block : mBlocks) {
-        const int x = block.x + mOffset.x;
-        const int y = block.y + mOffset.y;
-        const int z = block.z + mOffset.z;
-        const ChunkPos chunk_pos{ floor_div(x, 16), floor_div(z, 16) };
-        const auto chunk_it = result.find(chunk_pos);
-        if (chunk_it == result.end()) {
-            continue;
+    mChunkIndex.ensure(mBlocks, mOffset, [](const Block& block) {
+        return BlockPos{ block.x, block.y, block.z };
+    });
+    for (auto& [chunk_pos, chunk] : result) {
+        const auto* indexed = mChunkIndex.find(chunk_pos);
+        if (!indexed) continue;
+        for (const auto index : *indexed) {
+            const auto& block = mBlocks[index];
+            const int x = block.x + mOffset.x;
+            const int y = block.y + mOffset.y;
+            const int z = block.z + mOffset.z;
+            const int sub_y = floor_div(y - 64, 16);
+            const int local_x = x - chunk_pos.x * 16;
+            const int local_y = y - (sub_y * 16 + 64);
+            const int local_z = z - (chunk_pos.z * 16);
+            auto [sub_it, inserted] = chunk.sub_chunks.try_emplace(sub_y);
+            if (inserted) {
+                sub_it->second.layer0.fill(mRegistry.air_runtime_id());
+                sub_it->second.layer1.fill(mRegistry.air_runtime_id());
+            }
+            block_at(sub_it->second, 0, local_x, local_y, local_z) = block.runtime_id;
         }
-        const int sub_y = floor_div(y - 64, 16);
-        const int local_x = x - chunk_pos.x * 16;
-        const int local_y = y - (sub_y * 16 + 64);
-        const int local_z = z - chunk_pos.z * 16;
-        auto [sub_it, inserted] = chunk_it->second.sub_chunks.try_emplace(sub_y);
-        if (inserted) {
-            sub_it->second.layer0.fill(mRegistry.air_runtime_id());
-            sub_it->second.layer1.fill(mRegistry.air_runtime_id());
-        }
-        block_at(sub_it->second, 0, local_x, local_y, local_z) = block.runtime_id;
     }
     return Result<ChunkMap>::success(std::move(result));
 }

@@ -23,6 +23,7 @@ public:
     Result<void> read(const std::filesystem::path& path) override;
     Result<ChunkMap> get_chunks(std::span<const ChunkPos> positions) const override;
     Result<ChunkMap> get_chunks_layer0(std::span<const ChunkPos> positions) const override;
+    Result<void> visit_chunks(std::span<const ChunkPos> positions, const ChunkVisitor& visitor) const override;
     void release_cached_chunks() const noexcept override;
     Result<NbtChunkMap> get_chunk_nbt(std::span<const ChunkPos> positions) const override;
     Result<std::size_t> count_non_air_blocks() const override;

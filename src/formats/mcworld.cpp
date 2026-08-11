@@ -153,6 +153,22 @@ Result<ChunkMap> McWorldStructure::get_chunks_layer0(std::span<const ChunkPos> p
     return get_chunks_impl(positions, false);
 }
 
+Result<void> McWorldStructure::visit_chunks(
+    std::span<const ChunkPos> positions,
+    const ChunkVisitor& visitor) const
+{
+    if (!visitor) return Result<void>::failure("chunk visitor is empty");
+    auto chunks = get_chunks(positions);
+    if (!chunks) return Result<void>::failure(chunks.error());
+    for (const auto position : positions) {
+        const auto found = chunks.value().find(position);
+        if (found == chunks.value().end()) continue;
+        auto visited = visitor(position, found->second);
+        if (!visited) return visited;
+    }
+    return Result<void>::success();
+}
+
 Result<ChunkMap> McWorldStructure::get_chunks_impl(
     std::span<const ChunkPos> positions,
     bool include_layer1) const

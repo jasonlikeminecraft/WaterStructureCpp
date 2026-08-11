@@ -14,6 +14,8 @@
 #include <array>
 #include <chrono>
 #include <cstring>
+#include <cstdlib>
+#include <iostream>
 #include <sstream>
 
 namespace water_structure {
@@ -21,6 +23,7 @@ namespace water_structure {
 namespace {
 constexpr std::int32_t kMinSubChunkY = kOverworldMinY / 16;
 constexpr std::int32_t kMaxSubChunkY = 19;
+using Clock = std::chrono::steady_clock;
 
 std::string error_for(const char* operation, const std::string& detail)
 {
@@ -301,43 +304,67 @@ Result<std::vector<BlockEntity>> BedrockWorldAdapter::load_chunk_nbt(ChunkPos po
 
 Result<void> BedrockWorldAdapter::save_chunk(ChunkPos pos, const ChunkData& chunk)
 {
+    const std::array writes{ ChunkWrite{ pos, &chunk } };
+    return save_chunks(writes);
+}
+
+Result<void> BedrockWorldAdapter::save_chunks(std::span<const ChunkWrite> chunks)
+{
     if (!valid()) {
         return Result<void>::failure("世界未打开");
     }
 
-    for (const auto& [sub_y, data] : chunk.sub_chunks) {
-        if (sub_y < kMinSubChunkY || sub_y > kMaxSubChunkY) {
-            return Result<void>::failure(
-                "subchunk Y 超出 Overworld 范围: " + std::to_string(sub_y)
-            );
-        }
-        auto sub_chunk = BedrockWorldOperator::SubChunk::createAirFilled();
-        BlockLayer native_layer0{};
-        BlockLayer native_layer1{};
-        for (int x = 0; x < 16; ++x) {
-            for (int y = 0; y < 16; ++y) {
-                for (int z = 0; z < 16; ++z) {
-                    const auto native_index = static_cast<std::size_t>(x * 256 + y * 16 + z);
-                    const auto internal_index = static_cast<std::size_t>((y * 16 + z) * 16 + x);
-                    native_layer0[native_index] = data.layer0[internal_index];
-                    native_layer1[native_index] = data.layer1[internal_index];
+    std::vector<BedrockWorldOperator::PositionedSubChunkWrite> writes;
+    std::size_t sub_chunk_count = 0;
+    for (const auto& write : chunks) {
+        if (!write.chunk) return Result<void>::failure("chunk write is empty");
+        sub_chunk_count += write.chunk->sub_chunks.size();
+    }
+    writes.reserve(sub_chunk_count);
+    const auto air_runtime_id = BedrockWorldOperator::airRuntimeId();
+    for (const auto& chunk_write : chunks) {
+        const auto pos = chunk_write.pos;
+        for (const auto& [sub_y, data] : chunk_write.chunk->sub_chunks) {
+            if (sub_y < kMinSubChunkY || sub_y > kMaxSubChunkY) {
+                return Result<void>::failure(
+                    "subchunk Y 超出 Overworld 范围: " + std::to_string(sub_y)
+                );
+            }
+            auto sub_chunk = BedrockWorldOperator::SubChunk::createAirFilled();
+            BlockLayer native_layer0{};
+            const bool has_layer1 = std::any_of(
+                data.layer1.begin(), data.layer1.end(),
+                [air_runtime_id](const auto runtime_id) { return runtime_id != air_runtime_id; });
+            BlockLayer native_layer1{};
+            for (int x = 0; x < 16; ++x) {
+                for (int y = 0; y < 16; ++y) {
+                    for (int z = 0; z < 16; ++z) {
+                        const auto native_index = static_cast<std::size_t>(x * 256 + y * 16 + z);
+                        const auto internal_index = static_cast<std::size_t>((y * 16 + z) * 16 + x);
+                        native_layer0[native_index] = data.layer0[internal_index];
+                        if (has_layer1) native_layer1[native_index] = data.layer1[internal_index];
+                    }
                 }
             }
+            if (!sub_chunk.setBlocks(
+                std::span<const std::uint32_t>(native_layer0.data(), native_layer0.size()), 0)) {
+                return Result<void>::failure("创建 subchunk layer 0 失败");
+            }
+            if (has_layer1 && !sub_chunk.setBlocks(
+                std::span<const std::uint32_t>(native_layer1.data(), native_layer1.size()), 1)) {
+                return Result<void>::failure("创建 subchunk layer 1 失败");
+            }
+            BedrockWorldOperator::PositionedSubChunkWrite write;
+            write.position = { pos.x, sub_y, pos.z };
+            write.subChunk = std::move(sub_chunk);
+            writes.push_back(std::move(write));
         }
-        if (!sub_chunk.setBlocks(std::span<const std::uint32_t>(native_layer0.data(), native_layer0.size()), 0)) {
-            return Result<void>::failure("创建 subchunk layer 0 失败");
-        }
-        if (!sub_chunk.setBlocks(std::span<const std::uint32_t>(native_layer1.data(), native_layer1.size()), 1)) {
-            return Result<void>::failure("创建 subchunk layer 1 失败");
-        }
-        auto saved = mWorld->saveSubChunk(
+    }
+    if (!writes.empty()) {
+        auto saved = mWorld->saveSubChunksBatch(
             BedrockWorldOperator::Dimension::Overworld,
-            { pos.x, sub_y, pos.z },
-            sub_chunk
-        );
-        if (!saved) {
-            return Result<void>::failure(saved.error);
-        }
+            std::span<const BedrockWorldOperator::PositionedSubChunkWrite>(writes.data(), writes.size()));
+        if (!saved) return Result<void>::failure(saved.error);
     }
     return Result<void>::success();
 }
@@ -383,6 +410,14 @@ Result<void> BedrockWorldAdapter::save_chunk_nbt(ChunkPos pos, std::span<const B
 
 Result<void> convert_to_world(const IStructure& structure, WorldTarget& world, SubChunkPos start, ConversionCallbacks callbacks)
 {
+    const bool profile = std::getenv("WATER_STRUCTURE_PROFILE") != nullptr;
+    double visit_chunks_ms = 0.0;
+    double save_chunks_ms = 0.0;
+    double visit_entities_ms = 0.0;
+    double save_entities_ms = 0.0;
+    const auto elapsed_ms = [](const auto begin) {
+        return std::chrono::duration<double, std::milli>(Clock::now() - begin).count();
+    };
     const auto structure_size = structure.size();
     const auto total_chunks = static_cast<std::size_t>(structure_size.chunk_x_count()) * structure_size.chunk_z_count();
     if (callbacks.start) {
@@ -391,26 +426,26 @@ Result<void> convert_to_world(const IStructure& structure, WorldTarget& world, S
 
     std::vector<ChunkPos> positions;
     positions.reserve(total_chunks);
-    for (std::int32_t x = 0; x < structure_size.chunk_x_count(); ++x) {
-        for (std::int32_t z = 0; z < structure_size.chunk_z_count(); ++z) {
+    for (std::int32_t z = 0; z < structure_size.chunk_z_count(); ++z) {
+        for (std::int32_t x = 0; x < structure_size.chunk_x_count(); ++x) {
             positions.push_back({ x, z });
         }
     }
 
-    constexpr std::size_t batch_size = 64;
+    const std::size_t batch_size =
+        (structure.id() == StructureId::SchemV1 || structure.id() == StructureId::SchemV2)
+        ? static_cast<std::size_t>(structure_size.chunk_x_count())
+        : 64;
     for (std::size_t begin = 0; begin < positions.size(); begin += batch_size) {
         const auto end = std::min(begin + batch_size, positions.size());
         const auto batch = std::span<const ChunkPos>(positions).subspan(begin, end - begin);
-
-        auto chunks = structure.get_chunks(batch);
-        if (!chunks) {
-            return Result<void>::failure(chunks.error());
-        }
-        for (auto& [local_pos, chunk] : chunks.value()) {
+        const auto visit_chunks_start = Clock::now();
+        auto visited_chunks = structure.visit_chunks(batch,
+            [&](ChunkPos local_pos, const ChunkData& chunk) -> Result<void> {
             const ChunkPos target_pos{ local_pos.x + start.x, local_pos.z + start.z };
             ChunkData shifted;
             const auto sub_y_offset = start.y - kMinSubChunkY;
-            for (auto& [local_sub_y, sub_chunk] : chunk.sub_chunks) {
+            for (const auto& [local_sub_y, sub_chunk] : chunk.sub_chunks) {
                 const auto target_sub_y = local_sub_y + sub_y_offset;
                 if (target_sub_y < kMinSubChunkY || target_sub_y > kMaxSubChunkY) {
                     return Result<void>::failure(
@@ -418,9 +453,11 @@ Result<void> convert_to_world(const IStructure& structure, WorldTarget& world, S
                         std::to_string(target_pos.z) + "), subY=" + std::to_string(target_sub_y)
                     );
                 }
-                shifted.sub_chunks.emplace(target_sub_y, std::move(sub_chunk));
+                shifted.sub_chunks.emplace(target_sub_y, sub_chunk);
             }
+            const auto save_start = Clock::now();
             auto saved = world.save_chunk(target_pos, shifted);
+            save_chunks_ms += elapsed_ms(save_start);
             if (!saved) {
                 return Result<void>::failure(
                     "保存区块 (" + std::to_string(target_pos.x) + ", " + std::to_string(target_pos.z) + ") 失败: " +
@@ -430,33 +467,47 @@ Result<void> convert_to_world(const IStructure& structure, WorldTarget& world, S
             if (callbacks.progress) {
                 callbacks.progress();
             }
-        }
+            return Result<void>::success();
+        });
+        visit_chunks_ms += elapsed_ms(visit_chunks_start);
+        if (!visited_chunks) return visited_chunks;
 
-        auto entities = structure.get_chunk_nbt(batch);
-        if (!entities) {
-            return Result<void>::failure(entities.error());
-        }
-        for (auto& [local_pos, values] : entities.value()) {
-            if (values.empty()) {
-                continue;
-            }
+        const auto visit_entities_start = Clock::now();
+        auto visited_entities = structure.visit_chunk_nbt(batch,
+            [&](ChunkPos local_pos, std::span<const BlockEntity> values) -> Result<void> {
+            if (values.empty()) return Result<void>::success();
             const ChunkPos target_pos{ local_pos.x + start.x, local_pos.z + start.z };
-            for (auto& entity : values) {
+            std::vector<BlockEntity> shifted_values(values.begin(), values.end());
+            for (auto& entity : shifted_values) {
                 entity.pos.x += target_pos.x * 16;
                 entity.pos.y += start.y * 16 - kOverworldMinY;
                 entity.pos.z += target_pos.z * 16;
             }
+            const auto save_start = Clock::now();
             auto saved = world.save_chunk_nbt(
                 target_pos,
-                values
+                shifted_values
             );
+            save_entities_ms += elapsed_ms(save_start);
             if (!saved) {
                 return Result<void>::failure(
                     "保存区块 NBT (" + std::to_string(target_pos.x) + ", " + std::to_string(target_pos.z) + ") 失败: " +
                     saved.error()
                 );
             }
-        }
+            return Result<void>::success();
+        });
+        visit_entities_ms += elapsed_ms(visit_entities_start);
+        if (!visited_entities) return visited_entities;
+        structure.release_cached_chunks();
+    }
+    if (profile) {
+        std::cerr << "world_conversion_profile visit_chunks_ms=" << visit_chunks_ms
+                  << " save_chunks_ms=" << save_chunks_ms
+                  << " visit_without_save_ms=" << (visit_chunks_ms - save_chunks_ms)
+                  << " visit_entities_ms=" << visit_entities_ms
+                  << " save_entities_ms=" << save_entities_ms
+                  << '\n';
     }
     return Result<void>::success();
 }
