@@ -3,6 +3,8 @@
 #include "coordinates.hpp"
 
 #include <cstddef>
+#include <cstdint>
+#include <limits>
 #include <unordered_map>
 #include <vector>
 
@@ -19,9 +21,13 @@ public:
     }
 
     template <typename BlockRange, typename PositionFn>
-    void ensure(const BlockRange& blocks, BlockPos offset, PositionFn position) const
+    bool ensure(const BlockRange& blocks, BlockPos offset, PositionFn position) const
     {
-        if (mReady) return;
+        if (mReady) return true;
+        if (blocks.size() >
+            static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())) {
+            return false;
+        }
         mBuckets.clear();
         for (std::size_t index = 0; index < blocks.size(); ++index) {
             const auto local = position(blocks[index]);
@@ -30,12 +36,13 @@ public:
                 local.y + offset.y,
                 local.z + offset.z
             };
-            mBuckets[block_to_chunk(world)].push_back(index);
+            mBuckets[block_to_chunk(world)].push_back(static_cast<std::uint32_t>(index));
         }
         mReady = true;
+        return true;
     }
 
-    const std::vector<std::size_t>* find(ChunkPos position) const noexcept
+    const std::vector<std::uint32_t>* find(ChunkPos position) const noexcept
     {
         const auto found = mBuckets.find(position);
         return found == mBuckets.end() ? nullptr : &found->second;
@@ -43,7 +50,7 @@ public:
 
 private:
     mutable bool mReady = false;
-    mutable std::unordered_map<ChunkPos, std::vector<std::size_t>, ChunkPosHash> mBuckets;
+    mutable std::unordered_map<ChunkPos, std::vector<std::uint32_t>, ChunkPosHash> mBuckets;
 };
 
 } // namespace water_structure

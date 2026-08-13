@@ -17,6 +17,7 @@
 #include "litematic.hpp"
 #include "litematic_writer.hpp"
 #include "mcfunction.hpp"
+#include "mcfunction_writer.hpp"
 #include "mcstructure.hpp"
 #include "mcstructure_writer.hpp"
 #include "mcworld.hpp"
@@ -52,7 +53,7 @@ const std::vector<FormatInfo> kFormats = {
         { "constrct/version/section-index/NBT" } },
     { StructureId::AxiomBP, "AxiomBP", { ".bp" }, true, true, true, true,
         { "0x0AE5BB36/gzip NBT/BlockRegion" } },
-    { StructureId::MCFunction, "MCFunction", { ".mcfunction", ".txt" }, true, false, true, false, { "setblock|fill" } },
+    { StructureId::MCFunction, "MCFunction", { ".mcfunction", ".txt" }, true, true, true, true, { "setblock|fill" } },
     { StructureId::KBDX, "KBDX", { ".kbdx" }, true, false, true, false },
     { StructureId::IBImport, "IBImport", { ".ibi" }, true, true, true, true, { "IBImport " } },
     { StructureId::MianYangV1, "MianYangV1", { ".json" }, true, false, true, false,
@@ -240,17 +241,23 @@ Result<FormatInfo> FormatRegistry::detect(const std::filesystem::path& path)
     return Result<FormatInfo>::failure("无法识别结构文件格式: " + path.string());
 }
 
-Result<std::unique_ptr<IStructure>> FormatRegistry::open(const std::filesystem::path& path, RuntimeRegistry& registry)
+Result<std::unique_ptr<IStructure>> FormatRegistry::open(
+    const std::filesystem::path& path,
+    RuntimeRegistry& registry,
+    const OpenOptions& options)
 {
     auto detected = detect(path);
     if (!detected) {
         return Result<std::unique_ptr<IStructure>>::failure(detected.error());
     }
-    return open_as(path, detected.value().id, registry);
+    return open_as(path, detected.value().id, registry, options);
 }
 
 Result<std::unique_ptr<IStructure>> FormatRegistry::open_as(
-    const std::filesystem::path& path, StructureId format, RuntimeRegistry& registry)
+    const std::filesystem::path& path,
+    StructureId format,
+    RuntimeRegistry& registry,
+    const OpenOptions& options)
 {
     if (format == StructureId::KBDX) {
         auto reader = std::make_unique<KbdxStructure>(registry);
@@ -262,6 +269,7 @@ Result<std::unique_ptr<IStructure>> FormatRegistry::open_as(
     }
     if (format == StructureId::BDX) {
         auto reader = std::make_unique<BdxStructure>(registry);
+        reader->set_streaming_world_import(options.streaming_world_import);
         auto parsed = reader->read(path);
         if (!parsed) return Result<std::unique_ptr<IStructure>>::failure(parsed.error());
         return Result<std::unique_ptr<IStructure>>::success(std::move(reader));
@@ -420,7 +428,8 @@ Result<void> FormatRegistry::write(
     const IStructure& structure,
     StructureId format,
     const std::filesystem::path& path,
-    RuntimeRegistry& registry)
+    RuntimeRegistry& registry,
+    const ConversionOptions& options)
 {
     if (format == StructureId::MCStructure) {
         return write_mcstructure(structure, registry, path);
@@ -445,6 +454,9 @@ Result<void> FormatRegistry::write(
     }
     if (format == StructureId::FuHongV4 || format == StructureId::FuHongV5) {
         return write_fuhong(structure, registry, format, path);
+    }
+    if (format == StructureId::MCFunction) {
+        return write_mcfunction(structure, registry, path, options);
     }
     return Result<void>::failure(
         "capability error: 目标格式 " + to_string(format) + " 没有已验证的 writer");

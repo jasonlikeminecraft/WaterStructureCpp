@@ -283,6 +283,26 @@ std::filesystem::path write_truncated_bdx_sample()
     return write_bdx_payload(std::move(decoded), "water_structure_cpp_truncated_test.bdx");
 }
 
+std::filesystem::path write_truncated_bdx_brotli_sample()
+{
+    std::vector<std::uint8_t> decoded{ 'B','D','X','t','e','s','t',0,1,39 };
+    const std::uint32_t debug_size = 4096;
+    decoded.push_back(static_cast<std::uint8_t>(debug_size >> 24));
+    decoded.push_back(static_cast<std::uint8_t>(debug_size >> 16));
+    decoded.push_back(static_cast<std::uint8_t>(debug_size >> 8));
+    decoded.push_back(static_cast<std::uint8_t>(debug_size));
+    decoded.insert(decoded.end(), debug_size, 0x5a);
+    decoded.push_back(88);
+    const auto path = write_bdx_payload(
+        std::move(decoded), "water_structure_cpp_truncated_brotli_test.bdx");
+    std::ifstream input(path, std::ios::binary);
+    std::vector<char> bytes((std::istreambuf_iterator<char>(input)), {});
+    bytes.resize(std::max<std::size_t>(4, bytes.size() / 2));
+    std::ofstream output(path, std::ios::binary | std::ios::trunc);
+    output.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+    return path;
+}
+
 std::filesystem::path write_ibimport_sample()
 {
     const auto path = std::filesystem::temp_directory_path() / "water_structure_cpp_test.ibi";
@@ -1156,6 +1176,55 @@ public:
     water_structure::ChunkPos saved_pos{};
     water_structure::ChunkData saved_chunk;
 };
+
+class BlockEntityStructure final : public water_structure::IStructure {
+public:
+    explicit BlockEntityStructure(const water_structure::IStructure& source) : mSource(source) {}
+
+    water_structure::StructureId id() const noexcept override { return mSource.id(); }
+    std::string_view name() const noexcept override { return mSource.name(); }
+    water_structure::Size size() const noexcept override { return mSource.size(); }
+    water_structure::BlockPos offset() const noexcept override { return mSource.offset(); }
+    void set_offset(water_structure::BlockPos) noexcept override {}
+    water_structure::Result<void> read(const std::filesystem::path&) override {
+        return water_structure::Result<void>::failure("unused");
+    }
+    water_structure::Result<water_structure::ChunkMap> get_chunks(
+        std::span<const water_structure::ChunkPos> positions) const override
+    {
+        return mSource.get_chunks(positions);
+    }
+    water_structure::Result<water_structure::NbtChunkMap> get_chunk_nbt(
+        std::span<const water_structure::ChunkPos> positions) const override
+    {
+        water_structure::NbtChunkMap result;
+        for (const auto position : positions) result.emplace(position, std::vector<water_structure::BlockEntity>{});
+        if (!positions.empty()) {
+            result.at(positions.front()).push_back({ { 1, 2, 3 }, { 10, 0, 0, 0 } });
+        }
+        return water_structure::Result<water_structure::NbtChunkMap>::success(std::move(result));
+    }
+    water_structure::Result<std::size_t> count_non_air_blocks() const override {
+        return mSource.count_non_air_blocks();
+    }
+    water_structure::Result<void> write_to_world(
+        water_structure::WorldTarget&,
+        water_structure::SubChunkPos,
+        water_structure::ConversionCallbacks) const override
+    {
+        return water_structure::Result<void>::failure("unused");
+    }
+    water_structure::Result<void> read_from_world(
+        water_structure::WorldSource&,
+        water_structure::BlockBox,
+        water_structure::ConversionCallbacks) override
+    {
+        return water_structure::Result<void>::failure("unused");
+    }
+
+private:
+    const water_structure::IStructure& mSource;
+};
 }
 
 int main()
@@ -1268,6 +1337,7 @@ int main()
             water_structure::StructureId::MCStructure,
             water_structure::StructureId::BDX,
             water_structure::StructureId::AxiomBP,
+            water_structure::StructureId::MCFunction,
             water_structure::StructureId::IBImport,
             water_structure::StructureId::FuHongV4,
             water_structure::StructureId::FuHongV5 }) {
@@ -1412,6 +1482,103 @@ int main()
             schematic_round_trip_chunks.value().at({ 0, 0 }).sub_chunks.at(-4).layer0[0] ==
                 registry.schematic_runtime_id(1, 0).value(),
             "Schematic writer round-trip block state");
+        const auto mcfunction_source_path = std::filesystem::temp_directory_path() /
+            "water_structure_cpp_writer_source.mcfunction";
+        const auto mcfunction_writer_path = std::filesystem::temp_directory_path() /
+            "water_structure_cpp_writer_roundtrip.mcfunction";
+        const auto mcfunction_single_thread_path = std::filesystem::temp_directory_path() /
+            "water_structure_cpp_writer_single_thread.mcfunction";
+        {
+            std::ofstream source(mcfunction_source_path, std::ios::binary | std::ios::trunc);
+            source << "setblock 0 0 0 minecraft:oak_log[axis=x]\n"
+                   << "setblock 1 0 0 minecraft:green_candle[candles=3,lit=false]\n"
+                   << "setblock 2 0 0 minecraft:water[level=0]\n"
+                   << "setblock 32 32 32 minecraft:air\n";
+        }
+        const auto mcfunction_source = water_structure::FormatRegistry::open(
+            mcfunction_source_path, registry);
+        check(mcfunction_source.ok(), "MCFunction writer source parses");
+        const auto mcfunction_written = water_structure::FormatRegistry::write(
+            *mcfunction_source.value(), water_structure::StructureId::MCFunction,
+            mcfunction_writer_path, registry);
+        check(mcfunction_written.ok(), "MCFunction writer succeeds");
+        const auto mcfunction_single_thread_written = water_structure::FormatRegistry::write(
+            *mcfunction_source.value(), water_structure::StructureId::MCFunction,
+            mcfunction_single_thread_path, registry,
+            water_structure::ConversionOptions{ .thread_count = 1 });
+        check(mcfunction_single_thread_written.ok(),
+            "MCFunction single-thread writer succeeds");
+        {
+            std::ifstream parallel(mcfunction_writer_path, std::ios::binary);
+            std::ifstream sequential(mcfunction_single_thread_path, std::ios::binary);
+            const std::string parallel_bytes{
+                std::istreambuf_iterator<char>(parallel), std::istreambuf_iterator<char>() };
+            const std::string sequential_bytes{
+                std::istreambuf_iterator<char>(sequential), std::istreambuf_iterator<char>() };
+            check(parallel_bytes == sequential_bytes,
+                "MCFunction thread counts preserve deterministic output");
+        }
+        const auto mcfunction_round_trip = water_structure::FormatRegistry::open(
+            mcfunction_writer_path, registry);
+        check(mcfunction_round_trip.ok(), "MCFunction writer output parses");
+        const auto mcfunction_size = mcfunction_round_trip.value()->size();
+        check(mcfunction_size.width == 33 && mcfunction_size.height == 33 &&
+            mcfunction_size.length == 33,
+            "MCFunction writer preserves trailing-air dimensions");
+        check(mcfunction_round_trip.value()->count_non_air_blocks().value() == 3,
+            "MCFunction writer round-trip non-air count");
+        const auto mcfunction_source_chunks = mcfunction_source.value()->get_chunks(
+            std::array<water_structure::ChunkPos, 1>{ water_structure::ChunkPos{ 0, 0 } });
+        const auto mcfunction_round_trip_chunks = mcfunction_round_trip.value()->get_chunks(
+            std::array<water_structure::ChunkPos, 1>{ water_structure::ChunkPos{ 0, 0 } });
+        check(mcfunction_source_chunks.ok() && mcfunction_round_trip_chunks.ok() &&
+            mcfunction_source_chunks.value().at({ 0, 0 }).sub_chunks.at(-4).layer0[0] ==
+                mcfunction_round_trip_chunks.value().at({ 0, 0 }).sub_chunks.at(-4).layer0[0] &&
+            mcfunction_source_chunks.value().at({ 0, 0 }).sub_chunks.at(-4).layer0[1] ==
+                mcfunction_round_trip_chunks.value().at({ 0, 0 }).sub_chunks.at(-4).layer0[1] &&
+            mcfunction_source_chunks.value().at({ 0, 0 }).sub_chunks.at(-4).layer0[2] ==
+                mcfunction_round_trip_chunks.value().at({ 0, 0 }).sub_chunks.at(-4).layer0[2],
+            "MCFunction writer round-trip Java state properties");
+        {
+            std::ifstream written(mcfunction_writer_path, std::ios::binary);
+            std::string line;
+            bool found_state = false;
+            bool found_candle = false;
+            bool found_numeric_byte = false;
+            while (std::getline(written, line)) {
+                if (line.find("[axis=x]") != std::string::npos) found_state = true;
+                if (line.find("green_candle[candles=3,lit=false]") != std::string::npos) {
+                    found_candle = true;
+                }
+                if (line.find("minecraft:water[level=0]") != std::string::npos) {
+                    found_numeric_byte = true;
+                }
+                if (!line.starts_with("fill ")) continue;
+                std::istringstream fields(line);
+                std::string command;
+                std::int32_t x1 = 0, y1 = 0, z1 = 0, x2 = 0, y2 = 0, z2 = 0;
+                fields >> command >> x1 >> y1 >> z1 >> x2 >> y2 >> z2;
+                const auto fill_volume =
+                    static_cast<std::int64_t>(std::abs(x2 - x1) + 1) *
+                    (std::abs(y2 - y1) + 1) * (std::abs(z2 - z1) + 1);
+                check(fill_volume <= 32768, "MCFunction fill respects command block limit");
+            }
+            check(found_state, "MCFunction writer emits Java state properties");
+            check(found_candle, "MCFunction writer preserves unique Java reverse states");
+            check(found_numeric_byte, "MCFunction writer keeps numeric Java byte properties numeric");
+        }
+        const auto mcfunction_nbt_path = std::filesystem::temp_directory_path() /
+            "water_structure_cpp_writer_nbt.mcfunction";
+        std::filesystem::remove(mcfunction_nbt_path);
+        const BlockEntityStructure mcfunction_with_nbt(*mcfunction_source.value());
+        const auto mcfunction_nbt_written = water_structure::FormatRegistry::write(
+            mcfunction_with_nbt, water_structure::StructureId::MCFunction,
+            mcfunction_nbt_path, registry);
+        check(!mcfunction_nbt_written.ok() &&
+            mcfunction_nbt_written.error().find("方块实体 NBT") != std::string::npos,
+            "MCFunction writer explicitly rejects block entity NBT");
+        check(!std::filesystem::exists(mcfunction_nbt_path),
+            "MCFunction NBT rejection does not create partial output");
         const auto ibimport_writer_path = std::filesystem::temp_directory_path() /
             "water_structure_cpp_writer_roundtrip.ibi";
         const auto ibimport_written = water_structure::FormatRegistry::write(
@@ -1452,6 +1619,9 @@ int main()
             std::filesystem::remove(fuhong_writer_path);
         }
         std::filesystem::remove(ibimport_writer_path);
+        std::filesystem::remove(mcfunction_single_thread_path);
+        std::filesystem::remove(mcfunction_writer_path);
+        std::filesystem::remove(mcfunction_source_path);
         std::filesystem::remove(schematic_writer_path);
         std::filesystem::remove(litematic_writer_path);
         std::filesystem::remove(axiom_writer_path);
@@ -1581,6 +1751,21 @@ int main()
                 fixture_output,
                 std::filesystem::copy_options::overwrite_existing);
         }
+
+        const auto hinted_bdx_path = bdx_path.parent_path() /
+            "water_structure_cpp_test@[0,0,0]~[7,8,9].bdx";
+        std::filesystem::copy_file(
+            bdx_path,
+            hinted_bdx_path,
+            std::filesystem::copy_options::overwrite_existing);
+        const auto hinted_bdx = water_structure::FormatRegistry::open(
+            hinted_bdx_path,
+            registry,
+            { .streaming_world_import = true });
+        check(hinted_bdx.ok() && hinted_bdx.value()->size().width == 8 &&
+            hinted_bdx.value()->size().height == 9 && hinted_bdx.value()->size().length == 10,
+            "BDX filename bounds enable streaming world import");
+        std::filesystem::remove(hinted_bdx_path);
         std::filesystem::remove(bdx_path);
 
         const auto truncated_bdx_path = write_truncated_bdx_sample();
@@ -1588,6 +1773,14 @@ int main()
         check(!truncated_bdx.ok() && truncated_bdx.error().find("command #1") != std::string::npos,
             "BDX truncated command error context");
         std::filesystem::remove(truncated_bdx_path);
+
+        const auto truncated_brotli_path = write_truncated_bdx_brotli_sample();
+        const auto truncated_brotli = water_structure::FormatRegistry::open(
+            truncated_brotli_path, registry);
+        check(!truncated_brotli.ok() &&
+            truncated_brotli.error().find("Brotli") != std::string::npos,
+            "BDX truncated Brotli stream error");
+        std::filesystem::remove(truncated_brotli_path);
 
         const auto ibimport_path = write_ibimport_sample();
         preserve_benchmark_fixture(ibimport_path);

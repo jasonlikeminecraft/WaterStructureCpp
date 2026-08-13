@@ -66,6 +66,14 @@ struct BlockState {
 using NbtPayload = std::vector<std::uint8_t>;
 using BlockLayer = std::array<std::uint32_t, 4096>;
 
+// Internal structure readers use (y,z,x) indexing.  The Bedrock writer can
+// opt into the native (x,y,z) layout when a producer already emits blocks in
+// that order, avoiding a full 4096-entry transpose at save time.
+enum class BlockLayerLayout : std::uint8_t {
+    Internal,
+    Native
+};
+
 struct SubChunkData {
     BlockLayer layer0{};
     BlockLayer layer1{};
@@ -73,6 +81,7 @@ struct SubChunkData {
 
 struct ChunkData {
     std::unordered_map<std::int32_t, SubChunkData> sub_chunks;
+    BlockLayerLayout layout = BlockLayerLayout::Internal;
 };
 
 struct BlockEntity {

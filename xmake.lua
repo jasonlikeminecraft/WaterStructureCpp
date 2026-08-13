@@ -19,6 +19,11 @@ add_requires("zlib", { configs = { shared = false } })
 target("leveldb")
     set_kind("static")
     set_languages("cxx20")
+    if is_mode("release") then
+        set_optimize("fastest")
+        add_cxxflags("/GL", { force = true })
+        add_ldflags("/LTCG", "/OPT:REF", "/OPT:ICF", { force = true })
+    end
     add_files(
         "thirdparty/LevelDB/db/builder.cc",
         "thirdparty/LevelDB/db/c.cc",
@@ -64,6 +69,11 @@ target("leveldb")
 target("bedrock_world_operator")
     set_kind("static")
     set_languages("cxx23")
+    if is_mode("release") then
+        set_optimize("fastest")
+        add_cxxflags("/GL", { force = true })
+        add_ldflags("/LTCG", "/OPT:REF", "/OPT:ICF", { force = true })
+    end
     add_files("thirdparty/BedrockWorldOperator/src/*.cpp")
     add_includedirs("thirdparty/BedrockWorldOperator/include", { public = true })
     add_deps("leveldb", { public = true })
@@ -71,6 +81,11 @@ target("bedrock_world_operator")
 target("libnbt")
     set_kind("static")
     set_languages("cxx20")
+    if is_mode("release") then
+        set_optimize("fastest")
+        add_cxxflags("/GL", { force = true })
+        add_ldflags("/LTCG", "/OPT:REF", "/OPT:ICF", { force = true })
+    end
     add_files(
         "thirdparty/libnbt/src/*.cpp",
         "thirdparty/libnbt/src/io/*.cpp",
@@ -83,7 +98,28 @@ target("water_structure")
     set_kind("static")
     set_languages("cxx23")
     set_symbols("debug")
-    add_files("src/core/*.cpp", "src/world/*.cpp", "src/formats/*.cpp")
+    if is_mode("release") then
+        set_optimize("fastest")
+        add_cxxflags("/GL", { force = true })
+        add_ldflags("/LTCG", "/OPT:REF", "/OPT:ICF", { force = true })
+    end
+    add_files("src/c_api.cpp", "src/core/*.cpp", "src/world/*.cpp", "src/formats/*.cpp")
+    add_includedirs("include", { public = true })
+    add_deps("bedrock_world_operator", "libnbt", { public = true })
+    add_packages("nlohmann_json", "msgpack-cxx", "brotli", "zlib", { public = true })
+    add_syslinks("bcrypt", { public = true })
+
+target("water_structure_shared")
+    set_kind("shared")
+    set_languages("cxx23")
+    set_symbols("debug")
+    add_defines("WATER_STRUCTURE_BUILD_SHARED", { public = true })
+    if is_mode("release") then
+        set_optimize("fastest")
+        add_cxxflags("/GL", { force = true })
+        add_ldflags("/LTCG", "/OPT:REF", "/OPT:ICF", { force = true })
+    end
+    add_files("src/c_api.cpp", "src/core/*.cpp", "src/world/*.cpp", "src/formats/*.cpp")
     add_includedirs("include", { public = true })
     add_deps("bedrock_world_operator", "libnbt", { public = true })
     add_packages("nlohmann_json", "msgpack-cxx", "brotli", "zlib", { public = true })
@@ -92,6 +128,12 @@ target("water_structure")
 target("water_structure_cli")
     set_kind("binary")
     set_languages("cxx23")
+    set_symbols("debug")
+    if is_mode("release") then
+        set_optimize("fastest")
+        add_cxxflags("/GL", { force = true })
+        add_ldflags("/LTCG", "/OPT:REF", "/OPT:ICF", { force = true })
+    end
     add_files("src/cli/main.cpp")
     add_includedirs("include")
     add_deps("water_structure")
@@ -99,6 +141,11 @@ target("water_structure_cli")
 target("water_structure_tests")
     set_kind("binary")
     set_languages("cxx23")
+    if is_mode("release") then
+        set_optimize("fastest")
+        add_cxxflags("/GL", { force = true })
+        add_ldflags("/LTCG", "/OPT:REF", "/OPT:ICF", { force = true })
+    end
     add_files("tests/*.cpp")
     add_includedirs("include")
     add_deps("water_structure")
@@ -106,6 +153,11 @@ target("water_structure_tests")
 target("water_structure_bench")
     set_kind("binary")
     set_languages("cxx23")
+    if is_mode("release") then
+        set_optimize("fastest")
+        add_cxxflags("/GL", { force = true })
+        add_ldflags("/LTCG", "/OPT:REF", "/OPT:ICF", { force = true })
+    end
     add_files("benchmarks/*.cpp")
     add_includedirs("include")
     add_deps("water_structure")
@@ -114,6 +166,11 @@ target("water_structure_bench")
 target("cpp_manifest")
     set_kind("binary")
     set_languages("cxx23")
+    if is_mode("release") then
+        set_optimize("fastest")
+        add_cxxflags("/GL", { force = true })
+        add_ldflags("/LTCG", "/OPT:REF", "/OPT:ICF", { force = true })
+    end
     add_files("tools/cpp_manifest/*.cpp")
     add_includedirs("include")
     add_deps("water_structure")

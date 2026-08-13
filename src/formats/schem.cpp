@@ -9,7 +9,6 @@
 #include <tag_primitive.h>
 
 #include <algorithm>
-#include <array>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -18,17 +17,20 @@
 #include <iostream>
 #include <limits>
 #include <system_error>
+#include <vector>
 
 namespace water_structure {
 
 namespace {
 
 using NbtReader = nbt::io::stream_reader;
-constexpr std::size_t kIndexStride = 64;
+constexpr std::size_t kIndexStride = 256;
+constexpr std::uint16_t kMissingChunkOffset = std::numeric_limits<std::uint16_t>::max();
 
 class EncodedReader {
 public:
-    explicit EncodedReader(const std::filesystem::path& path) : mInput(path, std::ios::binary) {}
+    explicit EncodedReader(const std::filesystem::path& path)
+        : mInput(path, std::ios::binary), mBuffer(1u << 20) {}
     bool good() const noexcept { return static_cast<bool>(mInput); }
     bool seek(std::uint64_t offset)
     {
@@ -56,7 +58,7 @@ public:
     }
 private:
     std::ifstream mInput;
-    std::array<char, 1 << 20> mBuffer{};
+    std::vector<char> mBuffer;
     std::size_t mPosition = 0;
     std::size_t mSize = 0;
 };
@@ -86,7 +88,7 @@ std::optional<std::int32_t> read_integer(NbtReader& reader, nbt::tag_type type)
 
 void skip_bytes(std::istream& input, std::uint64_t count)
 {
-    std::array<char, 1 << 16> buffer{};
+    std::vector<char> buffer(1u << 16);
     while (count != 0) {
         const auto amount = static_cast<std::streamsize>(std::min<std::uint64_t>(count, buffer.size()));
         input.read(buffer.data(), amount);
@@ -162,25 +164,6 @@ bool read_encoded_index(EncodedReader& input, std::uint32_t& result, std::size_t
     }
 }
 
-bool read_decoded_index(EncodedReader& input, std::size_t bytes, std::uint32_t& result)
-{
-    std::uint8_t value[4]{};
-    for (std::size_t i = 0; i < bytes; ++i) if (!input.get(value[i])) return false;
-    result = value[0] | (static_cast<std::uint32_t>(value[1]) << 8) |
-        (static_cast<std::uint32_t>(value[2]) << 16) | (static_cast<std::uint32_t>(value[3]) << 24);
-    if (bytes == 1) result = value[0];
-    else if (bytes == 2) result = value[0] | (static_cast<std::uint32_t>(value[1]) << 8);
-    return true;
-}
-
-std::uint32_t decoded_index_at(const std::uint8_t* value, std::size_t bytes) noexcept
-{
-    if (bytes == 1) return value[0];
-    if (bytes == 2) return value[0] | (static_cast<std::uint32_t>(value[1]) << 8);
-    return value[0] | (static_cast<std::uint32_t>(value[1]) << 8) |
-        (static_cast<std::uint32_t>(value[2]) << 16) | (static_cast<std::uint32_t>(value[3]) << 24);
-}
-
 } // namespace
 
 SchemStructure::~SchemStructure()
@@ -194,19 +177,12 @@ void SchemStructure::release_block_data() noexcept
         std::error_code error;
         std::filesystem::remove(mBlockDataPath, error);
     }
-    if (!mDecodedDataPath.empty()) {
-        std::error_code error;
-        std::filesystem::remove(mDecodedDataPath, error);
-    }
     mBlockDataPath.clear();
-    mDecodedDataPath.clear();
     mRowOffsets.clear();
     mChunkOffsets.clear();
     mBlockCount = 0;
     mBlockDataBytes = 0;
     mChunkOffsetCount = 0;
-    mDecodedIndexBytes = 4;
-    mIndexBuilt = false;
     mMaxPaletteIndex = 0;
 }
 
@@ -247,51 +223,8 @@ Result<void> SchemStructure::read(const std::filesystem::path& path)
         bool has_nested_block_data = false;
         bool has_size = false;
         bool has_document = false;
-        bool index_ready = false;
-        std::size_t index_position = 0, index_row = 0, index_x = 0, index_file_offset = 0;
-        std::size_t index_row_bytes = 0;
-        std::uint64_t index_value = 0;
-        int index_shift = 0;
-        auto prepare_index = [&]() {
-            if (index_ready || mOriginalSize.width <= 0 || mOriginalSize.height <= 0 || mOriginalSize.length <= 0) return;
-            const auto width = static_cast<std::size_t>(mOriginalSize.width);
-            const auto rows = static_cast<std::size_t>(mOriginalSize.height) * static_cast<std::size_t>(mOriginalSize.length);
-            mChunkOffsetCount = (width + kIndexStride - 1) / kIndexStride + 1;
-            mRowOffsets.resize(rows);
-            mChunkOffsets.resize(rows * mChunkOffsetCount);
-            index_ready = true;
-        };
-        auto index_byte = [&](std::uint8_t byte) -> Result<void> {
-            const auto width = static_cast<std::size_t>(mOriginalSize.width);
-            const auto rows = static_cast<std::size_t>(mOriginalSize.height) * static_cast<std::size_t>(mOriginalSize.length);
-            if (index_x == 0 && index_shift == 0) {
-                if (index_row >= rows) return Result<void>::failure("Schem BlockData 方块数超过 size");
-                mRowOffsets[index_row] = index_file_offset;
-                mChunkOffsets[index_row * mChunkOffsetCount] = 0;
-            }
-            if (index_x % kIndexStride == 0 && index_x != 0 && index_shift == 0) {
-                if (index_row_bytes > std::numeric_limits<std::uint16_t>::max()) return Result<void>::failure("Schem BlockData 单行编码超过 65535 字节");
-                mChunkOffsets[index_row * mChunkOffsetCount + index_x / kIndexStride] = static_cast<std::uint16_t>(index_row_bytes);
-            }
-            index_value |= static_cast<std::uint64_t>(byte & 0x7fu) << index_shift;
-            ++index_file_offset;
-            ++index_row_bytes;
-            if ((byte & 0x80u) == 0) {
-                if (index_value > std::numeric_limits<std::uint32_t>::max() || index_value > mMaxPaletteIndex)
-                    return Result<void>::failure("Schem BlockData 引用了 palette 范围外的索引");
-                if (++index_position > static_cast<std::size_t>(mOriginalSize.volume())) return Result<void>::failure("Schem BlockData 方块数超过 size");
-                index_value = 0; index_shift = 0; ++index_x;
-                if (index_x == width) {
-                    if (index_row_bytes > std::numeric_limits<std::uint16_t>::max()) return Result<void>::failure("Schem BlockData 单行编码超过 65535 字节");
-                    mChunkOffsets[index_row * mChunkOffsetCount + (width + kIndexStride - 1) / kIndexStride] = static_cast<std::uint16_t>(index_row_bytes);
-                    ++index_row; index_x = 0; index_row_bytes = 0;
-                }
-            } else {
-                index_shift += 7;
-                if (index_shift >= 35) return Result<void>::failure("Schem varint 过长");
-            }
-            return Result<void>::success();
-        };
+        bool index_built_during_read = false;
+        std::uint32_t indexed_max_palette_index = 0;
         auto parse_palette = [&](std::unique_ptr<nbt::tag> payload) -> Result<void> {
             const auto& palette = payload->as<nbt::tag_compound>();
             const auto known_unknown = mRegistry.find("minecraft:unknown");
@@ -322,7 +255,24 @@ Result<void> SchemStructure::read(const std::filesystem::path& path)
         auto read_data = [&]() -> Result<void> {
             std::int32_t length = 0; reader.read_num(length);
             if (length < 0) return Result<void>::failure("Schem BlockData 长度无效");
-            std::array<char, 1 << 20> buffer{};
+            const auto build_index = !has_data &&
+                mOriginalSize.width > 0 && mOriginalSize.height > 0 && mOriginalSize.length > 0;
+            const auto width = static_cast<std::size_t>(mOriginalSize.width);
+            const auto rows = static_cast<std::size_t>(mOriginalSize.height) *
+                static_cast<std::size_t>(mOriginalSize.length);
+            const auto expected_count = static_cast<std::size_t>(mOriginalSize.volume());
+            std::size_t position = 0;
+            std::size_t row = 0;
+            std::size_t x = 0;
+            std::uint64_t encoded_offset = 0;
+            std::uint64_t value = 0;
+            int shift = 0;
+            if (build_index) {
+                mChunkOffsetCount = (width + kIndexStride - 1) / kIndexStride;
+                mRowOffsets.resize(rows);
+                mChunkOffsets.assign(rows * mChunkOffsetCount, kMissingChunkOffset);
+            }
+            std::vector<char> buffer(1u << 20);
             std::int32_t remaining = length;
             while (remaining > 0) {
                 const auto amount = std::min<std::int32_t>(remaining, static_cast<std::int32_t>(buffer.size()));
@@ -330,8 +280,50 @@ Result<void> SchemStructure::read(const std::filesystem::path& path)
                 if (decompressed.gcount() != amount) return Result<void>::failure("Schem BlockData 提前结束");
                 raw.write(buffer.data(), amount);
                 if (!raw) return Result<void>::failure("写入 Schem 临时 BlockData 失败");
+                if (build_index) {
+                    for (std::int32_t index = 0; index < amount; ++index) {
+                        const auto byte = static_cast<std::uint8_t>(buffer[static_cast<std::size_t>(index)]);
+                        if (shift == 0) {
+                            if (position >= expected_count || row >= rows)
+                                return Result<void>::failure("Schem BlockData 方块数超过 size");
+                            if (x == 0) mRowOffsets[row] = encoded_offset;
+                            if (x % kIndexStride == 0) {
+                                const auto relative_offset = encoded_offset - mRowOffsets[row];
+                                if (relative_offset < kMissingChunkOffset) {
+                                    mChunkOffsets[row * mChunkOffsetCount + x / kIndexStride] =
+                                        static_cast<std::uint16_t>(relative_offset);
+                                }
+                            }
+                        }
+                        value |= static_cast<std::uint64_t>(byte & 0x7fu) << shift;
+                        ++encoded_offset;
+                        if ((byte & 0x80u) == 0) {
+                            if (value > std::numeric_limits<std::uint32_t>::max())
+                                return Result<void>::failure("Schem varint 超出 uint32 范围");
+                            indexed_max_palette_index = std::max(
+                                indexed_max_palette_index, static_cast<std::uint32_t>(value));
+                            value = 0;
+                            shift = 0;
+                            ++position;
+                            ++x;
+                            if (x == width) {
+                                ++row;
+                                x = 0;
+                            }
+                        } else {
+                            shift += 7;
+                            if (shift >= 35) return Result<void>::failure("Schem varint 过长");
+                        }
+                    }
+                }
                 remaining -= amount;
                 mBlockDataBytes += static_cast<std::size_t>(amount);
+            }
+            if (build_index) {
+                if (shift != 0) return Result<void>::failure("Schem BlockData 以截断 varint 结束");
+                if (position != expected_count || row != rows || x != 0)
+                    return Result<void>::failure("Schem BlockData 方块数与 size 不一致");
+                index_built_during_read = true;
             }
             has_data = true;
             return Result<void>::success();
@@ -385,31 +377,46 @@ Result<void> SchemStructure::read(const std::filesystem::path& path)
         if (mOriginalSize.width <= 0 || mOriginalSize.height <= 0 || mOriginalSize.length <= 0 || !has_size)
             return Result<void>::failure("Schem 尺寸无效");
         if (!has_palette || !has_data) return Result<void>::failure("Schem 缺少 Palette/BlockData");
+        if (index_built_during_read && indexed_max_palette_index > mMaxPaletteIndex)
+            return Result<void>::failure("Schem BlockData 引用了 palette 范围外的索引");
         if (mFormat == StructureId::SchemV1 && !has_root_block_data)
             return Result<void>::failure("SchemV1 缺少根层 BlockData");
         if (mFormat == StructureId::SchemV2 && !has_nested_block_data)
             return Result<void>::failure("SchemV2 缺少 Blocks/Data");
         raw.close();
         mBlockCount = static_cast<std::size_t>(mOriginalSize.volume());
-        EncodedReader encoded(mBlockDataPath);
-        if (!encoded.good()) return Result<void>::failure("无法打开 Schem 临时 BlockData 文件");
-        const auto width = static_cast<std::size_t>(mOriginalSize.width);
-        const auto rows = static_cast<std::size_t>(mOriginalSize.height) *
-            static_cast<std::size_t>(mOriginalSize.length);
-        mRowOffsets.resize(rows);
-        std::uint64_t encoded_offset = 0;
-        for (std::size_t index = 0; index < mBlockCount; ++index) {
-            if (index % width == 0) mRowOffsets[index / width] = encoded_offset;
-            std::uint32_t palette_index = 0;
-            std::size_t encoded_size = 0;
-            if (!read_encoded_index(encoded, palette_index, &encoded_size) || palette_index > mMaxPaletteIndex) {
-                return Result<void>::failure("Schem BlockData varint 读取失败或 palette 索引越界");
+        if (!index_built_during_read) {
+            EncodedReader encoded(mBlockDataPath);
+            if (!encoded.good()) return Result<void>::failure("无法打开 Schem 临时 BlockData 文件");
+            const auto width = static_cast<std::size_t>(mOriginalSize.width);
+            const auto rows = static_cast<std::size_t>(mOriginalSize.height) *
+                static_cast<std::size_t>(mOriginalSize.length);
+            mRowOffsets.resize(rows);
+            mChunkOffsetCount = (width + kIndexStride - 1) / kIndexStride;
+            mChunkOffsets.assign(rows * mChunkOffsetCount, kMissingChunkOffset);
+            std::uint64_t encoded_offset = 0;
+            for (std::size_t index = 0; index < mBlockCount; ++index) {
+                const auto row = index / width;
+                const auto x = index % width;
+                if (x == 0) mRowOffsets[row] = encoded_offset;
+                if (x % kIndexStride == 0) {
+                    const auto relative_offset = encoded_offset - mRowOffsets[row];
+                    if (relative_offset < kMissingChunkOffset) {
+                        mChunkOffsets[row * mChunkOffsetCount + x / kIndexStride] =
+                            static_cast<std::uint16_t>(relative_offset);
+                    }
+                }
+                std::uint32_t palette_index = 0;
+                std::size_t encoded_size = 0;
+                if (!read_encoded_index(encoded, palette_index, &encoded_size) || palette_index > mMaxPaletteIndex) {
+                    return Result<void>::failure("Schem BlockData varint 读取失败或 palette 索引越界");
+                }
+                encoded_offset += encoded_size;
             }
-            encoded_offset += encoded_size;
-        }
-        std::uint8_t trailing_byte = 0;
-        if (encoded.get(trailing_byte)) {
-            return Result<void>::failure("Schem BlockData 方块数超过 size");
+            std::uint8_t trailing_byte = 0;
+            if (encoded.get(trailing_byte)) {
+                return Result<void>::failure("Schem BlockData 方块数超过 size");
+            }
         }
         set_offset({});
         return Result<void>::success();
@@ -418,72 +425,11 @@ Result<void> SchemStructure::read(const std::filesystem::path& path)
     }
 }
 
-Result<void> SchemStructure::build_block_index()
-{
-    EncodedReader encoded(mBlockDataPath);
-    if (!encoded.good()) return Result<void>::failure("无法打开 Schem 临时 BlockData 文件");
-    mDecodedDataPath = mBlockDataPath;
-    mDecodedDataPath += ".decoded";
-    std::ofstream decoded(mDecodedDataPath, std::ios::binary | std::ios::trunc);
-    if (!decoded) return Result<void>::failure("无法创建 Schem 定宽索引文件");
-    const auto width = static_cast<std::size_t>(mOriginalSize.width);
-    const auto length = static_cast<std::size_t>(mOriginalSize.length);
-    const auto rows = static_cast<std::size_t>(mOriginalSize.height) * length;
-    mChunkOffsetCount = 0;
-    mRowOffsets.resize(rows);
-    mDecodedIndexBytes = mMaxPaletteIndex <= 0xffu ? 1 : (mMaxPaletteIndex <= 0xffffu ? 2 : 4);
-    const auto total = static_cast<std::size_t>(mOriginalSize.volume());
-    std::size_t position = 0, row = 0, x = 0;
-    std::array<char, 1 << 20> output_buffer{};
-    std::size_t output_size = 0;
-    const auto flush_output = [&]() -> bool {
-        decoded.write(output_buffer.data(), static_cast<std::streamsize>(output_size));
-        output_size = 0;
-        return static_cast<bool>(decoded);
-    };
-    while (position < total) {
-        if (x == 0) {
-            if (row >= rows) return Result<void>::failure("Schem BlockData 方块数超过 size");
-            mRowOffsets[row] = static_cast<std::uint64_t>(row) * width * mDecodedIndexBytes;
-        }
-        std::uint32_t value = 0;
-        if (!read_encoded_index(encoded, value) || value > mMaxPaletteIndex)
-            return Result<void>::failure("Schem BlockData varint 读取失败或 palette 索引越界");
-        if (output_size + mDecodedIndexBytes > output_buffer.size() && !flush_output())
-            return Result<void>::failure("写入 Schem 定宽索引失败");
-        output_buffer[output_size++] = static_cast<char>(value & 0xffu);
-        if (mDecodedIndexBytes >= 2) output_buffer[output_size++] = static_cast<char>((value >> 8) & 0xffu);
-        if (mDecodedIndexBytes == 4) {
-            output_buffer[output_size++] = static_cast<char>((value >> 16) & 0xffu);
-            output_buffer[output_size++] = static_cast<char>((value >> 24) & 0xffu);
-        }
-        ++position; ++x;
-        if (x == width) { ++row; x = 0; }
-    }
-    if (output_size != 0 && !flush_output()) return Result<void>::failure("写入 Schem 定宽索引失败");
-    decoded.close();
-    if (position != static_cast<std::size_t>(mOriginalSize.volume()) || row != rows || x != 0)
-        return Result<void>::failure("Schem BlockData 方块数与 size 不一致");
-    mBlockCount = position;
-    return Result<void>::success();
-}
-
-Result<void> SchemStructure::ensure_block_index() const
-{
-    if (mIndexBuilt) return Result<void>::success();
-    auto* self = const_cast<SchemStructure*>(this);
-    auto built = self->build_block_index();
-    if (built) self->mIndexBuilt = true;
-    return built;
-}
-
 Result<ChunkMap> SchemStructure::get_chunks(std::span<const ChunkPos> positions) const
 {
     ChunkMap result;
     for (const auto pos : positions) result.emplace(pos, ChunkData{});
-    auto indexed = ensure_block_index();
-    if (!indexed) return Result<ChunkMap>::failure(indexed.error());
-    EncodedReader encoded(mDecodedDataPath);
+    EncodedReader encoded(mBlockDataPath);
     if (!encoded.good()) return Result<ChunkMap>::failure("无法打开 Schem 临时 BlockData 文件");
     const auto width = mOriginalSize.width, height = mOriginalSize.height, length = mOriginalSize.length;
     const auto air_runtime_id = mRegistry.air_runtime_id();
@@ -491,6 +437,51 @@ Result<ChunkMap> SchemStructure::get_chunks(std::span<const ChunkPos> positions)
     const auto runtime_id_for = [this, dense_palette](std::uint32_t index) noexcept {
         if (dense_palette && index < mDensePalette.size()) return dense_palette[index];
         const auto found = mPalette.find(index); return found == mPalette.end() ? mUnknownRuntimeId : found->second;
+    };
+    std::vector<std::uint8_t> encoded_row;
+    const auto read_row_range = [this, &encoded, &encoded_row](
+        std::size_t row_index,
+        int begin_x,
+        int end_x,
+        std::span<std::uint32_t> output) -> bool {
+        if (row_index >= mRowOffsets.size() || begin_x < 0 || end_x < begin_x ||
+            output.size() != static_cast<std::size_t>(end_x - begin_x + 1)) return false;
+        const auto checkpoint_index = static_cast<std::size_t>(begin_x) / kIndexStride;
+        if (checkpoint_index >= mChunkOffsetCount) return false;
+        const auto checkpoint = mChunkOffsets[row_index * mChunkOffsetCount + checkpoint_index];
+        int source_x = static_cast<int>(checkpoint_index * kIndexStride);
+        std::uint64_t source_offset = mRowOffsets[row_index];
+        if (checkpoint == kMissingChunkOffset) {
+            source_x = 0;
+        } else {
+            source_offset += checkpoint;
+        }
+        if (!encoded.seek(source_offset)) return false;
+        const auto row_end = row_index + 1 < mRowOffsets.size()
+            ? mRowOffsets[row_index + 1]
+            : static_cast<std::uint64_t>(mBlockDataBytes);
+        if (source_offset > row_end || row_end - source_offset > std::numeric_limits<std::size_t>::max())
+            return false;
+        encoded_row.resize(static_cast<std::size_t>(row_end - source_offset));
+        if (!encoded.read_exact(encoded_row)) return false;
+        std::size_t cursor = 0;
+        for (; source_x <= end_x; ++source_x) {
+            std::uint64_t value = 0;
+            int shift = 0;
+            for (;;) {
+                if (cursor >= encoded_row.size()) return false;
+                const auto byte = encoded_row[cursor++];
+                value |= static_cast<std::uint64_t>(byte & 0x7fu) << shift;
+                if ((byte & 0x80u) == 0) break;
+                shift += 7;
+                if (shift >= 35) return false;
+            }
+            if (value > mMaxPaletteIndex) return false;
+            if (source_x >= begin_x) {
+                output[static_cast<std::size_t>(source_x - begin_x)] = static_cast<std::uint32_t>(value);
+            }
+        }
+        return true;
     };
     // Conversion batches are ordered by Z, so a batch normally covers one Z
     // chunk and many X chunks. Decode each source row once and fan it out.
@@ -525,19 +516,17 @@ Result<ChunkMap> SchemStructure::get_chunks(std::span<const ChunkPos> positions)
             std::vector<ChunkData*> targets(static_cast<std::size_t>(max_target_x - min_target_x + 1), nullptr);
             for (const auto& [target_x, chunk] : target_entries) targets[static_cast<std::size_t>(target_x - min_target_x)] = chunk;
             const int begin_x = (min_x / static_cast<int>(kIndexStride)) * static_cast<int>(kIndexStride);
-            std::vector<std::uint8_t> row_data(static_cast<std::size_t>(max_x - begin_x + 1) * mDecodedIndexBytes);
+            std::vector<std::uint32_t> row_data(static_cast<std::size_t>(max_x - begin_x + 1));
             for (int y = 0; y < height; ++y) {
                 const int structure_y = y + mOffset.y, sub_y = floor_div(structure_y - 64, 16);
                 const int local_y = structure_y - (sub_y * 16 + 64);
                 std::vector<SubChunkData*> sub_chunks(targets.size(), nullptr);
                 for (int z = min_z; z <= max_z; ++z) {
                     const auto row_index = static_cast<std::size_t>(y) * static_cast<std::size_t>(length) + z;
-                    if (!encoded.seek(mRowOffsets[row_index] + static_cast<std::size_t>(begin_x) * mDecodedIndexBytes)) return Result<ChunkMap>::failure("Schem BlockData 偏移索引无效");
-                    if (!encoded.read_exact(row_data)) return Result<ChunkMap>::failure("Schem 定宽索引行读取失败");
+                    if (!read_row_range(row_index, begin_x, max_x, row_data))
+                        return Result<ChunkMap>::failure("Schem BlockData 行索引读取失败");
                     for (int x = begin_x; x <= max_x; ++x) {
-                        const auto palette_index = decoded_index_at(
-                            row_data.data() + static_cast<std::size_t>(x - begin_x) * mDecodedIndexBytes,
-                            mDecodedIndexBytes);
+                        const auto palette_index = row_data[static_cast<std::size_t>(x - begin_x)];
                         if (x < min_x) continue;
                         const auto target_x = floor_div(static_cast<std::int32_t>(static_cast<std::int64_t>(x) + mOffset.x), 16);
                         const auto target_index = target_x - min_target_x;
@@ -572,19 +561,17 @@ Result<ChunkMap> SchemStructure::get_chunks(std::span<const ChunkPos> positions)
         if (source_min_x > source_max_x || source_min_z > source_max_z) continue;
         const auto min_x = static_cast<int>(source_min_x), max_x = static_cast<int>(source_max_x);
         const int begin_x = (min_x / static_cast<int>(kIndexStride)) * static_cast<int>(kIndexStride);
-        std::vector<std::uint8_t> row_data(static_cast<std::size_t>(max_x - begin_x + 1) * mDecodedIndexBytes);
+        std::vector<std::uint32_t> row_data(static_cast<std::size_t>(max_x - begin_x + 1));
         for (int y = 0; y < height; ++y) {
             const int structure_y = y + mOffset.y, sub_y = floor_div(structure_y - 64, 16);
             const int local_y = structure_y - (sub_y * 16 + 64);
             SubChunkData* sub_chunk = nullptr;
             for (int z = static_cast<int>(source_min_z); z <= static_cast<int>(source_max_z); ++z) {
                 const auto row_index = static_cast<std::size_t>(y) * static_cast<std::size_t>(length) + z;
-                if (!encoded.seek(mRowOffsets[row_index] + static_cast<std::size_t>(begin_x) * mDecodedIndexBytes)) return Result<ChunkMap>::failure("Schem BlockData 偏移索引无效");
-                if (!encoded.read_exact(row_data)) return Result<ChunkMap>::failure("Schem 定宽索引行读取失败");
+                if (!read_row_range(row_index, begin_x, max_x, row_data))
+                    return Result<ChunkMap>::failure("Schem BlockData 行索引读取失败");
                 for (int x = begin_x; x <= max_x; ++x) {
-                    const auto palette_index = decoded_index_at(
-                        row_data.data() + static_cast<std::size_t>(x - begin_x) * mDecodedIndexBytes,
-                        mDecodedIndexBytes);
+                    const auto palette_index = row_data[static_cast<std::size_t>(x - begin_x)];
                     if (x < min_x) continue;
                     const auto runtime_id = runtime_id_for(palette_index);
                     if (runtime_id == air_runtime_id) continue;
@@ -626,16 +613,15 @@ Result<NbtChunkMap> SchemStructure::get_chunk_nbt(std::span<const ChunkPos> posi
 
 Result<std::size_t> SchemStructure::count_non_air_blocks() const
 {
-    auto indexed = ensure_block_index();
-    if (!indexed) return Result<std::size_t>::failure(indexed.error());
-    EncodedReader encoded(mDecodedDataPath);
+    EncodedReader encoded(mBlockDataPath);
     if (!encoded.good()) return Result<std::size_t>::failure("无法打开 Schem 临时 BlockData 文件");
     const auto* dense_palette = mDensePalette.empty() ? nullptr : mDensePalette.data();
     const auto air_runtime_id = mRegistry.air_runtime_id();
     std::size_t result = 0;
     for (std::size_t i = 0; i < mBlockCount; ++i) {
         std::uint32_t index = 0;
-        if (!read_decoded_index(encoded, mDecodedIndexBytes, index)) return Result<std::size_t>::failure("Schem 定宽索引读取失败");
+        if (!read_encoded_index(encoded, index) || index > mMaxPaletteIndex)
+            return Result<std::size_t>::failure("Schem BlockData varint 读取失败或 palette 索引越界");
         const auto runtime_id = dense_palette && index < mDensePalette.size() ? dense_palette[index] :
             (mPalette.count(index) ? mPalette.at(index) : mUnknownRuntimeId);
         if (runtime_id != air_runtime_id) ++result;

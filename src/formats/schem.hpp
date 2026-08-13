@@ -33,22 +33,17 @@ public:
 
 private:
     void release_block_data() noexcept;
-    Result<void> build_block_index();
-    Result<void> ensure_block_index() const;
     RuntimeRegistry& mRegistry;
     StructureId mFormat;
     Size mSize{};
     Size mOriginalSize{};
     BlockPos mOffset{};
     std::filesystem::path mBlockDataPath;
-    std::filesystem::path mDecodedDataPath;
     std::vector<std::uint64_t> mRowOffsets;
     std::vector<std::uint16_t> mChunkOffsets;
     std::size_t mBlockCount = 0;
     std::size_t mBlockDataBytes = 0;
     std::size_t mChunkOffsetCount = 0;
-    std::size_t mDecodedIndexBytes = 4;
-    mutable bool mIndexBuilt = false;
     std::uint32_t mMaxPaletteIndex = 0;
     std::unordered_map<std::uint32_t, std::uint32_t> mPalette;
     std::vector<std::uint32_t> mDensePalette;

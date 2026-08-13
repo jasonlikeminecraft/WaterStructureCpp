@@ -117,17 +117,17 @@ Result<void> McFunctionStructure::read(const std::filesystem::path& path)
     auto add = [&](std::int32_t x, std::int32_t y, std::int32_t z, std::string name, std::string state_text) -> Result<void> {
         auto parsed_states = states(state_text);
         if (!parsed_states) return Result<void>::failure("第 " + std::to_string(line_number) + " 行: 状态格式无效");
-        std::optional<std::uint32_t> runtime;
-        if (!parsed_states->empty()) {
+        std::string encoded = name;
+        if (!state_text.empty()) encoded += state_text;
+        // MCFunction uses Java block-state semantics. Some same-named Bedrock
+        // properties encode different values (for example candle counts), so
+        // the Java compatibility mapping must be attempted first.
+        auto runtime = mRegistry.compatible_java_runtime_id(encoded);
+        if (!runtime && !parsed_states->empty()) {
             runtime = mRegistry.legacy_state_runtime_id(name, *parsed_states);
-        } else {
+        } else if (!runtime) {
             runtime = mRegistry.legacy_state_runtime_id(name, {});
             if (!runtime) runtime = mRegistry.legacy_runtime_id(name, 0);
-        }
-        if (!runtime) {
-            std::string encoded = name;
-            if (!state_text.empty()) encoded += state_text;
-            runtime = mRegistry.compatible_java_runtime_id(encoded);
         }
         const auto runtime_id = runtime.value_or(
             mRegistry.find("minecraft:unknown").value_or(mRegistry.air_runtime_id()));
@@ -190,9 +190,9 @@ Result<void> McFunctionStructure::read(const std::filesystem::path& path)
 Result<ChunkMap> McFunctionStructure::get_chunks(std::span<const ChunkPos> positions) const
 {
     ChunkMap result; for (const auto pos : positions) result.emplace(pos, ChunkData{});
-    mChunkIndex.ensure(mBlocks, mOffset, [](const Block& block) {
+    if (!mChunkIndex.ensure(mBlocks, mOffset, [](const Block& block) {
         return BlockPos{ block.x, block.y, block.z };
-    });
+    })) return Result<ChunkMap>::failure("MCFunction chunk index 超过 uint32 容量");
     for (auto& [chunk_pos, chunk] : result) {
         const auto* indexed = mChunkIndex.find(chunk_pos);
         if (!indexed) continue;

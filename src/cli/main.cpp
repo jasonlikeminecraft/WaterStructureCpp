@@ -5,6 +5,7 @@
 #include <chrono>
 #include <algorithm>
 #include <cctype>
+#include <charconv>
 #include <filesystem>
 #include <iostream>
 #include <optional>
@@ -18,7 +19,7 @@ void print_usage()
     std::cout << "WaterStructureCpp\n"
                  "  inspect <input>\n"
                  "  to-world <input> <world-directory>\n"
-                 "  convert <input> --format <target> --output <path>\n";
+                 "  convert <input> --format <target> --output <path> [--threads <count>]\n";
 }
 
 std::optional<water_structure::StructureId> parse_format(std::string value)
@@ -143,7 +144,8 @@ int main(int argc, char** argv)
             return 2;
         }
         registry.install_as_bwo_resolver();
-        auto reader = water_structure::FormatRegistry::open(argv[2], registry);
+        auto reader = water_structure::FormatRegistry::open(
+            argv[2], registry, { .streaming_world_import = true });
         if (!reader) {
             std::cerr << reader.error() << '\n';
             return 2;
@@ -175,7 +177,8 @@ int main(int argc, char** argv)
         return 0;
     }
 
-    if (command == "convert" && argc == 7 && std::string_view(argv[3]) == "--format" &&
+    if (command == "convert" && (argc == 7 || argc == 9) &&
+        std::string_view(argv[3]) == "--format" &&
         std::string_view(argv[5]) == "--output") {
         const auto format = parse_format(argv[4]);
         if (!format) {
@@ -193,8 +196,23 @@ int main(int argc, char** argv)
             std::cerr << reader.error() << '\n';
             return 2;
         }
+        water_structure::ConversionOptions options;
+        if (argc == 9) {
+            if (std::string_view(argv[7]) != "--threads") {
+                std::cerr << "unknown option: " << argv[7] << '\n';
+                return 2;
+            }
+            const std::string_view value = argv[8];
+            const auto parsed = std::from_chars(
+                value.data(), value.data() + value.size(), options.thread_count);
+            if (parsed.ec != std::errc{} || parsed.ptr != value.data() + value.size() ||
+                options.thread_count == 0) {
+                std::cerr << "invalid thread count: " << value << '\n';
+                return 2;
+            }
+        }
         const auto written = water_structure::FormatRegistry::write(
-            *reader.value(), *format, argv[6], registry);
+            *reader.value(), *format, argv[6], registry, options);
         if (!written) {
             std::cerr << written.error() << '\n';
             return 3;

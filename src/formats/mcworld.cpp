@@ -13,6 +13,7 @@
 #include <fstream>
 #include <iostream>
 #include <regex>
+#include <unordered_set>
 
 namespace water_structure {
 
@@ -98,8 +99,13 @@ Result<void> McWorldStructure::read(const std::filesystem::path& path)
     auto selection = selection_from_text(path.filename().string());
     if (!selection) selection = selection_from_level_dat(opened.value().directory() / "level.dat");
     if (!selection) {
-        return Result<void>::failure(
-            "无法从 MCWorld 文件名或 LevelName 解析选区 @[x,y,z]~[x,y,z]");
+        auto bounds = opened.value().stored_block_bounds();
+        if (!bounds) return Result<void>::failure("枚举 MCWorld subchunk 边界失败: " + bounds.error());
+        if (!bounds.value()) {
+            return Result<void>::failure(
+                "无法从 MCWorld 文件名或 LevelName 解析选区，且世界没有已存储的 subchunk");
+        }
+        selection = std::pair{ bounds.value()->min, bounds.value()->max };
     }
     mMin = {
         std::min(selection->first.x, selection->second.x),
@@ -283,32 +289,49 @@ Result<NbtChunkMap> McWorldStructure::get_chunk_nbt(std::span<const ChunkPos> po
     NbtChunkMap result;
     for (const auto pos : positions) result.emplace(pos, std::vector<BlockEntity>{});
     if (!mWorld) return Result<NbtChunkMap>::failure("MCWorld 尚未打开");
-    const auto min_source_chunk_x = floor_div(mMin.x, 16);
-    const auto max_source_chunk_x = floor_div(mMax.x, 16);
-    const auto min_source_chunk_z = floor_div(mMin.z, 16);
-    const auto max_source_chunk_z = floor_div(mMax.z, 16);
-    for (int chunk_x = min_source_chunk_x; chunk_x <= max_source_chunk_x; ++chunk_x) {
-        for (int chunk_z = min_source_chunk_z; chunk_z <= max_source_chunk_z; ++chunk_z) {
-            const auto loaded = mWorld->load_chunk_nbt({ chunk_x, chunk_z });
-            if (!loaded) return Result<NbtChunkMap>::failure(loaded.error());
-            for (const auto& source : loaded.value()) {
-                if (source.pos.x < mMin.x || source.pos.x > mMax.x || source.pos.y < mMin.y ||
-                    source.pos.y > mMax.y || source.pos.z < mMin.z || source.pos.z > mMax.z) continue;
-                const auto local_x = source.pos.x - mMin.x + mOffset.x;
-                const auto local_y = source.pos.y - mMin.y + mOffset.y;
-                const auto local_z = source.pos.z - mMin.z + mOffset.z;
-                const ChunkPos local_chunk{ floor_div(local_x, 16), floor_div(local_z, 16) };
-                const auto it = result.find(local_chunk);
-                if (it == result.end()) continue;
-                it->second.push_back({
-                    {
-                        local_x - local_chunk.x * 16,
-                        structure_y_to_chunk_local(local_y),
-                        local_z - local_chunk.z * 16
-                    },
-                    source.payload
-                });
+    std::unordered_set<ChunkPos, ChunkPosHash> source_positions;
+    for (const auto local_chunk : positions) {
+        const auto local_x_begin = std::max(local_chunk.x * 16, mOffset.x);
+        const auto local_x_end = std::min(
+            local_chunk.x * 16 + 15, mOffset.x + mOriginalSize.width - 1);
+        const auto local_z_begin = std::max(local_chunk.z * 16, mOffset.z);
+        const auto local_z_end = std::min(
+            local_chunk.z * 16 + 15, mOffset.z + mOriginalSize.length - 1);
+        if (local_x_begin > local_x_end || local_z_begin > local_z_end) continue;
+        const auto source_x_begin = mMin.x + local_x_begin - mOffset.x;
+        const auto source_x_end = mMin.x + local_x_end - mOffset.x;
+        const auto source_z_begin = mMin.z + local_z_begin - mOffset.z;
+        const auto source_z_end = mMin.z + local_z_end - mOffset.z;
+        for (auto source_chunk_x = floor_div(source_x_begin, 16);
+             source_chunk_x <= floor_div(source_x_end, 16);
+             ++source_chunk_x) {
+            for (auto source_chunk_z = floor_div(source_z_begin, 16);
+                 source_chunk_z <= floor_div(source_z_end, 16);
+                 ++source_chunk_z) {
+                source_positions.insert({ source_chunk_x, source_chunk_z });
             }
+        }
+    }
+    for (const auto source_chunk : source_positions) {
+        const auto loaded = mWorld->load_chunk_nbt(source_chunk);
+        if (!loaded) return Result<NbtChunkMap>::failure(loaded.error());
+        for (const auto& source : loaded.value()) {
+            if (source.pos.x < mMin.x || source.pos.x > mMax.x || source.pos.y < mMin.y ||
+                source.pos.y > mMax.y || source.pos.z < mMin.z || source.pos.z > mMax.z) continue;
+            const auto local_x = source.pos.x - mMin.x + mOffset.x;
+            const auto local_y = source.pos.y - mMin.y + mOffset.y;
+            const auto local_z = source.pos.z - mMin.z + mOffset.z;
+            const ChunkPos local_chunk{ floor_div(local_x, 16), floor_div(local_z, 16) };
+            const auto it = result.find(local_chunk);
+            if (it == result.end()) continue;
+            it->second.push_back({
+                {
+                    local_x - local_chunk.x * 16,
+                    structure_y_to_chunk_local(local_y),
+                    local_z - local_chunk.z * 16
+                },
+                source.payload
+            });
         }
     }
     return Result<NbtChunkMap>::success(std::move(result));

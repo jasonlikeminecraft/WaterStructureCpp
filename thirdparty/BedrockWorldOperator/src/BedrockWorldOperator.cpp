@@ -10,6 +10,8 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -26,6 +28,7 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -38,6 +41,52 @@ constexpr uint32_t kFnvPrime = 0x01000193u;
 constexpr uint32_t kCurrentBlockVersion = 18168865u;
 constexpr uint8_t kChunkVersion = 40;
 constexpr uint32_t kFinalisationGenerated = 2;
+constexpr std::size_t kDiskStateRuntimeCacheLimit = 8 * 1024 * 1024;
+constexpr std::size_t kDiskStateRuntimeCacheEntryLimit = 16 * 1024;
+constexpr std::size_t kDiskStateRuntimeCacheEntrySizeLimit = 64 * 1024;
+constexpr std::size_t kEncodedDiskStateCacheLimit = 8 * 1024 * 1024;
+constexpr std::size_t kEncodedDiskStateCacheEntryLimit = 16 * 1024;
+
+struct DecodeProfileState {
+    std::atomic<std::uint64_t> calls{0};
+    std::atomic<std::uint64_t> sampledCalls{0};
+    std::atomic<std::uint64_t> sampledLayers{0};
+    std::atomic<std::uint64_t> sampledPaletteEntries{0};
+    std::atomic<std::uint64_t> payloadCopyNs{0};
+    std::atomic<std::uint64_t> nativeInitNs{0};
+    std::atomic<std::uint64_t> packedReadNs{0};
+    std::atomic<std::uint64_t> paletteResolveNs{0};
+    std::atomic<std::uint64_t> blockExpandNs{0};
+    std::atomic<std::uint64_t> setBlocksNs{0};
+    std::atomic<std::uint64_t> wrapperNs{0};
+};
+
+DecodeProfileState gDecodeProfile;
+
+struct EncodeProfileState {
+    std::atomic<std::uint64_t> calls{0};
+    std::atomic<std::uint64_t> sampledCalls{0};
+    std::atomic<std::uint64_t> sampledLayers{0};
+    std::atomic<std::uint64_t> sampledPaletteEntries{0};
+    std::atomic<std::uint64_t> paletteBuildNs{0};
+    std::atomic<std::uint64_t> indexPackNs{0};
+    std::atomic<std::uint64_t> packedWriteNs{0};
+    std::atomic<std::uint64_t> paletteWriteNs{0};
+};
+
+EncodeProfileState gEncodeProfile;
+
+bool decodeProfileEnabled()
+{
+    static const bool enabled = std::getenv("WATER_STRUCTURE_PROFILE_DETAIL") != nullptr;
+    return enabled;
+}
+
+std::uint64_t elapsedNs(std::chrono::steady_clock::time_point start)
+{
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - start).count());
+}
 
 enum class TagType : uint8_t {
     End = 0,
@@ -342,6 +391,44 @@ StateValue readNbtValue(ByteReader& r, TagType type) {
     return value;
 }
 
+void skipNbtValue(ByteReader& r, TagType type) {
+    switch (type) {
+    case TagType::Byte:
+        r.skip(1);
+        return;
+    case TagType::Short:
+        r.skip(2);
+        return;
+    case TagType::Int:
+        r.skip(4);
+        return;
+    case TagType::Long:
+        r.skip(8);
+        return;
+    case TagType::String:
+        r.skip(r.le16());
+        return;
+    case TagType::Compound:
+        while (true) {
+            const auto childType = static_cast<TagType>(r.u8());
+            if (childType == TagType::End) return;
+            r.skip(r.le16());
+            skipNbtValue(r, childType);
+        }
+    default:
+        throw std::runtime_error("unsupported nbt value type");
+    }
+}
+
+void skipDiskBlockState(ByteReader& r) {
+    const auto rootType = static_cast<TagType>(r.u8());
+    if (rootType != TagType::Compound) {
+        throw std::runtime_error("block state root is not compound");
+    }
+    r.skip(r.le16());
+    skipNbtValue(r, TagType::Compound);
+}
+
 StateMap parseStateCompoundPayload(ByteReader& r) {
     StateMap states;
     while (!r.empty()) {
@@ -473,6 +560,13 @@ public:
         std::lock_guard lock(mMutex);
         mResolver = std::move(resolver);
         mRuntimeCache.clear();
+        mDiskStateRuntimeCache.clear();
+        mDiskStateRuntimeCacheBytes = 0;
+        mGeneration.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    std::uint64_t generation() const noexcept {
+        return mGeneration.load(std::memory_order_relaxed);
     }
 
     uint32_t airRuntimeId() {
@@ -562,12 +656,23 @@ public:
         return &inserted->second;
     }
 
-    std::optional<uint32_t> toRuntime(std::string name, const StateMap& states, int32_t version = 0) {
+    std::optional<uint32_t> toRuntime(
+        std::string name,
+        const StateMap& states,
+        int32_t version = 0,
+        std::string_view encodedDiskState = {}) {
         std::lock_guard lock(mMutex);
+        if (!encodedDiskState.empty()) {
+            const auto cached = mDiskStateRuntimeCache.find(encodedDiskState);
+            if (cached != mDiskStateRuntimeCache.end()) {
+                return cached->second;
+            }
+        }
         if (name.rfind("minecraft:", 0) != 0) {
             name = "minecraft:" + name;
         }
 
+        std::optional<uint32_t> runtime;
         if (mResolver.stateToRuntimeId) {
             BedrockWorldOperator::BlockState state;
             state.name = name;
@@ -602,21 +707,57 @@ public:
                 }
                 state.states.push_back(std::move(property));
             }
-            if (auto runtime = mResolver.stateToRuntimeId(state)) {
-                return runtime;
-            }
+            runtime = mResolver.stateToRuntimeId(state);
         }
 
-        if (!mResolver.nameToRuntimeId) {
-            return std::nullopt;
+        if (!runtime && mResolver.nameToRuntimeId) {
+            runtime = mResolver.nameToRuntimeId(name);
         }
-        return mResolver.nameToRuntimeId(name);
+        if (runtime && !encodedDiskState.empty() &&
+            mDiskStateRuntimeCache.size() < kDiskStateRuntimeCacheEntryLimit &&
+            encodedDiskState.size() <= kDiskStateRuntimeCacheEntrySizeLimit &&
+            encodedDiskState.size() <= kDiskStateRuntimeCacheLimit -
+                std::min(kDiskStateRuntimeCacheLimit, mDiskStateRuntimeCacheBytes)) {
+            auto [inserted, added] = mDiskStateRuntimeCache.emplace(
+                std::string(encodedDiskState), *runtime);
+            if (added) {
+                mDiskStateRuntimeCacheBytes += inserted->first.size();
+            }
+        }
+        return runtime;
+    }
+
+    std::optional<uint32_t> cachedDiskRuntime(std::string_view encodedDiskState) {
+        std::lock_guard lock(mMutex);
+        const auto cached = mDiskStateRuntimeCache.find(encodedDiskState);
+        return cached == mDiskStateRuntimeCache.end()
+            ? std::nullopt
+            : std::optional<uint32_t>(cached->second);
     }
 
 private:
+    struct TransparentStringHash {
+        using is_transparent = void;
+
+        std::size_t operator()(std::string_view value) const noexcept {
+            return std::hash<std::string_view>{}(value);
+        }
+
+        std::size_t operator()(const std::string& value) const noexcept {
+            return (*this)(std::string_view(value));
+        }
+    };
+
     std::mutex mMutex;
     BedrockWorldOperator::BlockRuntimeResolver mResolver;
     std::unordered_map<uint32_t, Entry> mRuntimeCache;
+    std::unordered_map<
+        std::string,
+        uint32_t,
+        TransparentStringHash,
+        std::equal_to<>> mDiskStateRuntimeCache;
+    std::size_t mDiskStateRuntimeCacheBytes = 0;
+    std::atomic<std::uint64_t> mGeneration{1};
 };
 
 int rangeStartForDim(int dm) {
@@ -672,14 +813,20 @@ public:
         return mLayers[static_cast<size_t>(layer)];
     }
 
-    void setBlocks(int layer, const std::vector<uint32_t>& blocks) {
+    std::span<const uint32_t> blocksView(int layer) const noexcept {
+        if (layer < 0 || static_cast<size_t>(layer) >= mLayers.size()) {
+            return {};
+        }
+        return mLayers[static_cast<size_t>(layer)];
+    }
+
+    void setBlocks(int layer, std::vector<uint32_t> blocks) {
         if (layer < 0) {
             return;
         }
         ensureLayer(static_cast<size_t>(layer));
-        auto& dst = mLayers[static_cast<size_t>(layer)];
-        std::fill(dst.begin(), dst.end(), BlockStateRegistry::instance().airRuntimeId());
-        std::copy_n(blocks.begin(), std::min<size_t>(blocks.size(), 4096), dst.begin());
+        blocks.resize(4096, BlockStateRegistry::instance().airRuntimeId());
+        mLayers[static_cast<size_t>(layer)] = std::move(blocks);
     }
 
     bool empty() const {
@@ -821,27 +968,76 @@ size_t filledBitsPerPackedWord(uint8_t bits) {
     return (32 / bits) * bits;
 }
 
-std::vector<uint32_t> packIndices(const std::vector<uint32_t>& blocks, const std::unordered_map<uint32_t, uint32_t>& paletteIndex, uint8_t bits) {
-    std::vector<uint32_t> packed(packedUint32Count(bits), 0);
+void packIndices(
+    std::span<const std::uint16_t> blockPaletteIndices,
+    uint8_t bits,
+    std::vector<std::uint32_t>& packed) {
+    packed.assign(packedUint32Count(bits), 0);
     if (bits == 0) {
-        return packed;
+        return;
     }
-    const size_t filledBits = filledBitsPerPackedWord(bits);
-    for (int x = 0; x < 16; ++x) {
-        for (int z = 0; z < 16; ++z) {
-            for (int y = 0; y < 16; ++y) {
-                const size_t blockIndex = static_cast<size_t>(x) * 256 + static_cast<size_t>(y) * 16 + static_cast<size_t>(z);
-                const size_t storageIndex = (static_cast<size_t>(x) * 256 + static_cast<size_t>(z) * 16 + static_cast<size_t>(y));
-                const size_t bitOffset = storageIndex * bits;
-                const size_t word = bitOffset / filledBits;
-                const uint8_t shift = static_cast<uint8_t>(bitOffset % filledBits);
-                const uint32_t value = paletteIndex.at(blocks[blockIndex]);
-                packed[word] |= value << shift;
-            }
+    const std::size_t valuesPerWord = 32u / bits;
+    std::size_t storageIndex = 0;
+    for (auto& word : packed) {
+        for (std::size_t slot = 0;
+             slot < valuesPerWord && storageIndex < blockPaletteIndices.size();
+             ++slot, ++storageIndex) {
+            const auto blockIndex =
+                (storageIndex & 0xf00u) |
+                ((storageIndex & 0x00fu) << 4u) |
+                ((storageIndex & 0x0f0u) >> 4u);
+            word |= static_cast<std::uint32_t>(blockPaletteIndices[blockIndex]) <<
+                (slot * bits);
         }
     }
-    return packed;
 }
+
+class PaletteIndexTable {
+public:
+    PaletteIndexTable()
+        : mKeys(kCapacity), mValues(kCapacity), mGenerations(kCapacity) {}
+
+    void reset()
+    {
+        if (++mGeneration == 0) {
+            std::fill(mGenerations.begin(), mGenerations.end(), 0);
+            mGeneration = 1;
+        }
+    }
+
+    std::pair<std::uint16_t, bool> findOrInsert(
+        std::uint32_t key,
+        std::uint16_t value)
+    {
+        auto slot = hash(key) & (kCapacity - 1);
+        while (mGenerations[slot] == mGeneration) {
+            if (mKeys[slot] == key) return { mValues[slot], false };
+            slot = (slot + 1) & (kCapacity - 1);
+        }
+        mGenerations[slot] = mGeneration;
+        mKeys[slot] = key;
+        mValues[slot] = value;
+        return { value, true };
+    }
+
+private:
+    static constexpr std::size_t kCapacity = 8192;
+
+    static std::size_t hash(std::uint32_t value) noexcept
+    {
+        value ^= value >> 16u;
+        value *= 0x7feb352du;
+        value ^= value >> 15u;
+        value *= 0x846ca68bu;
+        value ^= value >> 16u;
+        return value;
+    }
+
+    std::vector<std::uint32_t> mKeys;
+    std::vector<std::uint16_t> mValues;
+    std::vector<std::uint32_t> mGenerations;
+    std::uint32_t mGeneration = 0;
+};
 
 uint32_t unpackIndex(const std::vector<uint32_t>& packed, uint8_t bits, int x, int y, int z) {
     if (bits == 0) {
@@ -963,6 +1159,23 @@ void encodePaletteEntry(std::vector<uint8_t>& out, uint32_t runtimeId, EncodingK
         writeVarInt32(out, static_cast<int32_t>(runtimeId));
         return;
     }
+    struct EncodedDiskStateCache {
+        std::uint64_t generation = 0;
+        std::size_t bytes = 0;
+        std::unordered_map<std::uint32_t, std::vector<std::uint8_t>> entries;
+    };
+    thread_local EncodedDiskStateCache cache;
+    const auto registryGeneration = BlockStateRegistry::instance().generation();
+    if (cache.generation != registryGeneration) {
+        cache.entries.clear();
+        cache.bytes = 0;
+        cache.generation = registryGeneration;
+    }
+    if (const auto cached = cache.entries.find(runtimeId);
+        cached != cache.entries.end()) {
+        out.insert(out.end(), cached->second.begin(), cached->second.end());
+        return;
+    }
     const auto* entry = BlockStateRegistry::instance().byRuntime(runtimeId);
     if (!entry) {
         entry = BlockStateRegistry::instance().byRuntime(BlockStateRegistry::instance().airRuntimeId());
@@ -973,9 +1186,23 @@ void encodePaletteEntry(std::vector<uint8_t>& out, uint32_t runtimeId, EncodingK
         entry ? entry->version : static_cast<int32_t>(kCurrentBlockVersion)
     );
     out.insert(out.end(), nbt.begin(), nbt.end());
+    if (cache.entries.size() < kEncodedDiskStateCacheEntryLimit &&
+        nbt.size() <= kEncodedDiskStateCacheLimit -
+            std::min(kEncodedDiskStateCacheLimit, cache.bytes)) {
+        cache.bytes += nbt.size();
+        cache.entries.emplace(runtimeId, std::move(nbt));
+    }
 }
 
 std::vector<uint8_t> encodeSubChunk(const NativeSubChunk& subChunk, int rangeStart, int ind, EncodingKind kind) {
+    const bool profileEnabled = decodeProfileEnabled();
+    const auto call = profileEnabled
+        ? gEncodeProfile.calls.fetch_add(1, std::memory_order_relaxed)
+        : 0;
+    const bool sampleProfile = profileEnabled && ((call & 63u) == 0);
+    if (sampleProfile) {
+        gEncodeProfile.sampledCalls.fetch_add(1, std::memory_order_relaxed);
+    }
     std::vector<uint8_t> out;
     const uint8_t storageCount = static_cast<uint8_t>(std::max<size_t>(1, subChunk.layerCount()));
     out.push_back(9);
@@ -983,20 +1210,71 @@ std::vector<uint8_t> encodeSubChunk(const NativeSubChunk& subChunk, int rangeSta
     out.push_back(static_cast<uint8_t>(static_cast<int8_t>(ind + (rangeStart >> 4))));
 
     for (uint8_t layer = 0; layer < storageCount; ++layer) {
-        auto blocks = subChunk.blocks(layer);
-        std::vector<uint32_t> palette;
-        std::unordered_map<uint32_t, uint32_t> paletteIndex;
-        palette.reserve(256);
-        for (uint32_t block : blocks) {
-            if (!paletteIndex.contains(block)) {
-                paletteIndex[block] = static_cast<uint32_t>(palette.size());
+        if (sampleProfile) {
+            gEncodeProfile.sampledLayers.fetch_add(1, std::memory_order_relaxed);
+        }
+        const auto blocks = subChunk.blocksView(layer);
+        const auto paletteStart = sampleProfile
+            ? std::chrono::steady_clock::now()
+            : std::chrono::steady_clock::time_point{};
+        struct EncodeWorkspace {
+            std::vector<std::uint32_t> palette;
+            std::vector<std::uint32_t> packed;
+            std::array<std::uint16_t, 4096> blockPaletteIndices{};
+            PaletteIndexTable paletteIndex;
+
+            EncodeWorkspace()
+            {
+                palette.reserve(64);
+                packed.reserve(packedUint32Count(16));
+            }
+        };
+        thread_local EncodeWorkspace workspace;
+        auto& palette = workspace.palette;
+        auto& packed = workspace.packed;
+        auto& blockPaletteIndices = workspace.blockPaletteIndices;
+        auto& paletteIndex = workspace.paletteIndex;
+        palette.clear();
+        paletteIndex.reset();
+        std::uint32_t previousBlock = 0;
+        std::uint16_t previousPaletteEntry = 0;
+        bool havePreviousBlock = false;
+        for (std::size_t blockIndex = 0; blockIndex < blocks.size(); ++blockIndex) {
+            const auto block = blocks[blockIndex];
+            if (havePreviousBlock && block == previousBlock) {
+                blockPaletteIndices[blockIndex] = previousPaletteEntry;
+                continue;
+            }
+            const auto [paletteEntry, inserted] = paletteIndex.findOrInsert(
+                block, static_cast<std::uint16_t>(palette.size()));
+            if (inserted) {
                 palette.push_back(block);
             }
+            blockPaletteIndices[blockIndex] = paletteEntry;
+            previousBlock = block;
+            previousPaletteEntry = paletteEntry;
+            havePreviousBlock = true;
+        }
+        if (sampleProfile) {
+            gEncodeProfile.paletteBuildNs.fetch_add(
+                elapsedNs(paletteStart), std::memory_order_relaxed);
+            gEncodeProfile.sampledPaletteEntries.fetch_add(
+                palette.size(), std::memory_order_relaxed);
         }
 
         const uint8_t bits = paletteSizeFor(palette.size());
         out.push_back(static_cast<uint8_t>((bits << 1) | (kind == EncodingKind::Network ? 1 : 0)));
-        auto packed = packIndices(blocks, paletteIndex, bits);
+        const auto packStart = sampleProfile
+            ? std::chrono::steady_clock::now()
+            : std::chrono::steady_clock::time_point{};
+        packIndices(blockPaletteIndices, bits, packed);
+        if (sampleProfile) {
+            gEncodeProfile.indexPackNs.fetch_add(
+                elapsedNs(packStart), std::memory_order_relaxed);
+        }
+        const auto packedWriteStart = sampleProfile
+            ? std::chrono::steady_clock::now()
+            : std::chrono::steady_clock::time_point{};
         for (uint32_t word : packed) {
             writeLe32(out, word);
         }
@@ -1008,14 +1286,31 @@ std::vector<uint8_t> encodeSubChunk(const NativeSubChunk& subChunk, int rangeSta
                 writeLe32(out, static_cast<uint32_t>(palette.size()));
             }
         }
+        if (sampleProfile) {
+            gEncodeProfile.packedWriteNs.fetch_add(
+                elapsedNs(packedWriteStart), std::memory_order_relaxed);
+        }
+        const auto paletteWriteStart = sampleProfile
+            ? std::chrono::steady_clock::now()
+            : std::chrono::steady_clock::time_point{};
         for (uint32_t runtimeId : palette) {
             encodePaletteEntry(out, runtimeId, kind);
+        }
+        if (sampleProfile) {
+            gEncodeProfile.paletteWriteNs.fetch_add(
+                elapsedNs(paletteWriteStart), std::memory_order_relaxed);
         }
     }
     return out;
 }
 
-std::vector<uint32_t> decodePalettedStorage(ByteReader& r, EncodingKind kind) {
+std::vector<uint32_t> decodePalettedStorage(
+    ByteReader& r,
+    EncodingKind kind,
+    bool sampleProfile) {
+    const auto packedStart = sampleProfile
+        ? std::chrono::steady_clock::now()
+        : std::chrono::steady_clock::time_point{};
     uint8_t bits = r.u8();
     bits >>= 1;
     if (bits == 0x7f) {
@@ -1041,36 +1336,91 @@ std::vector<uint32_t> decodePalettedStorage(ByteReader& r, EncodingKind kind) {
     if (paletteCount == 0 || paletteCount > 4096) {
         throw std::runtime_error("invalid palette size");
     }
+    if (sampleProfile) {
+        gDecodeProfile.packedReadNs.fetch_add(
+            elapsedNs(packedStart), std::memory_order_relaxed);
+        gDecodeProfile.sampledPaletteEntries.fetch_add(
+            paletteCount, std::memory_order_relaxed);
+    }
 
+    const auto paletteStart = sampleProfile
+        ? std::chrono::steady_clock::now()
+        : std::chrono::steady_clock::time_point{};
     std::vector<uint32_t> palette;
     palette.reserve(paletteCount);
     for (uint32_t i = 0; i < paletteCount; ++i) {
         if (kind == EncodingKind::Network) {
             palette.push_back(static_cast<uint32_t>(r.varInt32()));
         } else {
+            const auto* encodedBegin = r.current();
+            auto probe = r;
+            skipDiskBlockState(probe);
+            const auto encodedSize = static_cast<std::size_t>(probe.current() - encodedBegin);
+            const std::string_view encodedState(
+                reinterpret_cast<const char*>(encodedBegin), encodedSize);
+            if (const auto cached =
+                    BlockStateRegistry::instance().cachedDiskRuntime(encodedState)) {
+                r = probe;
+                palette.push_back(*cached);
+                continue;
+            }
             auto state = parseDiskBlockState(r);
-            auto runtime = BlockStateRegistry::instance().toRuntime(state.name, state.states, state.version);
+            auto runtime = BlockStateRegistry::instance().toRuntime(
+                state.name, state.states, state.version, encodedState);
             palette.push_back(runtime.value_or(BlockStateRegistry::instance().airRuntimeId()));
         }
     }
+    if (sampleProfile) {
+        gDecodeProfile.paletteResolveNs.fetch_add(
+            elapsedNs(paletteStart), std::memory_order_relaxed);
+    }
 
+    const auto expandStart = sampleProfile
+        ? std::chrono::steady_clock::now()
+        : std::chrono::steady_clock::time_point{};
     std::vector<uint32_t> blocks(4096, palette.front());
-    for (int x = 0; x < 16; ++x) {
-        for (int y = 0; y < 16; ++y) {
-            for (int z = 0; z < 16; ++z) {
-                const uint32_t pi = unpackIndex(packed, bits, x, y, z);
-                const size_t blockIndex = static_cast<size_t>(x) * 256 + static_cast<size_t>(y) * 16 + static_cast<size_t>(z);
-                blocks[blockIndex] = pi < palette.size() ? palette[pi] : palette.front();
+    if (bits != 0) {
+        const std::uint32_t mask = (1u << bits) - 1u;
+        const std::size_t valuesPerWord = 32u / bits;
+        std::size_t storageIndex = 0;
+        for (const auto word : packed) {
+            for (std::size_t slot = 0;
+                 slot < valuesPerWord && storageIndex < blocks.size();
+                 ++slot, ++storageIndex) {
+                const auto paletteIndex = (word >> (slot * bits)) & mask;
+                // Disk order is (x,z,y); NativeSubChunk stores (x,y,z).
+                const auto blockIndex =
+                    (storageIndex & 0xf00u) |
+                    ((storageIndex & 0x00fu) << 4u) |
+                    ((storageIndex & 0x0f0u) >> 4u);
+                blocks[blockIndex] = paletteIndex < palette.size()
+                    ? palette[paletteIndex]
+                    : palette.front();
             }
         }
+    }
+    if (sampleProfile) {
+        gDecodeProfile.blockExpandNs.fetch_add(
+            elapsedNs(expandStart), std::memory_order_relaxed);
     }
     return blocks;
 }
 
-std::pair<std::shared_ptr<NativeSubChunk>, int> decodeSubChunk(const std::vector<uint8_t>& payload, int rangeStart, EncodingKind kind) {
+std::pair<std::shared_ptr<NativeSubChunk>, int> decodeSubChunk(
+    const std::vector<uint8_t>& payload,
+    int rangeStart,
+    EncodingKind kind,
+    bool sampleProfile = false) {
     ByteReader r(payload);
     const uint8_t version = r.u8();
+    const auto nativeStart = sampleProfile
+        ? std::chrono::steady_clock::now()
+        : std::chrono::steady_clock::time_point{};
     auto sub = std::make_shared<NativeSubChunk>();
+    if (sampleProfile) {
+        gDecodeProfile.nativeInitNs.fetch_add(
+            elapsedNs(nativeStart), std::memory_order_relaxed);
+    }
     int index = 0;
     uint8_t storageCount = 1;
     if (version == 1) {
@@ -1085,9 +1435,19 @@ std::pair<std::shared_ptr<NativeSubChunk>, int> decodeSubChunk(const std::vector
     }
 
     for (uint8_t layer = 0; layer < storageCount; ++layer) {
-        auto blocks = decodePalettedStorage(r, kind);
+        if (sampleProfile) {
+            gDecodeProfile.sampledLayers.fetch_add(1, std::memory_order_relaxed);
+        }
+        auto blocks = decodePalettedStorage(r, kind, sampleProfile);
         if (!blocks.empty()) {
-            sub->setBlocks(layer, blocks);
+            const auto setBlocksStart = sampleProfile
+                ? std::chrono::steady_clock::now()
+                : std::chrono::steady_clock::time_point{};
+            sub->setBlocks(layer, std::move(blocks));
+            if (sampleProfile) {
+                gDecodeProfile.setBlocksNs.fetch_add(
+                    elapsedNs(setBlocksStart), std::memory_order_relaxed);
+            }
         }
     }
     return {sub, index};
@@ -1328,6 +1688,68 @@ public:
                 return encoded.error;
             }
             batch.Put(slice(key), leveldb::Slice(reinterpret_cast<const char*>(encoded.value.data()), encoded.value.size()));
+        }
+        const auto status = mDb->Write(leveldb::WriteOptions(), &batch);
+        return status.ok() ? "" : status.ToString();
+    }
+
+    BedrockWorldOperator::Result<std::optional<BedrockWorldOperator::Bytes>> loadSubChunkPayload(
+        int dm, int x, int y, int z) const {
+        if (!mDb) {
+            return BedrockWorldOperator::Result<std::optional<BedrockWorldOperator::Bytes>>::failure(
+                "database is not open");
+        }
+        std::string value;
+        const auto status = mDb->Get(
+            leveldb::ReadOptions(), slice(subChunkKey(dm, x, y, z)), &value);
+        if (status.IsNotFound()) {
+            return BedrockWorldOperator::Result<std::optional<BedrockWorldOperator::Bytes>>::success(
+                std::nullopt);
+        }
+        if (!status.ok()) {
+            return BedrockWorldOperator::Result<std::optional<BedrockWorldOperator::Bytes>>::failure(
+                status.ToString());
+        }
+        BedrockWorldOperator::Bytes payload(value.begin(), value.end());
+        return BedrockWorldOperator::Result<std::optional<BedrockWorldOperator::Bytes>>::success(
+            std::move(payload));
+    }
+
+    std::string saveSubChunkPayloadsBatch(
+        int dm,
+        std::span<const BedrockWorldOperator::PositionedSubChunkPayload> writes) {
+        if (!mDb) {
+            return "database is not open";
+        }
+        leveldb::WriteBatch batch;
+        std::set<std::pair<int, int>> metadata;
+        for (const auto& write : writes) {
+            if (!write.payload) {
+                continue;
+            }
+            const auto& pos = write.position;
+            if (!metadata.emplace(pos.x, pos.z).second) {
+                continue;
+            }
+            const auto metaKey = makeChunkKey(dm, pos.x, pos.z, {','});
+            batch.Put(slice(metaKey), leveldb::Slice(std::string(1, static_cast<char>(kChunkVersion))));
+            std::vector<uint8_t> finalisation;
+            writeLe32(finalisation, kFinalisationGenerated);
+            const auto finalKey = makeChunkKey(dm, pos.x, pos.z, {'6'});
+            batch.Put(slice(finalKey), slice(finalisation));
+        }
+        for (const auto& write : writes) {
+            const auto key = subChunkKey(
+                dm, write.position.x, write.position.y, write.position.z);
+            if (!write.payload) {
+                batch.Delete(slice(key));
+                continue;
+            }
+            const auto& payload = *write.payload;
+            batch.Put(
+                slice(key),
+                leveldb::Slice(
+                    reinterpret_cast<const char*>(payload.data()), payload.size()));
         }
         const auto status = mDb->Write(leveldb::WriteOptions(), &batch);
         return status.ok() ? "" : status.ToString();
@@ -1604,6 +2026,13 @@ BlockRuntimeList SubChunk::blocks(int layer) const
     return mImpl->native->blocks(layer);
 }
 
+std::span<const std::uint32_t> SubChunk::blocksView(int layer) const noexcept
+{
+    return valid()
+        ? mImpl->native->blocksView(layer)
+        : std::span<const std::uint32_t>{};
+}
+
 Result<void> SubChunk::setBlocks(std::span<const std::uint32_t> blocks, int layer)
 {
     if (layer < 0) {
@@ -1675,6 +2104,28 @@ Result<Bytes> World::levelDat() const
         return Result<Bytes>::failure("World::levelDat: world is not open");
     }
     return Result<Bytes>::success(mImpl->native->levelDatPayload());
+}
+
+Result<std::optional<Bytes>> World::loadSubChunkPayload(Dimension dim, SubChunkPos pos) const
+{
+    if (!valid()) {
+        return Result<std::optional<Bytes>>::failure(
+            "World::loadSubChunkPayload: world is not open");
+    }
+    const int dimensionId = toDimensionId(dim);
+    const int minSubY = rangeStartForDim(dimensionId) >> 4;
+    const int maxSubY = rangeEndForDim(dimensionId) >> 4;
+    if (pos.y < minSubY || pos.y > maxSubY) {
+        return Result<std::optional<Bytes>>::failure(
+            "World::loadSubChunkPayload: subchunk Y is out of dimension range");
+    }
+    auto loaded = mImpl->native->loadSubChunkPayload(
+        dimensionId, pos.x, pos.y, pos.z);
+    if (!loaded) {
+        return Result<std::optional<Bytes>>::failure(
+            "World::loadSubChunkPayload: " + loaded.error);
+    }
+    return loaded;
 }
 
 Result<SubChunk> World::loadSubChunk(Dimension dim, SubChunkPos pos) const
@@ -1776,6 +2227,65 @@ Result<void> World::saveSubChunksBatch(Dimension dim, std::span<const Positioned
     return Result<void>::success();
 }
 
+Result<void> World::saveSubChunkPayloadsBatch(
+    Dimension dim,
+    std::span<const PositionedSubChunkPayload> writes)
+{
+    if (!valid()) {
+        return Result<void>::failure(
+            "World::saveSubChunkPayloadsBatch: world is not open");
+    }
+    if (writes.empty()) {
+        return Result<void>::success();
+    }
+    const int dimensionId = toDimensionId(dim);
+    const int minSubY = rangeStartForDim(dimensionId) >> 4;
+    const int maxSubY = rangeEndForDim(dimensionId) >> 4;
+    for (const auto& write : writes) {
+        if (write.position.y < minSubY || write.position.y > maxSubY) {
+            return Result<void>::failure(
+                "World::saveSubChunkPayloadsBatch: subchunk Y is out of dimension range");
+        }
+        if (!write.payload) {
+            continue;
+        }
+        if (write.payload->empty()) {
+            return Result<void>::failure(
+                "World::saveSubChunkPayloadsBatch: payload is empty; use nullopt to delete");
+        }
+        const auto version = write.payload->front();
+        if (version != 1 && version != 8 && version != 9) {
+            return Result<void>::failure(
+                "World::saveSubChunkPayloadsBatch: unsupported subchunk payload version");
+        }
+        if ((version == 8 || version == 9) && write.payload->size() < 2) {
+            return Result<void>::failure(
+                "World::saveSubChunkPayloadsBatch: truncated subchunk payload header");
+        }
+        if ((version == 8 || version == 9) && (*write.payload)[1] == 0) {
+            return Result<void>::failure(
+                "World::saveSubChunkPayloadsBatch: subchunk payload has no storages");
+        }
+        if (version == 9) {
+            if (write.payload->size() < 3) {
+                return Result<void>::failure(
+                    "World::saveSubChunkPayloadsBatch: truncated v9 subchunk payload header");
+            }
+            const int encodedY = static_cast<int>(
+                static_cast<std::int8_t>((*write.payload)[2]));
+            if (encodedY != write.position.y) {
+                return Result<void>::failure(
+                    "World::saveSubChunkPayloadsBatch: v9 payload Y does not match position");
+            }
+        }
+    }
+    const auto err = mImpl->native->saveSubChunkPayloadsBatch(dimensionId, writes);
+    if (!err.empty()) {
+        return Result<void>::failure("World::saveSubChunkPayloadsBatch: " + err);
+    }
+    return Result<void>::success();
+}
+
 Result<Bytes> World::loadNbt(Dimension dim, ChunkPos pos) const
 {
     if (!valid()) {
@@ -1839,16 +2349,39 @@ Result<DecodedSubChunk> decodeSubChunkPayload(std::span<const std::uint8_t> payl
         return Result<DecodedSubChunk>::failure("decodeSubChunkPayload: empty payload");
     }
     try {
+        const bool profileEnabled = decodeProfileEnabled();
+        const auto call = profileEnabled
+            ? gDecodeProfile.calls.fetch_add(1, std::memory_order_relaxed)
+            : 0;
+        const bool sampleProfile = profileEnabled && ((call & 63u) == 0);
+        if (sampleProfile) {
+            gDecodeProfile.sampledCalls.fetch_add(1, std::memory_order_relaxed);
+        }
+        const auto copyStart = sampleProfile
+            ? std::chrono::steady_clock::now()
+            : std::chrono::steady_clock::time_point{};
         Bytes bytes(payload.begin(), payload.end());
-        auto [native, index] = decodeSubChunk(bytes, rangeStart, toEncodingKind(encoding));
+        if (sampleProfile) {
+            gDecodeProfile.payloadCopyNs.fetch_add(
+                elapsedNs(copyStart), std::memory_order_relaxed);
+        }
+        auto [native, index] = decodeSubChunk(
+            bytes, rangeStart, toEncodingKind(encoding), sampleProfile);
         if (!native) {
             return Result<DecodedSubChunk>::failure("decodeSubChunkPayload: decoder returned no subchunk");
         }
+        const auto wrapperStart = sampleProfile
+            ? std::chrono::steady_clock::now()
+            : std::chrono::steady_clock::time_point{};
         auto impl = std::make_shared<SubChunk::Impl>();
         impl->native = std::move(native);
         DecodedSubChunk decoded;
         decoded.subChunk = SubChunk(std::move(impl));
         decoded.index = index;
+        if (sampleProfile) {
+            gDecodeProfile.wrapperNs.fetch_add(
+                elapsedNs(wrapperStart), std::memory_order_relaxed);
+        }
         return Result<DecodedSubChunk>::success(std::move(decoded));
     } catch (const std::exception& e) {
         return Result<DecodedSubChunk>::failure(
@@ -1861,6 +2394,64 @@ Result<DecodedSubChunk> decodeSubChunkPayload(std::span<const std::uint8_t> payl
             decodeContext(encoding, rangeStart, rangeEnd, payload.size(), payload) + ")"
         );
     }
+}
+
+void resetSubChunkDecodeProfile() noexcept
+{
+    gDecodeProfile.calls.store(0, std::memory_order_relaxed);
+    gDecodeProfile.sampledCalls.store(0, std::memory_order_relaxed);
+    gDecodeProfile.sampledLayers.store(0, std::memory_order_relaxed);
+    gDecodeProfile.sampledPaletteEntries.store(0, std::memory_order_relaxed);
+    gDecodeProfile.payloadCopyNs.store(0, std::memory_order_relaxed);
+    gDecodeProfile.nativeInitNs.store(0, std::memory_order_relaxed);
+    gDecodeProfile.packedReadNs.store(0, std::memory_order_relaxed);
+    gDecodeProfile.paletteResolveNs.store(0, std::memory_order_relaxed);
+    gDecodeProfile.blockExpandNs.store(0, std::memory_order_relaxed);
+    gDecodeProfile.setBlocksNs.store(0, std::memory_order_relaxed);
+    gDecodeProfile.wrapperNs.store(0, std::memory_order_relaxed);
+}
+
+SubChunkDecodeProfile subChunkDecodeProfile() noexcept
+{
+    return {
+        gDecodeProfile.calls.load(std::memory_order_relaxed),
+        gDecodeProfile.sampledCalls.load(std::memory_order_relaxed),
+        gDecodeProfile.sampledLayers.load(std::memory_order_relaxed),
+        gDecodeProfile.sampledPaletteEntries.load(std::memory_order_relaxed),
+        gDecodeProfile.payloadCopyNs.load(std::memory_order_relaxed),
+        gDecodeProfile.nativeInitNs.load(std::memory_order_relaxed),
+        gDecodeProfile.packedReadNs.load(std::memory_order_relaxed),
+        gDecodeProfile.paletteResolveNs.load(std::memory_order_relaxed),
+        gDecodeProfile.blockExpandNs.load(std::memory_order_relaxed),
+        gDecodeProfile.setBlocksNs.load(std::memory_order_relaxed),
+        gDecodeProfile.wrapperNs.load(std::memory_order_relaxed)
+    };
+}
+
+void resetSubChunkEncodeProfile() noexcept
+{
+    gEncodeProfile.calls.store(0, std::memory_order_relaxed);
+    gEncodeProfile.sampledCalls.store(0, std::memory_order_relaxed);
+    gEncodeProfile.sampledLayers.store(0, std::memory_order_relaxed);
+    gEncodeProfile.sampledPaletteEntries.store(0, std::memory_order_relaxed);
+    gEncodeProfile.paletteBuildNs.store(0, std::memory_order_relaxed);
+    gEncodeProfile.indexPackNs.store(0, std::memory_order_relaxed);
+    gEncodeProfile.packedWriteNs.store(0, std::memory_order_relaxed);
+    gEncodeProfile.paletteWriteNs.store(0, std::memory_order_relaxed);
+}
+
+SubChunkEncodeProfile subChunkEncodeProfile() noexcept
+{
+    return {
+        gEncodeProfile.calls.load(std::memory_order_relaxed),
+        gEncodeProfile.sampledCalls.load(std::memory_order_relaxed),
+        gEncodeProfile.sampledLayers.load(std::memory_order_relaxed),
+        gEncodeProfile.sampledPaletteEntries.load(std::memory_order_relaxed),
+        gEncodeProfile.paletteBuildNs.load(std::memory_order_relaxed),
+        gEncodeProfile.indexPackNs.load(std::memory_order_relaxed),
+        gEncodeProfile.packedWriteNs.load(std::memory_order_relaxed),
+        gEncodeProfile.paletteWriteNs.load(std::memory_order_relaxed)
+    };
 }
 
 Result<Bytes> encodeSubChunkPayload(const SubChunk& subChunk, Encoding encoding, int rangeStart, int rangeEnd, int index)

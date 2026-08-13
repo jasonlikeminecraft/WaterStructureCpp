@@ -10,6 +10,7 @@
 #include <map>
 #include <memory>
 #include <sstream>
+#include <unordered_set>
 
 namespace water_structure {
 
@@ -367,6 +368,30 @@ std::string normalize_java_state(std::string_view encoded)
     return result.str();
 }
 
+std::string encode_java_state(const BlockState& state)
+{
+    auto name = state.name;
+    if (name.find(':') == std::string::npos) name.insert(0, "minecraft:");
+    if (state.states.empty()) return normalize_java_state(name);
+    auto properties = state.states;
+    std::sort(properties.begin(), properties.end(), [](const auto& left, const auto& right) {
+        return left.name < right.name;
+    });
+    name.push_back('[');
+    for (std::size_t index = 0; index < properties.size(); ++index) {
+        if (index != 0) name.push_back(',');
+        name += properties[index].name;
+        name.push_back('=');
+        if (properties[index].type == BlockStateValueType::Byte) {
+            name += properties[index].value == "0" ? "false" : "true";
+        } else {
+            name += properties[index].value;
+        }
+    }
+    name.push_back(']');
+    return normalize_java_state(name);
+}
+
 std::unordered_map<std::string, std::string> java_properties(std::string_view encoded)
 {
     std::unordered_map<std::string, std::string> result;
@@ -707,6 +732,12 @@ std::optional<BlockState> RuntimeRegistry::java_state(std::uint32_t runtime_id) 
     return it == mJavaByRuntimeId.end() ? std::nullopt : std::optional<BlockState>(it->second);
 }
 
+std::unordered_map<std::uint32_t, BlockState> RuntimeRegistry::java_states_snapshot() const
+{
+    std::lock_guard lock(mMutex);
+    return mJavaByRuntimeId;
+}
+
 std::optional<std::pair<std::uint8_t, std::uint8_t>> RuntimeRegistry::schematic_block(
     std::uint32_t runtime_id) const
 {
@@ -982,6 +1013,38 @@ Result<void> RuntimeRegistry::load_block_mappings(const std::filesystem::path& p
                 java_by_runtime.emplace(item["runtime"].get<std::uint32_t>(), std::move(state));
             }
         }
+        std::unordered_set<std::string> boolean_java_properties;
+        for (const auto& [encoded, _] : java_mapping) {
+            const auto open = encoded.find('[');
+            const auto name = encoded.substr(0, open);
+            for (const auto& [property, value] : java_property_views(encoded)) {
+                if (ascii_equal_ignore_case(value, "true") ||
+                    ascii_equal_ignore_case(value, "false")) {
+                    boolean_java_properties.insert(name + '\n' + std::string(property));
+                }
+            }
+        }
+        for (auto& [_, state] : java_by_runtime) {
+            const auto name = normalize_java_state(state.name);
+            for (auto& property : state.states) {
+                if (property.type == BlockStateValueType::Byte &&
+                    !boolean_java_properties.contains(name + '\n' + property.name)) {
+                    property.type = BlockStateValueType::Int;
+                }
+            }
+        }
+        std::unordered_map<std::string, std::uint32_t> java_round_trip_mapping;
+        std::unordered_set<std::string> ambiguous_java_states;
+        java_round_trip_mapping.reserve(java_by_runtime.size());
+        for (const auto& [runtime_id, state] : java_by_runtime) {
+            auto encoded = encode_java_state(state);
+            if (ambiguous_java_states.contains(encoded)) continue;
+            const auto [found, inserted] = java_round_trip_mapping.emplace(encoded, runtime_id);
+            if (!inserted && found->second != runtime_id) {
+                java_round_trip_mapping.erase(found);
+                ambiguous_java_states.insert(std::move(encoded));
+            }
+        }
 
         std::unordered_map<std::string, std::unordered_map<std::uint16_t, std::uint32_t>> legacy_by_name;
         if (root.contains("legacy_to_runtime") && root["legacy_to_runtime"].is_object()) {
@@ -1036,6 +1099,7 @@ Result<void> RuntimeRegistry::load_block_mappings(const std::filesystem::path& p
             mLegacyPools[117] = std::move(bdx117);
         }
         mJavaMapping = std::move(java_mapping);
+        mJavaRoundTripMapping = std::move(java_round_trip_mapping);
         mJavaDefaultByName = std::move(java_defaults);
         mJavaOrder = std::move(java_order);
         mJavaCandidatesByName.clear();
@@ -1091,6 +1155,13 @@ std::optional<std::uint32_t> RuntimeRegistry::legacy_runtime_id(std::uint8_t poo
     return pool->second[index];
 }
 
+std::vector<std::uint32_t> RuntimeRegistry::legacy_pool_snapshot(std::uint8_t pool_id) const
+{
+    std::lock_guard lock(mMutex);
+    const auto found = mLegacyPools.find(pool_id);
+    return found == mLegacyPools.end() ? std::vector<std::uint32_t>{} : found->second;
+}
+
 std::optional<std::uint32_t> RuntimeRegistry::legacy_runtime_id(
     std::string_view name,
     std::uint16_t data) const
@@ -1136,6 +1207,8 @@ std::optional<std::uint32_t> RuntimeRegistry::java_runtime_id(std::string_view b
 {
     const auto key = normalize_java_state(block_state);
     std::lock_guard lock(mMutex);
+    const auto round_trip = mJavaRoundTripMapping.find(key);
+    if (round_trip != mJavaRoundTripMapping.end()) return round_trip->second;
     const auto it = mJavaMapping.find(key);
     return it == mJavaMapping.end() ? std::nullopt : std::optional<std::uint32_t>(it->second);
 }
@@ -1149,10 +1222,14 @@ std::optional<std::uint32_t> RuntimeRegistry::compatible_java_runtime_id(
     const auto requested_property_views = java_property_views(requested);
     if (requested_property_views.empty()) {
         std::lock_guard lock(mMutex);
+        const auto round_trip = mJavaRoundTripMapping.find(requested);
+        if (round_trip != mJavaRoundTripMapping.end()) return round_trip->second;
         const auto java_default = mJavaDefaultByName.find(requested_name);
         if (java_default != mJavaDefaultByName.end()) return java_default->second;
     }
     std::lock_guard lock(mMutex);
+    const auto round_trip = mJavaRoundTripMapping.find(requested);
+    if (round_trip != mJavaRoundTripMapping.end()) return round_trip->second;
     const auto exact = mJavaMapping.find(requested);
     if (exact != mJavaMapping.end()) return exact->second;
     const JavaCandidate* best_candidate = nullptr;

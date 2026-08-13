@@ -243,7 +243,8 @@ Result<void> IbImportStructure::read(const std::filesystem::path& path)
 Result<ChunkMap> IbImportStructure::get_chunks(std::span<const ChunkPos> positions) const
 {
     ChunkMap result; for (const auto pos : positions) result.emplace(pos, ChunkData{});
-    mChunkIndex.ensure(mBlocks, mOffset, [](const Block& block) { return block.pos; });
+    if (!mChunkIndex.ensure(mBlocks, mOffset, [](const Block& block) { return block.pos; }))
+        return Result<ChunkMap>::failure("IBImport chunk index 超过 uint32 容量");
     for (auto& [chunk_pos, chunk] : result) {
         const auto* indexed = mChunkIndex.find(chunk_pos);
         if (!indexed) continue;

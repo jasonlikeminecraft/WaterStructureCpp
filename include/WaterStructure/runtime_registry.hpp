@@ -31,9 +31,11 @@ public:
     std::optional<std::uint32_t> find_compatible(BlockState state) const;
     std::optional<BlockState> state(std::uint32_t runtime_id) const;
     std::optional<BlockState> java_state(std::uint32_t runtime_id) const;
+    std::unordered_map<std::uint32_t, BlockState> java_states_snapshot() const;
 
     Result<void> load_legacy_pool(const std::filesystem::path& path, std::uint8_t pool_id = 117);
     Result<void> load_block_mappings(const std::filesystem::path& path);
+    std::vector<std::uint32_t> legacy_pool_snapshot(std::uint8_t pool_id) const;
     std::optional<std::uint32_t> legacy_runtime_id(std::uint8_t pool_id, std::size_t index) const;
     std::optional<std::uint32_t> legacy_runtime_id(std::string_view name, std::uint16_t data) const;
     std::optional<std::uint32_t> legacy_state_runtime_id(
@@ -88,6 +90,7 @@ private:
     };
 
     std::unordered_map<std::string, std::uint32_t> mJavaMapping;
+    std::unordered_map<std::string, std::uint32_t> mJavaRoundTripMapping;
     std::unordered_map<std::string, std::vector<JavaCandidate>> mJavaCandidatesByName;
     std::unordered_map<std::string, std::uint32_t> mJavaDefaultByName;
     std::unordered_map<std::string, std::size_t> mJavaOrder;

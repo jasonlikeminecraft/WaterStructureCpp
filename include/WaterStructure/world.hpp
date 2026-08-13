@@ -22,6 +22,11 @@ struct ChunkWrite {
     const ChunkData* chunk = nullptr;
 };
 
+struct EncodedSubChunkData {
+    SubChunkPos pos{};
+    std::vector<std::uint8_t> payload;
+};
+
 class WorldTarget {
 public:
     virtual ~WorldTarget() = default;
@@ -58,7 +63,16 @@ public:
         std::int32_t min_sub_y,
         std::int32_t max_sub_y,
         bool include_layer1 = true) const;
+    Result<std::optional<BlockBox>> stored_block_bounds() const;
     Result<std::vector<BlockEntity>> load_chunk_nbt(ChunkPos pos) const override;
+    Result<std::vector<EncodedSubChunkData>> encode_chunks(
+        std::span<const ChunkWrite> chunks) const;
+    Result<SubChunkData> decode_subchunk_payload(
+        std::span<const std::uint8_t> payload) const;
+    Result<std::optional<std::vector<std::uint8_t>>> load_subchunk_payload(
+        SubChunkPos pos) const;
+    Result<void> save_subchunk_payloads(
+        std::vector<EncodedSubChunkData> subchunks);
     Result<void> save_chunk(ChunkPos pos, const ChunkData& chunk) override;
     Result<void> save_chunks(std::span<const ChunkWrite> chunks) override;
     Result<void> save_chunk_nbt(ChunkPos pos, std::span<const BlockEntity> entities) override;

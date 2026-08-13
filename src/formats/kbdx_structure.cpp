@@ -292,9 +292,9 @@ Result<ChunkMap> KbdxStructure::get_chunks(std::span<const ChunkPos> positions) 
         result.emplace(pos, ChunkData{});
     }
 
-    mChunkIndex.ensure(mBlocks, mOffset, [](const Block& block) {
+    if (!mChunkIndex.ensure(mBlocks, mOffset, [](const Block& block) {
         return BlockPos{ block.x, block.y, block.z };
-    });
+    })) return Result<ChunkMap>::failure("KBDX chunk index 超过 uint32 容量");
     for (auto& [chunk_pos, chunk] : result) {
         const auto* indexed = mChunkIndex.find(chunk_pos);
         if (!indexed) continue;

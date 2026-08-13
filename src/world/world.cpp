@@ -16,6 +16,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <iostream>
+#include <limits>
 #include <sstream>
 
 namespace water_structure {
@@ -208,6 +209,48 @@ bool BedrockWorldAdapter::valid() const noexcept
     return mWorld.has_value() && mWorld->valid();
 }
 
+Result<std::optional<BlockBox>> BedrockWorldAdapter::stored_block_bounds() const
+{
+    if (!valid()) return Result<std::optional<BlockBox>>::failure("世界未打开");
+    auto positions = mWorld->listSubChunks(BedrockWorldOperator::Dimension::Overworld);
+    if (!positions) return Result<std::optional<BlockBox>>::failure(positions.error);
+    if (positions.value.empty()) return Result<std::optional<BlockBox>>::success(std::nullopt);
+
+    auto min_x = positions.value.front().x;
+    auto min_y = positions.value.front().y;
+    auto min_z = positions.value.front().z;
+    auto max_x = min_x;
+    auto max_y = min_y;
+    auto max_z = min_z;
+    for (const auto& position : positions.value) {
+        min_x = std::min(min_x, position.x);
+        min_y = std::min(min_y, position.y);
+        min_z = std::min(min_z, position.z);
+        max_x = std::max(max_x, position.x);
+        max_y = std::max(max_y, position.y);
+        max_z = std::max(max_z, position.z);
+    }
+    const auto block_coordinate = [](int value, int edge) -> std::optional<std::int32_t> {
+        const auto result = static_cast<std::int64_t>(value) * 16 + edge;
+        if (result < std::numeric_limits<std::int32_t>::min() ||
+            result > std::numeric_limits<std::int32_t>::max()) return std::nullopt;
+        return static_cast<std::int32_t>(result);
+    };
+    const auto block_min_x = block_coordinate(min_x, 0);
+    const auto block_min_y = block_coordinate(min_y, 0);
+    const auto block_min_z = block_coordinate(min_z, 0);
+    const auto block_max_x = block_coordinate(max_x, 15);
+    const auto block_max_y = block_coordinate(max_y, 15);
+    const auto block_max_z = block_coordinate(max_z, 15);
+    if (!block_min_x || !block_min_y || !block_min_z || !block_max_x || !block_max_y || !block_max_z) {
+        return Result<std::optional<BlockBox>>::failure("世界 subchunk 边界超出 int32 坐标范围");
+    }
+    return Result<std::optional<BlockBox>>::success(BlockBox{
+        { *block_min_x, *block_min_y, *block_min_z },
+        { *block_max_x, *block_max_y, *block_max_z }
+    });
+}
+
 Result<ChunkData> BedrockWorldAdapter::load_chunk(ChunkPos pos) const
 {
     return load_chunk_range(pos, kMinSubChunkY, kMaxSubChunkY, true);
@@ -242,22 +285,29 @@ Result<ChunkData> BedrockWorldAdapter::load_chunk_range(
     for (auto& decoded : loaded.value) {
         const auto sub_y = decoded.index;
         auto& loaded_subchunk = decoded.subChunk;
-        const auto blocks0 = loaded_subchunk.blocks(0);
+        const auto blocks0 = loaded_subchunk.blocksView(0);
         if (blocks0.size() != 4096) {
             return Result<ChunkData>::failure(error_for("读取 subchunk 失败", "方块数量不是 4096"));
         }
-        const auto blocks1 = include_layer1 ? loaded_subchunk.blocks(1) : BedrockWorldOperator::BlockRuntimeList{};
-        if (include_layer1 && blocks1.size() != 4096) {
+        const auto blocks1 = include_layer1
+            ? loaded_subchunk.blocksView(1)
+            : std::span<const std::uint32_t>{};
+        if (include_layer1 && !blocks1.empty() && blocks1.size() != 4096) {
             return Result<ChunkData>::failure(error_for("读取 subchunk 失败", "方块数量不是 4096"));
         }
         SubChunkData data;
+        if (include_layer1 && blocks1.empty()) {
+            data.layer1.fill(BedrockWorldOperator::airRuntimeId());
+        }
         for (int x = 0; x < 16; ++x) {
             for (int y = 0; y < 16; ++y) {
                 for (int z = 0; z < 16; ++z) {
                     const auto native_index = static_cast<std::size_t>(x * 256 + y * 16 + z);
                     const auto internal_index = static_cast<std::size_t>((y * 16 + z) * 16 + x);
                     data.layer0[internal_index] = blocks0[native_index];
-                    if (include_layer1) data.layer1[internal_index] = blocks1[native_index];
+                    if (include_layer1 && !blocks1.empty()) {
+                        data.layer1[internal_index] = blocks1[native_index];
+                    }
                 }
             }
         }
@@ -308,25 +358,28 @@ Result<void> BedrockWorldAdapter::save_chunk(ChunkPos pos, const ChunkData& chun
     return save_chunks(writes);
 }
 
-Result<void> BedrockWorldAdapter::save_chunks(std::span<const ChunkWrite> chunks)
+Result<std::vector<EncodedSubChunkData>> BedrockWorldAdapter::encode_chunks(
+    std::span<const ChunkWrite> chunks) const
 {
     if (!valid()) {
-        return Result<void>::failure("世界未打开");
+        return Result<std::vector<EncodedSubChunkData>>::failure("世界未打开");
     }
 
-    std::vector<BedrockWorldOperator::PositionedSubChunkWrite> writes;
+    std::vector<EncodedSubChunkData> result;
     std::size_t sub_chunk_count = 0;
     for (const auto& write : chunks) {
-        if (!write.chunk) return Result<void>::failure("chunk write is empty");
+        if (!write.chunk) {
+            return Result<std::vector<EncodedSubChunkData>>::failure("chunk write is empty");
+        }
         sub_chunk_count += write.chunk->sub_chunks.size();
     }
-    writes.reserve(sub_chunk_count);
+    result.reserve(sub_chunk_count);
     const auto air_runtime_id = BedrockWorldOperator::airRuntimeId();
     for (const auto& chunk_write : chunks) {
         const auto pos = chunk_write.pos;
         for (const auto& [sub_y, data] : chunk_write.chunk->sub_chunks) {
             if (sub_y < kMinSubChunkY || sub_y > kMaxSubChunkY) {
-                return Result<void>::failure(
+                return Result<std::vector<EncodedSubChunkData>>::failure(
                     "subchunk Y 超出 Overworld 范围: " + std::to_string(sub_y)
                 );
             }
@@ -336,37 +389,113 @@ Result<void> BedrockWorldAdapter::save_chunks(std::span<const ChunkWrite> chunks
                 data.layer1.begin(), data.layer1.end(),
                 [air_runtime_id](const auto runtime_id) { return runtime_id != air_runtime_id; });
             BlockLayer native_layer1{};
-            for (int x = 0; x < 16; ++x) {
-                for (int y = 0; y < 16; ++y) {
-                    for (int z = 0; z < 16; ++z) {
-                        const auto native_index = static_cast<std::size_t>(x * 256 + y * 16 + z);
-                        const auto internal_index = static_cast<std::size_t>((y * 16 + z) * 16 + x);
-                        native_layer0[native_index] = data.layer0[internal_index];
-                        if (has_layer1) native_layer1[native_index] = data.layer1[internal_index];
+            if (chunk_write.chunk->layout == BlockLayerLayout::Native) {
+                native_layer0 = data.layer0;
+                if (has_layer1) native_layer1 = data.layer1;
+            } else {
+                for (int x = 0; x < 16; ++x) {
+                    for (int y = 0; y < 16; ++y) {
+                        for (int z = 0; z < 16; ++z) {
+                            const auto native_index = static_cast<std::size_t>(x * 256 + y * 16 + z);
+                            const auto internal_index = static_cast<std::size_t>((y * 16 + z) * 16 + x);
+                            native_layer0[native_index] = data.layer0[internal_index];
+                            if (has_layer1) native_layer1[native_index] = data.layer1[internal_index];
+                        }
                     }
                 }
             }
             if (!sub_chunk.setBlocks(
                 std::span<const std::uint32_t>(native_layer0.data(), native_layer0.size()), 0)) {
-                return Result<void>::failure("创建 subchunk layer 0 失败");
+                return Result<std::vector<EncodedSubChunkData>>::failure(
+                    "创建 subchunk layer 0 失败");
             }
             if (has_layer1 && !sub_chunk.setBlocks(
                 std::span<const std::uint32_t>(native_layer1.data(), native_layer1.size()), 1)) {
-                return Result<void>::failure("创建 subchunk layer 1 失败");
+                return Result<std::vector<EncodedSubChunkData>>::failure(
+                    "创建 subchunk layer 1 失败");
             }
-            BedrockWorldOperator::PositionedSubChunkWrite write;
-            write.position = { pos.x, sub_y, pos.z };
-            write.subChunk = std::move(sub_chunk);
-            writes.push_back(std::move(write));
+            auto encoded = BedrockWorldOperator::encodeSubChunkPayload(
+                sub_chunk,
+                BedrockWorldOperator::Encoding::Disk,
+                kOverworldMinY,
+                319,
+                sub_y - kMinSubChunkY);
+            if (!encoded) {
+                return Result<std::vector<EncodedSubChunkData>>::failure(
+                    "编码 subchunk 失败: " + encoded.error);
+            }
+            result.push_back({
+                { pos.x, sub_y, pos.z },
+                std::move(encoded.value)
+            });
         }
     }
-    if (!writes.empty()) {
-        auto saved = mWorld->saveSubChunksBatch(
-            BedrockWorldOperator::Dimension::Overworld,
-            std::span<const BedrockWorldOperator::PositionedSubChunkWrite>(writes.data(), writes.size()));
-        if (!saved) return Result<void>::failure(saved.error);
+    return Result<std::vector<EncodedSubChunkData>>::success(std::move(result));
+}
+
+Result<SubChunkData> BedrockWorldAdapter::decode_subchunk_payload(
+    std::span<const std::uint8_t> payload) const
+{
+    if (!valid()) return Result<SubChunkData>::failure("世界未打开");
+    auto decoded = BedrockWorldOperator::decodeSubChunkPayload(
+        payload, BedrockWorldOperator::Encoding::Disk, kOverworldMinY, 319);
+    if (!decoded) {
+        return Result<SubChunkData>::failure("解码 subchunk 失败: " + decoded.error);
     }
+    const auto blocks0 = decoded.value.subChunk.blocksView(0);
+    if (blocks0.size() != 4096) {
+        return Result<SubChunkData>::failure("解码 subchunk 失败: layer 0 方块数量不是 4096");
+    }
+    const auto blocks1 = decoded.value.subChunk.blocksView(1);
+    if (!blocks1.empty() && blocks1.size() != 4096) {
+        return Result<SubChunkData>::failure("解码 subchunk 失败: layer 1 方块数量不是 4096");
+    }
+    SubChunkData data;
+    data.layer1.fill(BedrockWorldOperator::airRuntimeId());
+    std::copy(blocks0.begin(), blocks0.end(), data.layer0.begin());
+    if (!blocks1.empty()) std::copy(blocks1.begin(), blocks1.end(), data.layer1.begin());
+    return Result<SubChunkData>::success(std::move(data));
+}
+
+Result<std::optional<std::vector<std::uint8_t>>> BedrockWorldAdapter::load_subchunk_payload(
+    SubChunkPos pos) const
+{
+    if (!valid()) {
+        return Result<std::optional<std::vector<std::uint8_t>>>::failure("世界未打开");
+    }
+    auto loaded = mWorld->loadSubChunkPayload(
+        BedrockWorldOperator::Dimension::Overworld,
+        { pos.x, pos.y, pos.z });
+    if (!loaded) {
+        return Result<std::optional<std::vector<std::uint8_t>>>::failure(loaded.error);
+    }
+    return Result<std::optional<std::vector<std::uint8_t>>>::success(
+        std::move(loaded.value));
+}
+
+Result<void> BedrockWorldAdapter::save_subchunk_payloads(
+    std::vector<EncodedSubChunkData> subchunks)
+{
+    if (!valid()) return Result<void>::failure("世界未打开");
+    std::vector<BedrockWorldOperator::PositionedSubChunkPayload> writes;
+    writes.reserve(subchunks.size());
+    for (auto& subchunk : subchunks) {
+        writes.push_back({
+            { subchunk.pos.x, subchunk.pos.y, subchunk.pos.z },
+            std::move(subchunk.payload)
+        });
+    }
+    auto saved = mWorld->saveSubChunkPayloadsBatch(
+        BedrockWorldOperator::Dimension::Overworld, writes);
+    if (!saved) return Result<void>::failure(saved.error);
     return Result<void>::success();
+}
+
+Result<void> BedrockWorldAdapter::save_chunks(std::span<const ChunkWrite> chunks)
+{
+    auto encoded = encode_chunks(chunks);
+    if (!encoded) return Result<void>::failure(encoded.error());
+    return save_subchunk_payloads(std::move(encoded).value());
 }
 
 Result<void> BedrockWorldAdapter::save_chunk_nbt(ChunkPos pos, std::span<const BlockEntity> entities)

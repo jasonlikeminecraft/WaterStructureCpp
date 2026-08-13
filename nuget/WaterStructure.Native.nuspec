@@ -1,0 +1,20 @@
+<?xml version="1.0"?>
+<package>
+  <metadata>
+    <id>WaterStructure.Native</id>
+    <version>0.1.0</version>
+    <authors>WaterStructureCpp</authors>
+    <description>Native static and shared libraries for WaterStructureCpp.</description>
+    <license type="expression">MIT</license>
+    <tags>minecraft structure bdx mcworld schem</tags>
+  </metadata>
+  <files>
+    <file src="..\dist\runtime\water_structure_shared.dll" target="runtimes\win-x64\native" />
+    <file src="..\dist\runtime\water_structure_shared.lib" target="build\native" />
+    <file src="..\dist\runtime\water_structure_static.lib" target="build\native" />
+    <file src="..\include\WaterStructure\*.h" target="build\native\include\WaterStructure" />
+    <file src="..\include\WaterStructure\*.hpp" target="build\native\include\WaterStructure" />
+    <file src="..\assets\**\*" target="build\native\assets" />
+    <file src="WaterStructure.Native.targets" target="build\native" />
+  </files>
+</package>

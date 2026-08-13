@@ -1,0 +1,11 @@
+{
+  "name": "water-structure",
+  "version-string": "0.1.0",
+  "description": "Streaming Minecraft structure format conversion library",
+  "dependencies": [
+    "nlohmann-json",
+    "msgpack",
+    "brotli",
+    "zlib"
+  ]
+}

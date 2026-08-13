@@ -133,6 +133,7 @@ public:
 
     bool valid() const noexcept;
     BlockRuntimeList blocks(int layer = 0) const;
+    std::span<const std::uint32_t> blocksView(int layer = 0) const noexcept;
     Result<void> setBlocks(std::span<const std::uint32_t> blocks, int layer = 0);
 
 private:
@@ -150,6 +151,11 @@ private:
 struct PositionedSubChunkWrite {
     SubChunkPos position;
     std::optional<SubChunk> subChunk;
+};
+
+struct PositionedSubChunkPayload {
+    SubChunkPos position;
+    std::optional<Bytes> payload;
 };
 
 class Chunk {
@@ -174,6 +180,31 @@ struct DecodedSubChunk {
     int index = 0;
 };
 
+struct SubChunkDecodeProfile {
+    std::uint64_t calls = 0;
+    std::uint64_t sampledCalls = 0;
+    std::uint64_t sampledLayers = 0;
+    std::uint64_t sampledPaletteEntries = 0;
+    std::uint64_t payloadCopyNs = 0;
+    std::uint64_t nativeInitNs = 0;
+    std::uint64_t packedReadNs = 0;
+    std::uint64_t paletteResolveNs = 0;
+    std::uint64_t blockExpandNs = 0;
+    std::uint64_t setBlocksNs = 0;
+    std::uint64_t wrapperNs = 0;
+};
+
+struct SubChunkEncodeProfile {
+    std::uint64_t calls = 0;
+    std::uint64_t sampledCalls = 0;
+    std::uint64_t sampledLayers = 0;
+    std::uint64_t sampledPaletteEntries = 0;
+    std::uint64_t paletteBuildNs = 0;
+    std::uint64_t indexPackNs = 0;
+    std::uint64_t packedWriteNs = 0;
+    std::uint64_t paletteWriteNs = 0;
+};
+
 class World {
 public:
     World();
@@ -188,12 +219,14 @@ public:
     bool valid() const noexcept;
     Result<void> close();
     Result<Bytes> levelDat() const;
+    Result<std::optional<Bytes>> loadSubChunkPayload(Dimension dim, SubChunkPos pos) const;
     Result<SubChunk> loadSubChunk(Dimension dim, SubChunkPos pos) const;
     Result<std::vector<DecodedSubChunk>> loadSubChunks(Dimension dim, ChunkPos chunk, int minSubY, int maxSubY) const;
     Result<BlockStateList> loadSubChunkBlockStates(Dimension dim, SubChunkPos pos) const;
     Result<std::vector<SubChunkPos>> listSubChunks(Dimension dim) const;
     Result<void> saveSubChunk(Dimension dim, SubChunkPos pos, const SubChunk& subChunk);
     Result<void> saveSubChunksBatch(Dimension dim, std::span<const PositionedSubChunkWrite> writes);
+    Result<void> saveSubChunkPayloadsBatch(Dimension dim, std::span<const PositionedSubChunkPayload> writes);
     Result<Bytes> loadNbt(Dimension dim, ChunkPos pos) const;
     Result<std::vector<ChunkPos>> listNbtChunks(Dimension dim) const;
     Result<void> saveNbt(Dimension dim, ChunkPos pos, std::span<const std::uint8_t> payload);
@@ -208,5 +241,9 @@ private:
 
 Result<DecodedSubChunk> decodeSubChunkPayload(std::span<const std::uint8_t> payload, Encoding encoding, int rangeStart, int rangeEnd);
 Result<Bytes> encodeSubChunkPayload(const SubChunk& subChunk, Encoding encoding, int rangeStart, int rangeEnd, int index);
+void resetSubChunkDecodeProfile() noexcept;
+SubChunkDecodeProfile subChunkDecodeProfile() noexcept;
+void resetSubChunkEncodeProfile() noexcept;
+SubChunkEncodeProfile subChunkEncodeProfile() noexcept;
 
 } // namespace BedrockWorldOperator
