@@ -389,9 +389,14 @@ Result<std::vector<EncodedSubChunkData>> BedrockWorldAdapter::encode_chunks(
                 data.layer1.begin(), data.layer1.end(),
                 [air_runtime_id](const auto runtime_id) { return runtime_id != air_runtime_id; });
             BlockLayer native_layer1{};
+            const auto* layer0 = &native_layer0;
+            const auto* layer1 = &native_layer1;
             if (chunk_write.chunk->layout == BlockLayerLayout::Native) {
-                native_layer0 = data.layer0;
-                if (has_layer1) native_layer1 = data.layer1;
+                // Schem/BDX producers already emit Bedrock's native x/y/z
+                // order. Pass their arrays directly to BWO; setBlocks() owns
+                // its storage, so an intermediate 4096-entry copy is wasted.
+                layer0 = &data.layer0;
+                if (has_layer1) layer1 = &data.layer1;
             } else {
                 for (int x = 0; x < 16; ++x) {
                     for (int y = 0; y < 16; ++y) {
@@ -405,12 +410,12 @@ Result<std::vector<EncodedSubChunkData>> BedrockWorldAdapter::encode_chunks(
                 }
             }
             if (!sub_chunk.setBlocks(
-                std::span<const std::uint32_t>(native_layer0.data(), native_layer0.size()), 0)) {
+                std::span<const std::uint32_t>(layer0->data(), layer0->size()), 0)) {
                 return Result<std::vector<EncodedSubChunkData>>::failure(
                     "创建 subchunk layer 0 失败");
             }
             if (has_layer1 && !sub_chunk.setBlocks(
-                std::span<const std::uint32_t>(native_layer1.data(), native_layer1.size()), 1)) {
+                std::span<const std::uint32_t>(layer1->data(), layer1->size()), 1)) {
                 return Result<std::vector<EncodedSubChunkData>>::failure(
                     "创建 subchunk layer 1 失败");
             }

@@ -50,6 +50,28 @@ public:
         value = static_cast<std::uint8_t>(mBuffer[mPosition++]);
         return true;
     }
+    bool read_varint_u32(std::uint32_t& result)
+    {
+        std::uint64_t value = 0;
+        int shift = 0;
+        for (;;) {
+            if (mPosition == mSize) {
+                mInput.read(mBuffer.data(), static_cast<std::streamsize>(mBuffer.size()));
+                mSize = static_cast<std::size_t>(mInput.gcount());
+                mPosition = 0;
+                if (mSize == 0) return false;
+            }
+            const auto byte = static_cast<std::uint8_t>(mBuffer[mPosition++]);
+            value |= static_cast<std::uint64_t>(byte & 0x7fu) << shift;
+            if ((byte & 0x80u) == 0) {
+                if (value > std::numeric_limits<std::uint32_t>::max()) return false;
+                result = static_cast<std::uint32_t>(value);
+                return true;
+            }
+            shift += 7;
+            if (shift >= 35) return false;
+        }
+    }
     bool read_exact(std::span<std::uint8_t> output)
     {
         mPosition = mSize = 0;
@@ -162,6 +184,24 @@ bool read_encoded_index(EncodedReader& input, std::uint32_t& result, std::size_t
         shift += 7;
         if (shift >= 35) return false;
     }
+}
+
+// Fast path for the hot world-stream loop. EncodedReader keeps a contiguous
+// heap buffer, so most palette indices are decoded without a function call or
+// stream state check. The fallback handles a varint split at the buffer edge.
+bool read_encoded_index_fast(
+    EncodedReader& input, std::uint32_t& result)
+{
+    return input.read_varint_u32(result);
+}
+
+bool read_encoded_index_fast(
+    EncodedReader& input,
+    std::uint32_t& result,
+    std::uint16_t max_value)
+{
+    if (!read_encoded_index_fast(input, result)) return false;
+    return result <= max_value;
 }
 
 } // namespace
@@ -651,11 +691,18 @@ Result<void> SchemStructure::write_to_world(WorldTarget& world, SubChunkPos star
         const auto found = mPalette.find(index);
         return found == mPalette.end() ? mUnknownRuntimeId : found->second;
     };
+    // The direct world stream is palette-index bounded to uint16. Resolve it
+    // once so the 500M-block hot loop performs a plain array lookup instead of
+    // repeatedly branching between dense and sparse palette representations.
+    std::vector<std::uint32_t> runtime_palette(
+        static_cast<std::size_t>(mMaxPaletteIndex) + 1, mUnknownRuntimeId);
+    for (std::size_t index = 0; index < runtime_palette.size(); ++index) {
+        runtime_palette[index] = runtime_id_for(static_cast<std::uint16_t>(index));
+    }
     std::vector<std::uint8_t> palette_non_air(
-        static_cast<std::size_t>(mMaxPaletteIndex) + 1, 1);
+        runtime_palette.size(), 1);
     for (std::size_t index = 0; index < palette_non_air.size(); ++index) {
-        palette_non_air[index] = runtime_id_for(static_cast<std::uint32_t>(index)) !=
-            air_runtime_id;
+        palette_non_air[index] = runtime_palette[index] != air_runtime_id;
     }
     if (callbacks.start) callbacks.start(total_chunks);
 
@@ -690,7 +737,7 @@ Result<void> SchemStructure::write_to_world(WorldTarget& world, SubChunkPos star
             for (std::size_t source_z = 0; source_z < length; ++source_z) {
                 for (std::size_t source_x = 0; source_x < width; ++source_x, ++slab_index) {
                     std::uint32_t palette_index = 0;
-                    if (!read_encoded_index(encoded, palette_index) || palette_index > mMaxPaletteIndex) {
+                    if (!read_encoded_index_fast(encoded, palette_index, mMaxPaletteIndex)) {
                         return Result<void>::failure("Schem BlockData varint 读取失败或 palette 索引越界");
                     }
                     slab[slab_index] = static_cast<std::uint16_t>(palette_index);
@@ -727,7 +774,7 @@ Result<void> SchemStructure::write_to_world(WorldTarget& world, SubChunkPos star
                         const auto source_z = source_z_begin + local_z;
                         const auto row_offset = (local_y * length + source_z) * width;
                         for (std::size_t source_x = source_x_begin; source_x < source_x_end; ++source_x) {
-                            const auto runtime_id = runtime_id_for(slab[row_offset + source_x]);
+                            const auto runtime_id = runtime_palette[slab[row_offset + source_x]];
                             if (runtime_id == air_runtime_id) continue;
                             const auto local_x = source_x - source_x_begin;
                             // BedrockWorldAdapter can consume the native
