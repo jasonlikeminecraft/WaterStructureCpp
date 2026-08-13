@@ -116,84 +116,28 @@ MCFunction reader 同样采用有界流式路径：逐行解析后只保留紧�
 
 ## 性能与内存
 
-流式处理是本库的核心约束，不是只针对个别大型样本的可选优化。reader、writer 和
-世界适配层不得以完整结构体积为比例保留方块数组、命令流或解压结果；必须使用有界
-缓冲、chunk/subchunk 批次或临时文件。新增格式和优化只有在保持此约束、错误兼容性
-及 canonical manifest 不变时才可合入。
+流式处理是所有转换器的默认行为：reader 按命令、chunk 或 subchunk 读取，writer
+按批次写出；不会因为输入地图很大而把完整方块数组长期留在内存中。下面是当前
+Release 构建在本机实测的端到端结果，数字用于比较转换器量级，不是硬件保证值。
 
-MCWorld 世界导出采用流式路径，避免把整个世界或完整 `BlockData` 一次性放入
-内存。以下是本地 Release 构建对真实大型地图
-`2701 x 176 x 2701`（约 12.84 亿方块、28,561 个 chunk 柱）的观测值；结果会
-随 CPU、磁盘和压缩库版本变化，仅用于比较优化前后的量级：
+| 转换方向 | 测试样本 | 输出 | 耗时 | 峰值私有内存 |
+| --- | --- | --- | ---: | ---: |
+| MCWorld → SchemV1 | 乌托邦，`2701×176×2701`，约 2.86 万 chunk 柱 | `.schem` | 约 29.3 秒 | 约 175 MiB（工作集约 348 MiB） |
+| MCWorld → MCFunction | 同上 | `.mcfunction` | 约 10.79 秒（写真实文件） | 约 154 MiB |
+| MCWorld → BDX | Kuudra，`188×175×185`，270.6 万非空气方块 | `.bdx` | 约 1.49 秒 | 约 152 MiB |
+| BDX → MCWorld | 同一 Kuudra BDX | 世界目录/`.mcworld` | 约 1.68 秒 | 约 159 MiB |
+| Schematic → MCWorld | `519×256×519`，1089 个 chunk | 世界目录/`.mcworld` | 约 3.6 秒 | 约 412 MiB |
+| SchemV1 → MCWorld | Flight，`2610×282×2615` | 世界目录 | 约 40 秒 | 约 161 MiB |
 
-| 阶段 | 转换耗时 | 峰值私有内存 | 说明 |
-| --- | ---: | ---: | --- |
-| 早期完整缓存路径 | 约 206 秒 | 会出现数 GB 瞬时占用 | 作为历史问题基线 |
-| 条带流式 Schem 写入 | 约 33.1 秒 | 约 201 MiB | 输出 SHA-256 与基线一致 |
-| BWO 范围/批量 subchunk 读取 | 约 29.3 秒 | 约 175 MiB（工作集约 348 MiB） | 当前默认路径 |
+MCFunction 编码默认使用 2 个线程；在乌托邦样本上，1/2/3/4/8 个编码线程约为
+17.06/9.55/11.31/11.05/11.28 秒。该负载在 2 个线程后受内存带宽限制，因此
+线程越多不一定越快。其他 writer 当前主要受源文件解码、压缩或 LevelDB 写入速度
+限制，`--threads` 不会自动让所有格式线性加速。
 
-同一乌托邦样本输出 MCFunction 时，固定线程池将独立 chunk 批次并行合并，主线程
-仍按原任务顺序写出。经整数格式化、磁盘 palette 状态缓存和 subchunk 零拷贝读取
-优化后，Release 写入 `NUL` 实测 1 线程约 17.06 秒、2 线程约 9.55 秒；真实文件
-写入约 10.79 秒。输出为 897,044,964 字节，SHA-256 为
-`359696D912A4969C935CCFDEEF7A90509C7AD2A53951C22675019ED7D5BC2492`，峰值私有
-内存约 154 MiB。3/4/8 线程分别约 11.31/11.05/11.28 秒，表明该负载在 2 个编码
-线程后已受内存带宽和缓存竞争限制，因此默认值固定为 2，而不是逻辑核心数。
-
-BDX 双向转换也使用有界流式路径。Kuudra 样本（`188 x 175 x 185`，实际写入
-2,705,661 个非空气方块）从 MCWorld 输出 BDX 由约 27.15 秒、278 MiB 降至约
-1.49 秒、152 MiB；BDX 写回 MCWorld 由约 2.96 秒、169 MiB 降至约 1.68 秒、
-159 MiB。writer 使用 Brotli quality 6，因此该样本压缩文件由 143,935 字节增加
-到 173,178 字节。新旧 BDX 的 canonical chunk manifest 完全一致。
-
-大型 Schem reader 使用稀疏行检查点直接访问 varint BlockData，不再生成数 GB 的
-定宽索引临时文件。本地 Flight 样本（`2610 x 282 x 2615`）的完整 benchmark
-由约 84 秒降至约 40 秒，峰值私有内存约 161 MiB，checksum 保持一致。所有
-1 MiB I/O 缓冲均在堆上分配，兼容 Windows 默认线程栈大小。
-
-当前 profile（`$env:WATER_STRUCTURE_PROFILE = "1"`）显示该样本的主要阶段约为：
-
-- `get_chunks`：12.34 秒
-- BlockData 编码：7.95 秒
-- 条带合并：4.60 秒
-- 169 个 Z 条带，BlockData 原始字节约 1.29 GB
-
-已落地的性能优化包括：
-
-- Schem BlockData 按 Z 条带写入临时文件，最后按 `y -> z -> x` 顺序合并，避免
-  分配完整 BlockData 数组。
-- MCWorld chunk 缓存按条带释放，并根据结构的 Y 范围裁剪 subchunk 读取。
-- 对齐的完整 16x16 chunk 直接复制 subchunk；边界、负坐标和 offset 仍回退到
-  通用逐方块路径，保持兼容性。
-- Schem writer 使用 layer0-only 读取，避免无用的第二方块层初始化和扫描。
-- varint 编码复用预分配行缓冲，减少热路径上的临时分配。
-- BWO 通过一次范围查询读取 chunk 的 subchunk payload，再进行解码，减少逐层
-  LevelDB 调用和重复查找。
-- BWO 对重复的磁盘 block-state NBT 使用最多 8 MiB 的 runtime ID 缓存；命中时
-  只扫描 NBT 边界，不再重复分配属性 map 或执行 upgrade schema。
-- BWO 解码后的 4096 项方块层通过只读 span 交给世界适配层，并在内部移动接管
-  解码数组，消除两次完整 layer 拷贝。
-- Schem reader 在解压阶段建立行和分段偏移，按实际行长度读取并直接解码
-  varint；超宽行的 16 位检查点溢出时自动回退到行首扫描。
-- MCFunction writer 使用有界固定线程池，世界读取保持单线程；每个工作线程复用
-  扫描工作区和 Java 状态缓存，任务结果超过 2 MiB 时自动溢写临时文件，避免
-  高并发输出导致内存失控，并按任务序号确定性合并。命令整数使用 `to_chars`
-  写入连续 staging buffer，避免热路径上的 iostream 格式化开销。
-- BDX reader 直接从 64 KiB Brotli 解压窗口解析命令，并缓存 constant/pool palette
-  的 runtime ID；writer 以 32 个 chunk 为上限读取世界，使用 256 KiB staging
-  buffer 流式压缩，不再同时保留完整 chunk 集、命令流和压缩输出。
-- BDX 导入世界时不保存完整方块列表。首轮只计算游标边界和非空气数量，不构造
-  runtime state 或方块实体 NBT；第二轮使用有界 chunk 缓存直接写入世界。缓存容量
-  覆盖 writer 的 X 批次，避免正常 BDX 输出在 Y 层切换时反复重载同一批 chunk；首轮
-  的原始 NBT 使用深度受限的 typed skip，不创建 libnbt 对象树。
-- BDX 解压输出增加 64 KiB 用户态读取窗口，避免每个命令字段调用一次 `istream`
-  读取；世界写入按 16 个 chunk 聚合 `saveSubChunksBatch`，profile 模式会报告
-  `save_batches`、`reloads` 和 `save_ms`，用于区分命令解析与 LevelDB 写入瓶颈。
-- vector-backed reader 的 chunk 索引使用带容量检查的 32 位编号，将 BDX→MCWorld
-  每方块索引开销由 8 字节降为 4 字节。
-
-解析器逐项优化、基准命令、重复测试结果和未完成格式清单记录在
-[docs/parser_optimization.md](docs/parser_optimization.md)。
+已经支持的 JSON、MessagePack、NBT、BDX、IBImport、MCFunction 等格式都走相同的
+有界 chunk/subchunk 管线；但没有大型真实样本的格式目前只有最小 fixture 的测试
+耗时，不能与上表的大地图转换时间直接比较。详细的测试命令、样本和阶段 profile
+记录在 [docs/parser_optimization.md](docs/parser_optimization.md)。
 
 可用以下命令查看阶段耗时：
 
