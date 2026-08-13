@@ -1723,6 +1723,34 @@ int main()
             "MCFunction chunks");
         std::filesystem::remove(mcfunction_path);
 
+        const auto large_mcfunction_path = std::filesystem::temp_directory_path() /
+            "water_structure_cpp_large_fill.mcfunction";
+        {
+            std::ofstream large_file(large_mcfunction_path, std::ios::binary | std::ios::trunc);
+            large_file << "fill 0 0 0 127 31 127 minecraft:stone\n";
+        }
+        const auto large_mcfunction = water_structure::FormatRegistry::open(
+            large_mcfunction_path, registry);
+        check(large_mcfunction.ok(), "large MCFunction fill parses without expansion");
+        check(large_mcfunction.value()->size().width == 128 &&
+                large_mcfunction.value()->size().height == 32 &&
+                large_mcfunction.value()->size().length == 128,
+            "large MCFunction fill dimensions");
+        check(large_mcfunction.value()->count_non_air_blocks().value() ==
+                static_cast<std::size_t>(128 * 32 * 128),
+            "large MCFunction fill non-air count");
+        std::size_t streamed_mcfunction_chunks = 0;
+        const std::array<water_structure::ChunkPos, 2> streamed_positions{{ {0, 0}, {7, 7} }};
+        const auto streamed = large_mcfunction.value()->visit_chunks(
+            streamed_positions,
+            [&](water_structure::ChunkPos, const water_structure::ChunkData& chunk) {
+                ++streamed_mcfunction_chunks;
+                check(!chunk.sub_chunks.empty(), "MCFunction streamed chunk has subchunk");
+                return water_structure::Result<void>::success();
+            });
+        check(streamed.ok() && streamed_mcfunction_chunks == 2, "MCFunction chunk streaming visitor");
+        std::filesystem::remove(large_mcfunction_path);
+
         const auto kbdx_path = write_kbdx_sample();
         const auto kbdx = water_structure::FormatRegistry::open(kbdx_path, registry);
         check(kbdx.ok() && kbdx.value()->id() == water_structure::StructureId::KBDX,

@@ -113,7 +113,7 @@ tracked individually in the status table as native fixtures become available.
 
 **Status:** implemented and verified by Release rebuild plus core tests.
 
-BDX, KBDX, MCFunction, RunAway, and IBImport keep decoded blocks in vectors. Their
+BDX, KBDX, RunAway, and IBImport keep decoded blocks in vectors. Their
 old materializers revisited the complete vector for every requested chunk batch.
 `ChunkBlockIndex` now lazily groups vector indices by world chunk and invalidates
 the grouping when an offset changes. Requested batches visit only their buckets,
@@ -128,6 +128,14 @@ The synthetic BDX fixture was run three times after the index change: `parse_ms`
 0.265ms, 0.239ms, 0.285ms (median 0.265ms), `get_chunks_ms` = 0.0097ms,
 0.0090ms, 0.0092ms. Dimensions were `8x9x10`, three entities were retained, and
 the checksum was `4392299447`.
+
+MCFunction no longer belongs to this vector-backed group. Its reader retains one
+compact command record per `setblock`/`fill` line and never expands a `fill`
+cuboid during parsing. Requested chunks replay only the intersecting portion of
+each command, and `visit_chunks()` materializes one chunk at a time. Reader memory
+therefore scales with command count rather than filled block volume. Exact
+non-air counting is evaluated chunk-by-chunk and cached, preserving overwrite and
+air-clearing semantics without constructing the full structure.
 
 ### OPT-005: Streaming chunk and entity visitors
 
