@@ -10,9 +10,9 @@ The project now provides three consumption layers:
   [`include/WaterStructure/c_api.h`](include/WaterStructure/c_api.h). The ABI
   uses opaque handles, UTF-8 paths, integer result codes, and a context-owned
   error string; C++ STL types and exceptions never cross the DLL boundary.
-- `python/`: a dependency-free `ctypes` wrapper. Set
-  `WATER_STRUCTURE_LIBRARY` to the built DLL, or place the DLL beside the
-  module, then use `Context.inspect()`, `Context.convert()`, and
+- `python/`: a dependency-free `ctypes` wrapper. The PyPI wheel bundles the
+  DLL and assets; source-tree users can set `WATER_STRUCTURE_LIBRARY` to a
+  locally built DLL. Use `Context.inspect()`, `Context.convert()`, and
   `Context.to_world()`.
 
 Build the native targets with:
@@ -21,16 +21,34 @@ Build the native targets with:
 xmake build -m release water_structure water_structure_shared water_structure_cli
 ```
 
-The Python wrapper expects the runtime mapping assets. Pass the assets
-directory explicitly when it is not under the current working directory:
+Install the prebuilt Windows x64 wheel from PyPI with:
+
+```text
+python -m pip install water-structure
+```
+
+The installed package automatically locates its bundled runtime assets:
 
 ```python
 from water_structure import Context
 
-ctx = Context(r"D:\Projects\WaterStructureCpp\assets")
-info = ctx.inspect(r"D:\import\input.bdx")
-ctx.convert(r"D:\import\input.bdx", "SchemV1", r"D:\import\output.schem")
+with Context() as ctx:
+    info = ctx.inspect(r"D:\import\input.bdx")
+    ctx.convert(r"D:\import\input.bdx", "SchemV1", r"D:\import\output.schem")
 ```
+
+To build and validate a wheel locally, install `build` and `twine`, then run:
+
+```powershell
+python -m pip install build twine
+.\python\build_wheel.ps1
+python -m twine check .\dist\python\*.whl
+```
+
+Use `.\python\publish.ps1 -TestPyPI` for a TestPyPI upload and
+`.\python\publish.ps1` only after the TestPyPI installation test succeeds.
+The first release supports Python 3.9+ on Windows x64. Package and native
+versions must be updated together in `python/pyproject.toml` and `ws_version()`.
 
 For CMake consumers, configure with `-DWATER_STRUCTURE_BUILD_SHARED=ON`, then
 install the package. The install tree exports `WaterStructure::water_structure`
@@ -96,13 +114,31 @@ xmake run water_structure_tests
 
 ## CLI
 
+直接双击或无参数运行 `water_structure_cli.exe` 会进入中文交互向导，和 Go 版一样
+逐步提示源文件、自动检测格式、选择目标格式、输出路径、线程数以及世界坐标。路径
+可以直接从资源管理器拖入控制台；任何步骤输入 `q` 都可以退出。
+
 ```text
-inspect <input>
-to-world <input> <world-or-mcworld>
-convert <input> --format <target> --output <path> [--threads <count>]
+water_structure_cli formats [--writers-only]
+water_structure_cli inspect <input>
+water_structure_cli convert <input> <output> [--format <target>] [--threads <count>]
+water_structure_cli to-world <input> <world-or-mcworld> [--start <x,y,z>]
 ```
 
-仅当目标格式存在已实现且已验证的 writer 时，`convert` 才允许输出。
+CLI 参考 Go 版任意结构转换流程：自动识别输入格式、检查目标 writer capability、
+创建输出目录并报告耗时。目标扩展名唯一时可以省略 `--format`：
+
+```powershell
+water_structure_cli convert input.bdx output.mcstructure
+water_structure_cli convert input.mcworld output.bdx --threads 4
+# .schem 同时对应 V1/V2，必须明确版本：
+water_structure_cli convert input.bdx output.schem --format SchemV1
+water_structure_cli to-world input.schem output.mcworld --start 0,-4,0
+```
+
+旧的 `convert <input> --format <target> --output <path>` 参数形式继续兼容。仅当目标
+格式存在已实现且已验证的 writer 时，`convert` 才允许输出；`formats --writers-only`
+可以查看当前可用目标。
 
 MCFunction writer 按 chunk 批次流式读取，只输出非空气方块，并用不超过 32,768
 方块的 `fill` 命令清空结构范围以保留空气和尺寸。由于 MCFunction 没有统一的

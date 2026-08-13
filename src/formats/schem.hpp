@@ -24,6 +24,10 @@ public:
     void set_offset(BlockPos offset) noexcept override;
 
     Result<void> read(const std::filesystem::path& path) override;
+    // World-import callers consume BlockData sequentially and do not need the
+    // random-access row/checkpoint index.  Allow that path to defer the
+    // validation/index pass so opening a large Schem does not scan it twice.
+    void set_streaming_world_import(bool enabled) noexcept { mStreamingWorldImport = enabled; }
     Result<ChunkMap> get_chunks(std::span<const ChunkPos> positions) const override;
     Result<void> visit_chunks(std::span<const ChunkPos> positions, const ChunkVisitor& visitor) const override;
     Result<NbtChunkMap> get_chunk_nbt(std::span<const ChunkPos> positions) const override;
@@ -42,12 +46,15 @@ private:
     std::vector<std::uint64_t> mRowOffsets;
     std::vector<std::uint16_t> mChunkOffsets;
     std::size_t mBlockCount = 0;
+    std::size_t mNonAirCount = 0;
     std::size_t mBlockDataBytes = 0;
     std::size_t mChunkOffsetCount = 0;
     std::uint32_t mMaxPaletteIndex = 0;
     std::unordered_map<std::uint32_t, std::uint32_t> mPalette;
     std::vector<std::uint32_t> mDensePalette;
     std::uint32_t mUnknownRuntimeId = 0;
+    bool mNonAirCountValid = false;
+    bool mStreamingWorldImport = false;
 };
 
 } // namespace water_structure

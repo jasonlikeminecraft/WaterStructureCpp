@@ -52,6 +52,35 @@ public:
     }
     bool read_varint_u32(std::uint32_t& result)
     {
+        // The Schem palette is normally compact: the overwhelming majority of
+        // indices fit in one byte.  Decode directly from the current buffer
+        // for that case and for complete multi-byte varints.  Only a varint
+        // crossing the buffer boundary takes the checked fallback below.
+        if (mPosition < mSize) {
+            const auto remaining = mSize - mPosition;
+            const auto* bytes = reinterpret_cast<const std::uint8_t*>(mBuffer.data()) + mPosition;
+            const auto first = bytes[0];
+            if ((first & 0x80u) == 0) {
+                result = first;
+                ++mPosition;
+                return true;
+            }
+            if (remaining >= 5) {
+                std::uint64_t value = first & 0x7fu;
+                int shift = 7;
+                for (std::size_t index = 1; index < 5; ++index, shift += 7) {
+                    const auto byte = bytes[index];
+                    value |= static_cast<std::uint64_t>(byte & 0x7fu) << shift;
+                    if ((byte & 0x80u) == 0) {
+                        if (value > std::numeric_limits<std::uint32_t>::max()) return false;
+                        result = static_cast<std::uint32_t>(value);
+                        mPosition += index + 1;
+                        return true;
+                    }
+                }
+                return false;
+            }
+        }
         std::uint64_t value = 0;
         int shift = 0;
         for (;;) {
@@ -221,9 +250,11 @@ void SchemStructure::release_block_data() noexcept
     mRowOffsets.clear();
     mChunkOffsets.clear();
     mBlockCount = 0;
+    mNonAirCount = 0;
     mBlockDataBytes = 0;
     mChunkOffsetCount = 0;
     mMaxPaletteIndex = 0;
+    mNonAirCountValid = false;
 }
 
 void SchemStructure::set_offset(BlockPos offset) noexcept
@@ -295,7 +326,7 @@ Result<void> SchemStructure::read(const std::filesystem::path& path)
         auto read_data = [&]() -> Result<void> {
             std::int32_t length = 0; reader.read_num(length);
             if (length < 0) return Result<void>::failure("Schem BlockData 长度无效");
-            const auto build_index = !has_data &&
+            const auto build_index = !has_data && !mStreamingWorldImport &&
                 mOriginalSize.width > 0 && mOriginalSize.height > 0 && mOriginalSize.length > 0;
             const auto width = static_cast<std::size_t>(mOriginalSize.width);
             const auto rows = static_cast<std::size_t>(mOriginalSize.height) *
@@ -307,6 +338,13 @@ Result<void> SchemStructure::read(const std::filesystem::path& path)
             std::uint64_t encoded_offset = 0;
             std::uint64_t value = 0;
             int shift = 0;
+            // When the palette precedes BlockData (the normal Schem layout),
+            // count non-air values while the index pass is already decoding
+            // them.  This makes inspect() reuse the same scan instead of
+            // opening and decoding the temporary stream a second time.
+            const auto* indexed_dense_palette =
+                mDensePalette.empty() ? nullptr : mDensePalette.data();
+            const auto air_runtime_id = mRegistry.air_runtime_id();
             if (build_index) {
                 mChunkOffsetCount = (width + kIndexStride - 1) / kIndexStride;
                 mRowOffsets.resize(rows);
@@ -342,6 +380,10 @@ Result<void> SchemStructure::read(const std::filesystem::path& path)
                                 return Result<void>::failure("Schem varint 超出 uint32 范围");
                             indexed_max_palette_index = std::max(
                                 indexed_max_palette_index, static_cast<std::uint32_t>(value));
+                            if (indexed_dense_palette && value < mDensePalette.size() &&
+                                indexed_dense_palette[value] != air_runtime_id) {
+                                ++mNonAirCount;
+                            }
                             value = 0;
                             shift = 0;
                             ++position;
@@ -364,6 +406,7 @@ Result<void> SchemStructure::read(const std::filesystem::path& path)
                 if (position != expected_count || row != rows || x != 0)
                     return Result<void>::failure("Schem BlockData 方块数与 size 不一致");
                 index_built_during_read = true;
+                mNonAirCountValid = indexed_dense_palette != nullptr;
             }
             has_data = true;
             return Result<void>::success();
@@ -382,6 +425,13 @@ Result<void> SchemStructure::read(const std::filesystem::path& path)
                     has_size = true;
                 } else if (key == "Palette" && type == nbt::tag_type::Compound) {
                     auto parsed = parse_palette(reader.read_payload(type)); if (!parsed) return parsed;
+                } else if (key == "Blocks" && type == nbt::tag_type::Compound && !blocks_payload &&
+                           mFormat == StructureId::SchemV1) {
+                    // Reject the other Schem version before consuming its
+                    // potentially enormous nested BlockData payload.  The
+                    // registry probes V1 before V2, so this keeps a V2 file
+                    // from being fully decompressed twice.
+                    return Result<void>::failure("SchemV1 使用了 Blocks/Data 结构");
                 } else if ((key == "BlockData" && type == nbt::tag_type::Byte_Array && !blocks_payload) ||
                            (key == "Data" && type == nbt::tag_type::Byte_Array && blocks_payload)) {
                     auto parsed = read_data(); if (!parsed) return parsed;
@@ -425,7 +475,8 @@ Result<void> SchemStructure::read(const std::filesystem::path& path)
             return Result<void>::failure("SchemV2 缺少 Blocks/Data");
         raw.close();
         mBlockCount = static_cast<std::size_t>(mOriginalSize.volume());
-        if (!index_built_during_read) {
+        if (!index_built_during_read &&
+            (!mStreamingWorldImport || mMaxPaletteIndex > std::numeric_limits<std::uint16_t>::max())) {
             EncodedReader encoded(mBlockDataPath);
             if (!encoded.good()) return Result<void>::failure("无法打开 Schem 临时 BlockData 文件");
             const auto width = static_cast<std::size_t>(mOriginalSize.width);
@@ -653,6 +704,7 @@ Result<NbtChunkMap> SchemStructure::get_chunk_nbt(std::span<const ChunkPos> posi
 
 Result<std::size_t> SchemStructure::count_non_air_blocks() const
 {
+    if (mNonAirCountValid) return Result<std::size_t>::success(mNonAirCount);
     EncodedReader encoded(mBlockDataPath);
     if (!encoded.good()) return Result<std::size_t>::failure("无法打开 Schem 临时 BlockData 文件");
     const auto* dense_palette = mDensePalette.empty() ? nullptr : mDensePalette.data();
@@ -812,6 +864,13 @@ Result<void> SchemStructure::write_to_world(WorldTarget& world, SubChunkPos star
                 for (std::size_t chunk_x = 0; chunk_x < chunk_x_count; ++chunk_x) callbacks.progress();
             }
         }
+    }
+    // The streaming read intentionally defers varint validation until this
+    // sequential pass.  Check that the expected block count consumed the
+    // complete byte array, preserving the extra-varint rejection behavior.
+    std::uint8_t trailing_byte = 0;
+    if (encoded.get(trailing_byte)) {
+        return Result<void>::failure("Schem BlockData 方块数超过 size");
     }
     if (profile) {
         std::cerr << "schem_world_profile decode_ms=" << decode_ms

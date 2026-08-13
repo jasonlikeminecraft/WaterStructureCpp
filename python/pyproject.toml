@@ -1,16 +1,48 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "water-structure"
 version = "0.1.0"
-description = "Python ctypes bindings for WaterStructureCpp"
+description = "Streaming Minecraft structure conversion powered by WaterStructureCpp"
+readme = "README.md"
 requires-python = ">=3.9"
+license = "AGPL-3.0-only"
+authors = [{ name = "jasonlikeminecraft" }]
+keywords = ["minecraft", "bedrock", "schematic", "schem", "bdx", "mcworld"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Operating System :: Microsoft :: Windows :: Windows 10",
+    "Operating System :: Microsoft :: Windows :: Windows 11",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+
+[project.urls]
+Homepage = "https://github.com/jasonlikeminecraft/WaterStructureCpp"
+Repository = "https://github.com/jasonlikeminecraft/WaterStructureCpp"
+Issues = "https://github.com/jasonlikeminecraft/WaterStructureCpp/issues"
 
 [tool.setuptools]
-packages = ["water_structure"]
-py-modules = ["water_structure"]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["water_structure*"]
+namespaces = true
 
 [tool.setuptools.package-data]
-water_structure = ["*.dll", "*.pyd", "assets/**/*", "assets/**"]
+water_structure = [
+    "*.dll",
+    "*.pyi",
+    "py.typed",
+    "assets/*.json",
+    "assets/*-LICENSE",
+    "assets/block_upgrade_schemas/*.json",
+]
+
+[tool.distutils.bdist_wheel]
+plat-name = "win_amd64"
