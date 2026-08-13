@@ -127,7 +127,7 @@ Release 构建在本机实测的端到端结果，数字用于比较转换器量
 | MCWorld → BDX | Kuudra，`188×175×185`，270.6 万非空气方块 | `.bdx` | 约 1.49 秒 | 约 152 MiB |
 | BDX → MCWorld | 同一 Kuudra BDX | 世界目录/`.mcworld` | 约 1.68 秒 | 约 159 MiB |
 | Schematic → MCWorld | `519×256×519`，1089 个 chunk | 世界目录/`.mcworld` | 约 3.6 秒 | 约 412 MiB |
-| SchemV1 → MCWorld | Flight，`2610×282×2615` | 世界目录 | 约 40 秒 | 约 161 MiB |
+| SchemV1 → MCWorld | Flight，`2610×282×2615` | 世界目录 | 约 29 秒 | 约 161 MiB |
 
 MCFunction 编码默认使用 2 个线程；在乌托邦样本上，1/2/3/4/8 个编码线程约为
 17.06/9.55/11.31/11.05/11.28 秒。该负载在 2 个线程后受内存带宽限制，因此

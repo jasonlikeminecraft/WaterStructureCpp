@@ -232,6 +232,16 @@ and should be used for sampled or small-fixture round trips, not every large
 writer iteration. `McWorldStructure` now overrides `visit_chunks()` to retain
 requested batches rather than falling back to one chunk per visitor call.
 
+### OPT-011: Native-layout Schem world stream
+
+The direct Schem-to-world path now emits each populated subchunk in native
+Bedrock `(x,y,z)` block order. This removes the adapter's second 4096-entry
+transpose before palette encoding while retaining the generic internal layout
+for other readers. On the Flight sample, a profiled Release run changed from
+approximately `decode=27.99s, materialize=11.54s, save=12.86s` to
+`decode=14.13s, materialize=5.32s, save=9.64s` (about 29s end-to-end in that
+run); the verification checksum remained `393687046530647`.
+
 ### OPT-010: Streaming BDX and bounded world batches
 
 **Status:** implemented and verified with generated and real Go BDX files.

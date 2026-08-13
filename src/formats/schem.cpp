@@ -651,6 +651,12 @@ Result<void> SchemStructure::write_to_world(WorldTarget& world, SubChunkPos star
         const auto found = mPalette.find(index);
         return found == mPalette.end() ? mUnknownRuntimeId : found->second;
     };
+    std::vector<std::uint8_t> palette_non_air(
+        static_cast<std::size_t>(mMaxPaletteIndex) + 1, 1);
+    for (std::size_t index = 0; index < palette_non_air.size(); ++index) {
+        palette_non_air[index] = runtime_id_for(static_cast<std::uint32_t>(index)) !=
+            air_runtime_id;
+    }
     if (callbacks.start) callbacks.start(total_chunks);
 
     const bool profile = std::getenv("WATER_STRUCTURE_PROFILE") != nullptr;
@@ -674,15 +680,25 @@ Result<void> SchemStructure::write_to_world(WorldTarget& world, SubChunkPos star
 
     const auto plane_size = width * length;
     std::vector<std::uint16_t> slab(plane_size * 16);
+    std::vector<std::uint8_t> slab_non_air(chunk_x_count * chunk_z_count);
     for (std::size_t slab_y = 0; slab_y < height; slab_y += 16) {
         const auto layer_count = std::min<std::size_t>(16, height - slab_y);
         const auto decode_start = std::chrono::steady_clock::now();
-        for (std::size_t index = 0; index < plane_size * layer_count; ++index) {
-            std::uint32_t palette_index = 0;
-            if (!read_encoded_index(encoded, palette_index) || palette_index > mMaxPaletteIndex) {
-                return Result<void>::failure("Schem BlockData varint 读取失败或 palette 索引越界");
+        std::fill(slab_non_air.begin(), slab_non_air.end(), 0);
+        std::size_t slab_index = 0;
+        for (std::size_t local_y = 0; local_y < layer_count; ++local_y) {
+            for (std::size_t source_z = 0; source_z < length; ++source_z) {
+                for (std::size_t source_x = 0; source_x < width; ++source_x, ++slab_index) {
+                    std::uint32_t palette_index = 0;
+                    if (!read_encoded_index(encoded, palette_index) || palette_index > mMaxPaletteIndex) {
+                        return Result<void>::failure("Schem BlockData varint 读取失败或 palette 索引越界");
+                    }
+                    slab[slab_index] = static_cast<std::uint16_t>(palette_index);
+                    if (palette_non_air[palette_index]) {
+                        slab_non_air[(source_z / 16) * chunk_x_count + source_x / 16] = 1;
+                    }
+                }
             }
-            slab[index] = static_cast<std::uint16_t>(palette_index);
         }
         decode_ms += elapsed_ms(decode_start);
 
@@ -700,12 +716,12 @@ Result<void> SchemStructure::write_to_world(WorldTarget& world, SubChunkPos star
             std::vector<ChunkWrite> writes;
             writes.reserve(chunk_x_count);
             for (std::size_t chunk_x = 0; chunk_x < chunk_x_count; ++chunk_x) {
+                if (!slab_non_air[chunk_z * chunk_x_count + chunk_x]) continue;
                 const auto source_x_begin = chunk_x * 16;
                 const auto source_x_end = std::min(width, source_x_begin + 16);
                 SubChunkData sub_chunk;
                 sub_chunk.layer0.fill(air_runtime_id);
                 sub_chunk.layer1.fill(air_runtime_id);
-                bool has_non_air = false;
                 for (std::size_t local_y = 0; local_y < layer_count; ++local_y) {
                     for (std::size_t local_z = 0; local_z < source_z_count; ++local_z) {
                         const auto source_z = source_z_begin + local_z;
@@ -714,18 +730,21 @@ Result<void> SchemStructure::write_to_world(WorldTarget& world, SubChunkPos star
                             const auto runtime_id = runtime_id_for(slab[row_offset + source_x]);
                             if (runtime_id == air_runtime_id) continue;
                             const auto local_x = source_x - source_x_begin;
-                            sub_chunk.layer0[(local_y * 16 + local_z) * 16 + local_x] = runtime_id;
-                            has_non_air = true;
+                            // BedrockWorldAdapter can consume the native
+                            // x/y/z layout directly.  Producing it here
+                            // avoids a second 4096-entry transpose for every
+                            // populated subchunk during world encoding.
+                            sub_chunk.layer0[local_x * 256 + local_y * 16 + local_z] = runtime_id;
                         }
                     }
                 }
-                if (!has_non_air) continue;
                 if (verify) {
                     verification_checksum += static_cast<std::uint32_t>(
                         static_cast<std::int32_t>(slab_y / 16) + kOverworldMinY / 16);
                     for (const auto runtime_id : sub_chunk.layer0) verification_checksum += runtime_id;
                     for (const auto runtime_id : sub_chunk.layer1) verification_checksum += runtime_id;
                 }
+                chunks[chunk_x].layout = BlockLayerLayout::Native;
                 chunks[chunk_x].sub_chunks.emplace(target_sub_y, std::move(sub_chunk));
                 writes.push_back({
                     {
