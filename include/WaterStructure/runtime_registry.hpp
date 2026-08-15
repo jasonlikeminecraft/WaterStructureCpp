@@ -30,6 +30,13 @@ public:
     ) const;
     std::optional<std::uint32_t> find_compatible(BlockState state) const;
     std::optional<BlockState> state(std::uint32_t runtime_id) const;
+    // Applies the loaded block-upgrade schemas to a decoded state, mirroring
+    // what register_state() does internally. Returns the state unchanged when
+    // no upgrade schemas are loaded.
+    BlockState upgrade_state(BlockState state) const;
+    // Resolve a Bedrock world decoder ID directly through BWO when it is not
+    // present in this registry's static mapping table.
+    std::optional<BlockState> resolve_state(std::uint32_t runtime_id) const;
     std::optional<BlockState> java_state(std::uint32_t runtime_id) const;
     std::unordered_map<std::uint32_t, BlockState> java_states_snapshot() const;
 

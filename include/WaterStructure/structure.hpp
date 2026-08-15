@@ -60,6 +60,19 @@ using NbtChunkMap = std::unordered_map<ChunkPos, std::vector<BlockEntity>, Chunk
 using ChunkVisitor = std::function<Result<void>(ChunkPos, const ChunkData&)>;
 using ChunkNbtVisitor = std::function<Result<void>(ChunkPos, std::span<const BlockEntity>)>;
 
+// Palette-preserving view of one subchunk. `sub_y` is the structure-local
+// subchunk Y (floor_div(y - 64, 16)); `indices` are in Bedrock native (x,y,z)
+// order: index = x*256 + y*16 + z. Indices are a moveable vector so the data
+// can flow decode -> adapter -> structure -> writer without array copies.
+struct SubChunkPaletteData {
+    std::int32_t sub_y = 0;
+    std::vector<BlockState> palette;
+    std::vector<std::uint16_t> indices; // 4096 entries, native (x,y,z) order
+};
+
+using ChunkPaletteVisitor =
+    std::function<Result<void>(ChunkPos, std::span<const SubChunkPaletteData>)>;
+
 struct ConversionCallbacks {
     std::function<void(std::size_t)> start;
     std::function<void()> progress;
@@ -121,6 +134,18 @@ public:
     }
     // Allows streaming consumers to release source-side chunk caches between batches.
     virtual void release_cached_chunks() const noexcept {}
+    // Palette streaming extension: readers that can decode subchunk palettes
+    // without materializing per-block runtime IDs or BlockState objects (e.g.
+    // MCWorld) override this to feed writers directly. States are returned as
+    // decoded; consumers apply the block-upgrade schemas once per distinct
+    // state. The default reports "unsupported"; writers fall back to
+    // get_chunks()/get_chunks_layer0().
+    virtual Result<void> visit_chunk_palettes(
+        std::span<const ChunkPos> positions,
+        const ChunkPaletteVisitor& visitor) const {
+        if (!visitor) return Result<void>::failure("chunk palette visitor is empty");
+        return Result<void>::failure("此格式不支持 palette 流式读取");
+    }
     virtual Result<NbtChunkMap> get_chunk_nbt(std::span<const ChunkPos> positions) const = 0;
     virtual Result<std::size_t> count_non_air_blocks() const = 0;
     virtual Result<void> write_to_world(WorldTarget& world, SubChunkPos start, ConversionCallbacks callbacks) const = 0;

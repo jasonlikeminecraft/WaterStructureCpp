@@ -175,6 +175,65 @@ Result<void> McWorldStructure::visit_chunks(
     return Result<void>::success();
 }
 
+Result<void> McWorldStructure::visit_chunk_palettes(
+    std::span<const ChunkPos> positions,
+    const ChunkPaletteVisitor& visitor) const
+{
+    if (!visitor) return Result<void>::failure("chunk palette visitor is empty");
+    // The palette fast path serves grid-aligned selections without an offset.
+    // Anything else keeps the generic materialized get_chunks() path; the
+    // writer falls back to it when this returns failure.
+    if (mOffset != BlockPos{} ||
+        floor_mod(mMin.x, 16) != 0 ||
+        floor_mod(mMin.y, 16) != 0 ||
+        floor_mod(mMin.z, 16) != 0) {
+        return Result<void>::failure(
+            "MCWorld palette 快速路径要求选区与 16 对齐且无 offset");
+    }
+    if (!mWorld) return Result<void>::failure("MCWorld 尚未打开");
+    const auto source_chunk_base_x = floor_div(mMin.x, 16);
+    const auto source_chunk_base_z = floor_div(mMin.z, 16);
+    const auto sub_y_delta = floor_div(mMin.y + 64, 16);
+    const auto min_sub_y = floor_div(mMin.y, 16);
+    const auto max_sub_y = floor_div(mMax.y, 16);
+
+    const bool profile = std::getenv("WATER_STRUCTURE_PROFILE") != nullptr;
+    double load_ms = 0.0;
+    std::size_t loaded_subchunks = 0;
+
+    for (const auto local_pos : positions) {
+        const ChunkPos source_pos{
+            source_chunk_base_x + local_pos.x,
+            source_chunk_base_z + local_pos.z
+        };
+        const auto load_start = Clock::now();
+        auto loaded = mWorld->load_chunk_palettes(source_pos, min_sub_y, max_sub_y);
+        if (!loaded) return Result<void>::failure(loaded.error());
+        load_ms += elapsed_ms(load_start);
+        std::vector<SubChunkPaletteData> subchunks;
+        for (std::int32_t sub_y = min_sub_y; sub_y <= max_sub_y; ++sub_y) {
+            auto& slot = loaded.value()[
+                static_cast<std::size_t>(sub_y - min_sub_y)];
+            if (!slot) continue;
+            // States are returned as decoded; consumers apply the block-upgrade
+            // schemas once per distinct state (see the MCFunction writer).
+            SubChunkPaletteData data;
+            data.sub_y = sub_y - sub_y_delta;
+            data.palette = std::move(slot->palette);
+            data.indices = std::move(slot->indices);
+            subchunks.push_back(std::move(data));
+            ++loaded_subchunks;
+        }
+        auto visited = visitor(local_pos, subchunks);
+        if (!visited) return visited;
+    }
+    if (profile) {
+        std::cerr << "mcworld_palette_profile load_ms=" << load_ms
+                  << " subchunks=" << loaded_subchunks << '\n';
+    }
+    return Result<void>::success();
+}
+
 Result<ChunkMap> McWorldStructure::get_chunks_impl(
     std::span<const ChunkPos> positions,
     bool include_layer1) const

@@ -478,6 +478,104 @@ Result<std::optional<std::vector<std::uint8_t>>> BedrockWorldAdapter::load_subch
         std::move(loaded.value));
 }
 
+namespace {
+
+BlockState internal_state(const BedrockWorldOperator::BlockState& decoded)
+{
+    BlockState result;
+    result.name = decoded.name;
+    result.version = decoded.version;
+    result.states.reserve(decoded.states.size());
+    for (const auto& property : decoded.states) {
+        BlockStateProperty item;
+        item.name = property.name;
+        switch (property.type) {
+        case BedrockWorldOperator::BlockStateValueType::Byte:
+            item.type = BlockStateValueType::Byte;
+            item.value = std::to_string(static_cast<std::int8_t>(property.intValue));
+            break;
+        case BedrockWorldOperator::BlockStateValueType::Short:
+            item.type = BlockStateValueType::Short;
+            item.value = std::to_string(static_cast<std::int16_t>(property.intValue));
+            break;
+        case BedrockWorldOperator::BlockStateValueType::Long:
+            item.type = BlockStateValueType::Long;
+            item.value = std::to_string(property.intValue);
+            break;
+        case BedrockWorldOperator::BlockStateValueType::String:
+            item.type = BlockStateValueType::String;
+            item.value = property.stringValue;
+            break;
+        default:
+            item.type = BlockStateValueType::Int;
+            item.value = std::to_string(static_cast<std::int32_t>(property.intValue));
+            break;
+        }
+        result.states.push_back(std::move(item));
+    }
+    return result;
+}
+
+} // namespace
+
+Result<std::optional<DecodedStateSubChunk>> BedrockWorldAdapter::load_subchunk_palette(
+    SubChunkPos pos) const
+{
+    if (!valid()) {
+        return Result<std::optional<DecodedStateSubChunk>>::failure("世界未打开");
+    }
+    auto loaded = mWorld->loadSubChunkPalette(
+        BedrockWorldOperator::Dimension::Overworld,
+        { pos.x, pos.y, pos.z });
+    if (!loaded) {
+        return Result<std::optional<DecodedStateSubChunk>>::failure(loaded.error);
+    }
+    if (!loaded.value) {
+        return Result<std::optional<DecodedStateSubChunk>>::success(std::nullopt);
+    }
+    DecodedStateSubChunk result;
+    result.palette.reserve(loaded.value->palette.size());
+    for (const auto& state : loaded.value->palette) {
+        result.palette.push_back(internal_state(state));
+    }
+    result.indices.assign(loaded.value->indices.begin(), loaded.value->indices.end());
+    return Result<std::optional<DecodedStateSubChunk>>::success(std::move(result));
+}
+
+Result<std::vector<std::optional<DecodedStateSubChunk>>> BedrockWorldAdapter::load_chunk_palettes(
+    ChunkPos pos,
+    std::int32_t min_sub_y,
+    std::int32_t max_sub_y) const
+{
+    if (!valid()) {
+        return Result<std::vector<std::optional<DecodedStateSubChunk>>>::failure("世界未打开");
+    }
+    if (min_sub_y > max_sub_y) {
+        return Result<std::vector<std::optional<DecodedStateSubChunk>>>::success({});
+    }
+    auto loaded = mWorld->loadSubChunkPalettes(
+        BedrockWorldOperator::Dimension::Overworld,
+        { pos.x, pos.z },
+        min_sub_y,
+        max_sub_y);
+    if (!loaded) {
+        return Result<std::vector<std::optional<DecodedStateSubChunk>>>::failure(loaded.error);
+    }
+    std::vector<std::optional<DecodedStateSubChunk>> result(
+        static_cast<std::size_t>(max_sub_y - min_sub_y + 1));
+    for (auto& [sub_y, decoded] : loaded.value) {
+        auto& slot = result[static_cast<std::size_t>(sub_y - min_sub_y)];
+        DecodedStateSubChunk data;
+        data.palette.reserve(decoded.palette.size());
+        for (const auto& state : decoded.palette) {
+            data.palette.push_back(internal_state(state));
+        }
+        data.indices.assign(decoded.indices.begin(), decoded.indices.end());
+        slot = std::move(data);
+    }
+    return Result<std::vector<std::optional<DecodedStateSubChunk>>>::success(std::move(result));
+}
+
 Result<void> BedrockWorldAdapter::save_subchunk_payloads(
     std::vector<EncodedSubChunkData> subchunks)
 {

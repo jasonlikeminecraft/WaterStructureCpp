@@ -12,6 +12,9 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <atomic>
+#include <mutex>
+#include <thread>
 #include <vector>
 
 #if defined(_WIN32)
@@ -215,23 +218,66 @@ class Progress {
 public:
     explicit Progress(bool quiet) : mQuiet(quiet) {}
 
+    ~Progress() { end_busy(); }
+
     void start(std::size_t total)
     {
+        end_busy();
+        std::lock_guard lock(mMutex);
         mTotal = total;
         mDone = 0;
         mLastPercent = -1;
+        mBegin = Clock::now();
+        mIndeterminate = false;
+        render(true);
+    }
+
+    void stage(std::string_view label, bool indeterminate = false)
+    {
+        std::lock_guard lock(mMutex);
+        mLabel.assign(label);
+        mIndeterminate = indeterminate;
         render(true);
     }
 
     void advance()
     {
+        std::lock_guard lock(mMutex);
         ++mDone;
         render(false);
     }
 
+    // Keep the terminal alive while a writer is doing a long blocking pass.
+    // Writers which do not expose fine-grained callbacks still get an
+    // updating elapsed/ETA line instead of a frozen prompt.
+    void begin_busy()
+    {
+        if (mQuiet || mBusy.exchange(true)) return;
+        mStopBusy = false;
+        mBusyThread = std::thread([this] {
+            while (!mStopBusy.load()) {
+                {
+                    std::lock_guard lock(mMutex);
+                    render(true);
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(250));
+            }
+        });
+    }
+
+    void end_busy()
+    {
+        if (!mBusy.exchange(false)) return;
+        mStopBusy = true;
+        if (mBusyThread.joinable()) mBusyThread.join();
+    }
+
     void finish()
     {
+        end_busy();
+        std::lock_guard lock(mMutex);
         if (mQuiet || mTotal == 0) return;
+        mIndeterminate = false;
         mDone = mTotal;
         render(true);
         std::cout << '\n';
@@ -241,6 +287,15 @@ private:
     void render(bool force)
     {
         if (mQuiet || mTotal == 0) return;
+        if (mIndeterminate) {
+            static constexpr std::string_view spinner = "-\\|/";
+            const auto elapsed = std::chrono::duration<double>(Clock::now() - mBegin).count();
+            const auto frame = static_cast<std::size_t>(elapsed * 4.0) % spinner.size();
+            std::cout << "\r[" << spinner[frame] << "] " << mLabel
+                      << " elapsed " << std::fixed << std::setprecision(1) << elapsed
+                      << "s ETA n/a" << std::flush;
+            return;
+        }
         const auto percent = static_cast<int>(mDone * 100 / mTotal);
         if (!force && percent == mLastPercent) return;
         mLastPercent = percent;
@@ -248,13 +303,32 @@ private:
         const auto filled = percent * width / 100;
         std::cout << "\r[";
         for (int i = 0; i < width; ++i) std::cout << (i < filled ? '#' : '-');
-        std::cout << "] " << std::setw(3) << percent << "% " << mDone << '/' << mTotal << std::flush;
+        const auto elapsed = std::chrono::duration<double>(Clock::now() - mBegin).count();
+        const auto eta = (mDone > 0 && mDone < mTotal)
+            ? elapsed * static_cast<double>(mTotal - mDone) / static_cast<double>(mDone)
+            : 0.0;
+        std::cout << "] " << std::setw(3) << percent << "% " << mDone << '/' << mTotal
+                  << " " << mLabel
+                  << " elapsed " << std::fixed << std::setprecision(1) << elapsed << "s";
+        if (mDone > 0 && mDone < mTotal) {
+            std::cout << " ETA " << std::fixed << std::setprecision(1) << eta << "s";
+        } else if (mDone == 0) {
+            std::cout << " ETA calculating...";
+        }
+        std::cout << std::flush;
     }
 
     bool mQuiet = false;
     std::size_t mTotal = 0;
     std::size_t mDone = 0;
     int mLastPercent = -1;
+    Clock::time_point mBegin = Clock::now();
+    std::mutex mMutex;
+    std::atomic_bool mBusy = false;
+    std::atomic_bool mStopBusy = false;
+    std::thread mBusyThread;
+    std::string mLabel = "处理中";
+    bool mIndeterminate = false;
 };
 
 int list_formats(bool writers_only)
@@ -358,11 +432,23 @@ int convert_file(
         return kInputError;
     }
     const auto begin = Clock::now();
+    Progress progress(common.quiet);
+    // Conversion writers currently expose no per-block callback.  Treat the
+    // operation as two measurable stages (open and write); while the write
+    // stage is active the background refresh keeps elapsed time visible and
+    // estimates its remaining duration from the completed open stage.
+    progress.start(2);
+    progress.stage("读取");
     auto opened = water_structure::FormatRegistry::open(input, registry);
     if (!opened) { std::cerr << "error: " << opened.error() << '\n'; return kInputError; }
+    progress.advance();
+    progress.stage("写入", true);
+    progress.begin_busy();
     auto written = water_structure::FormatRegistry::write(
         *opened.value(), *format, output, registry, {threads, 0});
+    progress.end_busy();
     if (!written) { std::cerr << "error: " << written.error() << '\n'; return kConversionError; }
+    progress.finish();
     const auto seconds = std::chrono::duration<double>(Clock::now() - begin).count();
     if (!common.quiet) {
         std::cout << "converted " << opened.value()->name() << " -> "
@@ -391,6 +477,7 @@ int to_world(
     auto world = water_structure::BedrockWorldAdapter::open(output);
     if (!world) { std::cerr << "error: " << world.error() << '\n'; return kInputError; }
     Progress progress(common.quiet);
+    progress.stage("写入世界");
     const auto begin = Clock::now();
     auto converted = opened.value()->write_to_world(
         world.value(), start,
@@ -445,6 +532,8 @@ int interactive(const std::filesystem::path& executable)
                  " WaterStructureCpp 结构转换器\n"
                  "========================================\n"
                  "输入 q 可随时退出。路径可以直接拖入窗口。\n\n";
+
+    for (;;) {
 
     const auto source_text = prompt("请输入源结构文件路径");
     if (source_text.empty() || lower(source_text) == "q") return 0;
@@ -521,7 +610,10 @@ int interactive(const std::filesystem::path& executable)
             return kUsageError;
         }
         std::cout << "\n正在写入世界……\n";
-        return to_world(source, output, start, executable, common);
+        const auto result = to_world(source, output, start, executable, common);
+        if (result == 0) std::cout << "本次转换完成，可以继续处理其他文件。\n\n";
+        else std::cerr << "本次转换失败，可以继续处理其他文件。\n\n";
+        continue;
     }
 
     std::size_t threads = 0;
@@ -533,7 +625,10 @@ int interactive(const std::filesystem::path& executable)
         return kUsageError;
     }
     std::cout << "\n正在转换 " << detected.value().name << " -> " << target->name << "……\n";
-    return convert_file(source, output, target->id, threads, executable, common);
+    const auto result = convert_file(source, output, target->id, threads, executable, common);
+    if (result == 0) std::cout << "本次转换完成，可以继续处理其他文件。\n\n";
+    else std::cerr << "本次转换失败，可以继续处理其他文件。\n\n";
+    }
 }
 
 } // namespace

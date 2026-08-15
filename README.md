@@ -128,6 +128,11 @@ water_structure_cli to-world <input> <world-or-mcworld> [--start <x,y,z>]
 CLI 参考 Go 版任意结构转换流程：自动识别输入格式、检查目标 writer capability、
 创建输出目录并报告耗时。目标扩展名唯一时可以省略 `--format`：
 
+转换时默认显示实时进度、已用时间和预计剩余时间（ETA）。对于暂未提供细粒度
+回调的 writer，CLI 会在写入阶段显示旋转指示器并每 250ms 刷新一次真实已用时间；
+这类阶段的 ETA 会标记为 `n/a`，不会伪造 50% 之类的进度。`--quiet` 可以关闭这些
+终端输出。
+
 ```powershell
 water_structure_cli convert input.bdx output.mcstructure
 water_structure_cli convert input.mcworld output.bdx --threads 4
@@ -141,10 +146,19 @@ water_structure_cli to-world input.schem output.mcworld --start 0,-4,0
 可以查看当前可用目标。
 
 MCFunction writer 按 chunk 批次流式读取，只输出非空气方块，并用不超过 32,768
-方块的 `fill` 命令清空结构范围以保留空气和尺寸。由于 MCFunction 没有统一的
-Bedrock 方块实体协议，遇到方块实体 NBT 时会明确报错，不会静默丢弃。
+方块的 `fill` 命令清空结构范围以保留空气和尺寸。MCFunction 没有统一的
+Bedrock 方块实体协议，因此方块实体 NBT 会按约定跳过，不会静默改写。
 MCFunction 默认使用 2 个编码线程；`--threads 1` 可关闭并行，显式指定更高线程数
 可用于按目标机器重新测量，但内存带宽受限的大型世界并不一定更快。
+
+MCWorld 输入走专用的 palette 流式路径：库新增了 `visit_chunk_palettes()`
+（`SubChunkPaletteData`：子区块 palette + 4096 个 native `(x,y,z)` 索引）和
+`BedrockWorldAdapter::load_subchunk_palette()`。MCFunction writer 直接从
+palette 读取方块状态——每个不同状态只升级并格式化一次（转换期内按状态签名
+缓存），再按 indices 扫描生成 `fill`/`setblock`，完全跳过内部 runtime ID 映射和
+逐方块状态反查；其他格式仍走通用的 `get_chunks_layer0()` 路径，行为不变。
+MCWorld 输入的加载（LevelDB 读取 + 子区块解码）由独立线程预取，与编码线程
+流水线重叠，避免单线程解码成为整条链路的瓶颈。
 
 MCFunction reader 同样采用有界流式路径：逐行解析后只保留紧凑的
 `setblock`/`fill` 命令，不会把大 `fill` 展开为逐方块数组；下游按需请求 chunk 时
@@ -159,7 +173,7 @@ Release 构建在本机实测的端到端结果，数字用于比较转换器量
 | 转换方向 | 测试样本 | 输出 | 耗时 | 峰值私有内存 |
 | --- | --- | --- | ---: | ---: |
 | MCWorld → SchemV1 | 乌托邦，`2701×176×2701`，约 2.86 万 chunk 柱 | `.schem` | 约 29.3 秒 | 约 175 MiB（工作集约 348 MiB） |
-| MCWorld → MCFunction | 同上 | `.mcfunction` | 约 10.79 秒（写真实文件） | 约 154 MiB |
+| MCWorld → MCFunction | 同上 | `.mcfunction` | 约 13 秒（palette 流水线，本机复测；generic 路径约 16 秒） | 约 154 MiB |
 | MCWorld → BDX | Kuudra，`188×175×185`，270.6 万非空气方块 | `.bdx` | 约 1.49 秒 | 约 152 MiB |
 | BDX → MCWorld | 同一 Kuudra BDX | 世界目录/`.mcworld` | 约 1.68 秒 | 约 159 MiB |
 | Schematic → MCWorld | `519×256×519`，1089 个 chunk | 世界目录/`.mcworld` | 约 3.6 秒 | 约 412 MiB |
@@ -169,6 +183,10 @@ MCFunction 编码默认使用 2 个线程；在乌托邦样本上，1/2/3/4/8 �
 17.06/9.55/11.31/11.05/11.28 秒。该负载在 2 个线程后受内存带宽限制，因此
 线程越多不一定越快。其他 writer 当前主要受源文件解码、压缩或 LevelDB 写入速度
 限制，`--threads` 不会自动让所有格式线性加速。
+
+palette 流水线路径（MCWorld → MCFunction）相对通用路径的收益与输入状态多样性
+相关：状态单调的世界两者接近，状态多样的世界差距明显——chenshi 样本
+（`2716×278×2245`）上 palette 路径约 14 秒，而通用路径约 55 秒。
 
 已经支持的 JSON、MessagePack、NBT、BDX、IBImport、MCFunction 等格式都走相同的
 有界 chunk/subchunk 管线；但没有大型真实样本的格式目前只有最小 fixture 的测试

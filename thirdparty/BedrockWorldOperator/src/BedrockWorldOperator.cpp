@@ -562,6 +562,8 @@ public:
         mRuntimeCache.clear();
         mDiskStateRuntimeCache.clear();
         mDiskStateRuntimeCacheBytes = 0;
+        mDiskStateBlockCache.clear();
+        mDiskStateBlockCacheBytes = 0;
         mGeneration.fetch_add(1, std::memory_order_relaxed);
     }
 
@@ -735,6 +737,34 @@ public:
             : std::optional<uint32_t>(cached->second);
     }
 
+    // Caches decoded palette BlockStates by their raw encoded NBT bytes so
+    // palette-preserving decode can skip re-parsing repeated states.
+    std::optional<BedrockWorldOperator::BlockState> cachedDiskBlockState(
+        std::string_view encodedDiskState) {
+        std::lock_guard lock(mMutex);
+        const auto cached = mDiskStateBlockCache.find(encodedDiskState);
+        return cached == mDiskStateBlockCache.end()
+            ? std::nullopt
+            : std::optional<BedrockWorldOperator::BlockState>(cached->second);
+    }
+
+    void cacheDiskBlockState(
+        std::string_view encodedDiskState,
+        const BedrockWorldOperator::BlockState& state) {
+        std::lock_guard lock(mMutex);
+        if (mDiskStateBlockCache.size() >= kDiskStateRuntimeCacheEntryLimit ||
+            encodedDiskState.size() > kDiskStateRuntimeCacheEntrySizeLimit ||
+            encodedDiskState.size() > kDiskStateRuntimeCacheLimit -
+                std::min(kDiskStateRuntimeCacheLimit, mDiskStateBlockCacheBytes)) {
+            return;
+        }
+        auto [inserted, added] = mDiskStateBlockCache.emplace(
+            encodedDiskState, state);
+        if (added) {
+            mDiskStateBlockCacheBytes += inserted->first.size();
+        }
+    }
+
 private:
     struct TransparentStringHash {
         using is_transparent = void;
@@ -757,6 +787,12 @@ private:
         TransparentStringHash,
         std::equal_to<>> mDiskStateRuntimeCache;
     std::size_t mDiskStateRuntimeCacheBytes = 0;
+    std::unordered_map<
+        std::string,
+        BedrockWorldOperator::BlockState,
+        TransparentStringHash,
+        std::equal_to<>> mDiskStateBlockCache;
+    std::size_t mDiskStateBlockCacheBytes = 0;
     std::atomic<std::uint64_t> mGeneration{1};
 };
 
@@ -1484,6 +1520,143 @@ BedrockWorldOperator::BlockStateList decodeDiskSubChunkBlockStates(const std::ve
     return result;
 }
 
+// Consumes one paletted storage without materializing block states. Used to
+// skip layer-1+ storages while decoding a subchunk's layer-0 palette.
+void skipPalettedStorage(ByteReader& r) {
+    uint8_t bits = r.u8();
+    bits >>= 1;
+    if (bits == 0x7f) {
+        return;
+    }
+    if (!isValidPaletteBits(bits)) {
+        throw std::runtime_error("invalid palette bit width");
+    }
+    for (size_t i = 0; i < packedUint32Count(bits); ++i) {
+        (void)r.le32();
+    }
+    uint32_t paletteCount = 1;
+    if (bits != 0) {
+        const int32_t decodedPaletteCount = static_cast<int32_t>(r.le32());
+        if (decodedPaletteCount <= 0) {
+            throw std::runtime_error("empty palette");
+        }
+        paletteCount = static_cast<uint32_t>(decodedPaletteCount);
+    }
+    if (paletteCount == 0 || paletteCount > 4096) {
+        throw std::runtime_error("invalid palette size");
+    }
+    for (uint32_t i = 0; i < paletteCount; ++i) {
+        skipDiskBlockState(r);
+    }
+}
+
+// Decodes one layer-0 paletted storage into a palette plus packed indices.
+// indices are in native (x,y,z) order: index = x*256 + y*16 + z.
+void decodeDiskSubChunkPaletteLayer(ByteReader& r, BedrockWorldOperator::DecodedSubChunkPalette& result) {
+    uint8_t bits = r.u8();
+    bits >>= 1;
+    if (bits == 0x7f) {
+        return;
+    }
+    if (!isValidPaletteBits(bits)) {
+        throw std::runtime_error("invalid palette bit width");
+    }
+    std::vector<uint32_t> packed;
+    packed.reserve(packedUint32Count(bits));
+    for (size_t i = 0; i < packedUint32Count(bits); ++i) {
+        packed.push_back(r.le32());
+    }
+
+    uint32_t paletteCount = 1;
+    if (bits != 0) {
+        const int32_t decodedPaletteCount = static_cast<int32_t>(r.le32());
+        if (decodedPaletteCount <= 0) {
+            throw std::runtime_error("empty palette");
+        }
+        paletteCount = static_cast<uint32_t>(decodedPaletteCount);
+    }
+    if (paletteCount == 0 || paletteCount > 4096) {
+        throw std::runtime_error("invalid palette size");
+    }
+
+    result.palette.reserve(result.palette.size() + paletteCount);
+    for (uint32_t i = 0; i < paletteCount; ++i) {
+        // Reuse the raw encoded bytes as the cache key so repeated states skip
+        // the NBT parse entirely (mirrors the runtime path's disk-state cache).
+        const auto* encodedBegin = r.current();
+        auto probe = r;
+        skipDiskBlockState(probe);
+        const auto encodedSize = static_cast<std::size_t>(probe.current() - encodedBegin);
+        const std::string_view encodedState(
+            reinterpret_cast<const char*>(encodedBegin), encodedSize);
+        BedrockWorldOperator::BlockState entry;
+        if (const auto cached =
+                BlockStateRegistry::instance().cachedDiskBlockState(encodedState)) {
+            r = probe;
+            entry = *cached;
+        } else {
+            entry = toPublicBlockState(parseDiskBlockState(r));
+            BlockStateRegistry::instance().cacheDiskBlockState(encodedState, entry);
+        }
+        entry.paletteIndex = static_cast<std::uint16_t>(i);
+        result.palette.push_back(std::move(entry));
+    }
+
+    if (bits != 0) {
+        const std::uint32_t mask = (1u << bits) - 1u;
+        const std::size_t valuesPerWord = 32u / bits;
+        std::size_t storageIndex = 0;
+        for (const auto word : packed) {
+            for (std::size_t slot = 0;
+                 slot < valuesPerWord && storageIndex < result.indices.size();
+                 ++slot, ++storageIndex) {
+                const auto paletteIndex = (word >> (slot * bits)) & mask;
+                // Disk order is (x,z,y); indices are stored in native (x,y,z).
+                const auto blockIndex =
+                    (storageIndex & 0xf00u) |
+                    ((storageIndex & 0x00fu) << 4u) |
+                    ((storageIndex & 0x0f0u) >> 4u);
+                result.indices[blockIndex] = static_cast<std::uint16_t>(
+                    paletteIndex < paletteCount ? paletteIndex : 0);
+            }
+        }
+    }
+}
+
+BedrockWorldOperator::DecodedSubChunkPalette decodeDiskSubChunkPalette(const std::vector<uint8_t>& payload, int rangeStart) {
+    ByteReader r(payload);
+    const uint8_t version = r.u8();
+    uint8_t storageCount = 1;
+    if (version == 1) {
+        storageCount = 1;
+    } else if (version == 8 || version == 9) {
+        storageCount = r.u8();
+        if (version == 9) {
+            (void)r.u8();
+        }
+    } else {
+        throw std::runtime_error("unsupported subchunk version");
+    }
+
+    (void)rangeStart;
+    BedrockWorldOperator::DecodedSubChunkPalette result;
+    result.found = true;
+    for (uint8_t layer = 0; layer < storageCount; ++layer) {
+        if (layer == 0) {
+            decodeDiskSubChunkPaletteLayer(r, result);
+        } else {
+            skipPalettedStorage(r);
+        }
+    }
+    if (result.palette.empty()) {
+        BedrockWorldOperator::BlockState air;
+        air.name = "minecraft:air";
+        air.paletteIndex = 0;
+        result.palette.push_back(std::move(air));
+    }
+    return result;
+}
+
 class NativeBedrockWorld {
 public:
     static std::shared_ptr<NativeBedrockWorld> open(const std::string& dirName) {
@@ -1643,6 +1816,29 @@ public:
         }
         std::vector<uint8_t> payload(data.begin(), data.end());
         return decodeDiskSubChunkBlockStates(payload, rangeStartForDim(dm));
+    }
+
+    BedrockWorldOperator::DecodedSubChunkPalette loadSubChunkPalette(int dm, int x, int y, int z) {
+        BedrockWorldOperator::DecodedSubChunkPalette result;
+        if (y < (rangeStartForDim(dm) >> 4) || y > (rangeEndForDim(dm) >> 4)) {
+            return result;
+        }
+        const auto key = subChunkKey(dm, x, y, z);
+        const std::string data = get(key);
+        if (data.empty()) {
+            if (has(makeChunkKey(dm, x, z, {','})) || has(makeChunkKey(dm, x, z, {'v'}))) {
+                BedrockWorldOperator::BlockState air;
+                air.name = "minecraft:air";
+                air.paletteIndex = 0;
+                result.found = true;
+                result.palette.push_back(std::move(air));
+                return result;
+            }
+            return result;
+        }
+        std::vector<uint8_t> payload(data.begin(), data.end());
+        result = decodeDiskSubChunkPalette(payload, rangeStartForDim(dm));
+        return result;
     }
 
     std::string saveSubChunk(int dm, int x, int y, int z, const NativeSubChunk& sub) {
@@ -2182,6 +2378,50 @@ Result<BlockStateList> World::loadSubChunkBlockStates(Dimension dim, SubChunkPos
     }
 }
 
+Result<std::optional<DecodedSubChunkPalette>> World::loadSubChunkPalette(Dimension dim, SubChunkPos pos) const
+{
+    if (!valid()) {
+        return Result<std::optional<DecodedSubChunkPalette>>::failure("world is not open");
+    }
+    try {
+        auto decoded = mImpl->native->loadSubChunkPalette(toDimensionId(dim), pos.x, pos.y, pos.z);
+        if (!decoded.found) {
+            return Result<std::optional<DecodedSubChunkPalette>>::success(std::nullopt);
+        }
+        return Result<std::optional<DecodedSubChunkPalette>>::success(std::move(decoded));
+    } catch (const std::exception& e) {
+        return Result<std::optional<DecodedSubChunkPalette>>::failure(e.what());
+    } catch (...) {
+        return Result<std::optional<DecodedSubChunkPalette>>::failure("failed to load subchunk palette");
+    }
+}
+
+Result<std::vector<std::pair<int, DecodedSubChunkPalette>>> World::loadSubChunkPalettes(
+    Dimension dim, ChunkPos chunk, int minSubY, int maxSubY) const
+{
+    if (!valid()) {
+        return Result<std::vector<std::pair<int, DecodedSubChunkPalette>>>::failure("world is not open");
+    }
+    try {
+        const int dimensionId = toDimensionId(dim);
+        const auto payloads = mImpl->native->loadSubChunkPayloads(
+            dimensionId, chunk.x, chunk.z, minSubY, maxSubY);
+        std::vector<std::pair<int, DecodedSubChunkPalette>> result;
+        result.reserve(payloads.size());
+        for (const auto& [data, y] : payloads) {
+            if (data.empty()) continue;
+            std::vector<uint8_t> payload(data.begin(), data.end());
+            auto decoded = decodeDiskSubChunkPalette(payload, rangeStartForDim(dimensionId));
+            result.emplace_back(y, std::move(decoded));
+        }
+        return Result<std::vector<std::pair<int, DecodedSubChunkPalette>>>::success(std::move(result));
+    } catch (const std::exception& e) {
+        return Result<std::vector<std::pair<int, DecodedSubChunkPalette>>>::failure(e.what());
+    } catch (...) {
+        return Result<std::vector<std::pair<int, DecodedSubChunkPalette>>>::failure("failed to load subchunk palettes");
+    }
+}
+
 Result<std::vector<SubChunkPos>> World::listSubChunks(Dimension dim) const
 {
     if (!valid()) {
@@ -2489,6 +2729,29 @@ std::optional<std::string> runtimeIdToName(std::uint32_t runtimeId)
         return std::nullopt;
     }
     return entry->name;
+}
+
+std::optional<BlockState> runtimeIdToState(std::uint32_t runtimeId)
+{
+    auto* entry = BlockStateRegistry::instance().byRuntime(runtimeId);
+    if (!entry) return std::nullopt;
+    BlockState result;
+    result.name = entry->name;
+    result.version = entry->version;
+    result.states.reserve(entry->states.size());
+    for (const auto& [name, value] : entry->states) {
+        BlockStateProperty property;
+        property.name = name;
+        switch (value.type) {
+        case TagType::Byte: property.type = BlockStateValueType::Byte; property.intValue = value.byteValue; break;
+        case TagType::Short: property.type = BlockStateValueType::Short; property.intValue = static_cast<std::int16_t>(value.intValue); break;
+        case TagType::Long: property.type = BlockStateValueType::Long; property.intValue = value.intValue; break;
+        case TagType::String: property.type = BlockStateValueType::String; property.stringValue = value.stringValue; break;
+        default: property.type = BlockStateValueType::Int; property.intValue = static_cast<std::int32_t>(value.intValue); break;
+        }
+        result.states.push_back(std::move(property));
+    }
+    return result;
 }
 
 std::optional<std::uint32_t> nameToRuntimeId(std::string_view name)

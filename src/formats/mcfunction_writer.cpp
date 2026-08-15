@@ -9,12 +9,16 @@
 #include <charconv>
 #include <chrono>
 #include <compare>
+#include <condition_variable>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <fstream>
 #include <future>
+#include <iostream>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -218,52 +222,17 @@ CuboidKey cuboid_key(const Cuboid& cuboid) noexcept {
     };
 }
 
-Result<void> reject_block_entities(const IStructure& structure, Size size)
+// Formats an internal BlockState into a Bedrock command state string. Cannot
+// fail: names are prefixed and properties sorted deterministically.
+std::string format_bedrock_state(const BlockState& state)
 {
-    std::vector<ChunkPos> positions;
-    positions.reserve(static_cast<std::size_t>(size.chunk_x_count()));
-    for (std::int32_t chunk_z = 0; chunk_z < size.chunk_z_count(); ++chunk_z) {
-        positions.clear();
-        for (std::int32_t chunk_x = 0; chunk_x < size.chunk_x_count(); ++chunk_x) {
-            positions.push_back({ chunk_x, chunk_z });
-        }
-        auto entities = structure.get_chunk_nbt(positions);
-        if (!entities) {
-            return Result<void>::failure(
-                "MCFunction writer 获取方块实体失败: " + entities.error());
-        }
-        for (const auto& [_, chunk_entities] : entities.value()) {
-            if (chunk_entities.empty()) continue;
-            const auto& pos = chunk_entities.front().pos;
-            return Result<void>::failure(
-                "MCFunction writer 不支持 Bedrock 方块实体 NBT，首个方块实体坐标: (" +
-                std::to_string(pos.x) + "," + std::to_string(pos.y) + "," +
-                std::to_string(pos.z) + ")");
-        }
-    }
-    return Result<void>::success();
-}
-
-Result<std::string> java_state_string(
-    const std::unordered_map<std::uint32_t, BlockState>& java_states,
-    std::uint32_t runtime_id,
-    BlockPos position)
-{
-    const auto found = java_states.find(runtime_id);
-    if (found == java_states.end()) {
-        return Result<std::string>::failure(
-            "MCFunction writer: runtime ID " + std::to_string(runtime_id) +
-            " 没有 Java block-state 映射，坐标: (" + std::to_string(position.x) + "," +
-            std::to_string(position.y) + "," + std::to_string(position.z) + ")");
-    }
-
-    auto name = found->second.name;
+    auto name = state.name;
     if (name.find(':') == std::string::npos) name = "minecraft:" + name;
-    if (found->second.states.empty()) {
-        return Result<std::string>::success(std::move(name));
+    if (state.states.empty()) {
+        return name;
     }
 
-    auto properties = found->second.states;
+    auto properties = state.states;
     std::sort(properties.begin(), properties.end(), [](const auto& left, const auto& right) {
         return left.name < right.name;
     });
@@ -279,7 +248,52 @@ Result<std::string> java_state_string(
         }
     }
     name.push_back(']');
-    return Result<std::string>::success(std::move(name));
+    return name;
+}
+
+Result<std::string> bedrock_state_string(
+    const RuntimeRegistry& registry,
+    std::uint32_t runtime_id,
+    BlockPos position)
+{
+    const auto found = registry.resolve_state(runtime_id);
+    if (!found) {
+        return Result<std::string>::failure(
+            "MCFunction writer: runtime ID " + std::to_string(runtime_id) +
+            " 没有 Bedrock block-state 映射，坐标: (" + std::to_string(position.x) + "," +
+            std::to_string(position.y) + "," + std::to_string(position.z) + ")");
+    }
+    return Result<std::string>::success(format_bedrock_state(*found));
+}
+
+// Canonical identity of a decoded state, used to cache upgrade + formatting
+// once per distinct state across the whole conversion. Includes the version
+// because the upgrade schemas are version-dependent. Decoded Bedrock states
+// arrive with sorted properties (NBT compounds), so the sort is skipped in
+// the common case.
+std::string palette_state_key(const BlockState& state)
+{
+    const auto properties_less = [](const auto& left, const auto& right) {
+        if (left.name != right.name) return left.name < right.name;
+        if (left.type != right.type) return left.type < right.type;
+        return left.value < right.value;
+    };
+    auto properties = state.states;
+    if (!std::is_sorted(properties.begin(), properties.end(), properties_less)) {
+        std::sort(properties.begin(), properties.end(), properties_less);
+    }
+    std::string key = state.name;
+    key += '|';
+    key += std::to_string(state.version);
+    for (const auto& property : properties) {
+        key += '|';
+        key += property.name;
+        key += ':';
+        key += std::to_string(static_cast<int>(property.type));
+        key += '=';
+        key += property.value;
+    }
+    return key;
 }
 
 void write_fill(
@@ -377,6 +391,19 @@ const BlockLayer* layer_at(
         : &sub_chunk->second.layer0;
 }
 
+// Uniform per-layer access for the run/rectangle/cuboid encoder.
+// - `data` points to 4096 entries in either internal (y,z,x) or Bedrock native
+//   (x,y,z) order (generic runtime/handle layers).
+// - `palette_handles`/`indices` is the palette-preserving mode: `indices` holds
+//   4096 native (x,y,z) entries and each maps into `palette_handles`.
+// A null `data` and null `indices` means the layer is absent (air).
+struct BlockLayerView {
+    const std::uint32_t* data = nullptr;
+    bool native_layout = false;
+    const std::uint32_t* palette_handles = nullptr;
+    const std::uint16_t* indices = nullptr;
+};
+
 struct BatchBounds {
     std::int32_t chunk_z = 0;
     std::int32_t batch_x = 0;
@@ -389,7 +416,7 @@ struct BatchBounds {
 
 struct WorkerContext {
     std::unordered_map<std::uint32_t, std::string> state_cache;
-    std::vector<const BlockLayer*> layers;
+    std::vector<BlockLayerView> layers;
     std::vector<Rectangle> open_rectangles;
     std::vector<Rectangle> next_rectangles;
     std::vector<Rectangle> rectangles;
@@ -452,16 +479,16 @@ std::size_t selected_worker_count(
     return std::clamp<std::size_t>(workers, 1, std::max<std::size_t>(task_count, 1));
 }
 
-Result<void> encode_batch(
-    const ChunkMap& chunks,
-    const std::unordered_map<std::uint32_t, BlockState>& java_states,
+template <class LayerFor, class EmitState>
+Result<void> encode_batch_impl(
     std::uint32_t air,
     Size size,
     const BatchBounds& bounds,
     WorkerContext& context,
-    TaskCommandBuffer& output)
+    TaskCommandBuffer& output,
+    LayerFor&& layer_for,
+    EmitState&& emit_state)
 {
-    auto& state_cache = context.state_cache;
     auto& layers = context.layers;
     auto& open_rectangles = context.open_rectangles;
     auto& next_rectangles = context.next_rectangles;
@@ -486,16 +513,10 @@ Result<void> encode_batch(
     next_cuboids.reserve(static_cast<std::size_t>(bounds.x_end - bounds.x_begin));
 
     const auto emit_cuboid = [&](const Cuboid& cuboid) -> Result<void> {
-        auto cached = state_cache.find(cuboid.runtime);
-        if (cached == state_cache.end()) {
-            auto state = java_state_string(
-                java_states,
-                cuboid.runtime,
-                { cuboid.x1, cuboid.y1, cuboid.z1 });
-            if (!state) return Result<void>::failure(state.error());
-            cached = state_cache.emplace(cuboid.runtime, std::move(state.value())).first;
-        }
-        write_cuboid(output, cuboid, cached->second);
+        auto state = emit_state(
+            cuboid.runtime, { cuboid.x1, cuboid.y1, cuboid.z1 });
+        if (!state) return Result<void>::failure(state.error());
+        write_cuboid(output, cuboid, state.value());
         if (!output.good()) {
             return Result<void>::failure("MCFunction writer 写入任务输出失败");
         }
@@ -506,8 +527,10 @@ Result<void> encode_batch(
         const auto sub_y = floor_div(y - 64, 16);
         const auto local_y = y - (sub_y * 16 + 64);
         layers.clear();
-        for (auto chunk_x = bounds.batch_x; chunk_x < bounds.batch_end; ++chunk_x) {
-            layers.push_back(layer_at(chunks, { chunk_x, bounds.chunk_z }, sub_y));
+        for (std::size_t chunk_index = 0;
+             chunk_index < static_cast<std::size_t>(bounds.batch_end - bounds.batch_x);
+             ++chunk_index) {
+            layers.push_back(layer_for(chunk_index, sub_y));
         }
 
         open_rectangles.clear();
@@ -521,11 +544,20 @@ Result<void> encode_batch(
             for (std::int32_t x = bounds.x_begin; x < bounds.x_end; ++x) {
                 const auto chunk_index =
                     static_cast<std::size_t>((x / 16) - bounds.batch_x);
-                const auto* layer = layers[chunk_index];
-                const auto runtime_id = layer == nullptr
-                    ? air
-                    : (*layer)[static_cast<std::size_t>(
-                        (local_y * 16 + local_z) * 16 + floor_mod(x, 16))];
+                const auto& layer = layers[chunk_index];
+                std::uint32_t runtime_id = air;
+                if (layer.data != nullptr) {
+                    const auto local_x = floor_mod(x, 16);
+                    const auto index = layer.native_layout
+                        ? static_cast<std::size_t>(local_x * 256 + local_y * 16 + local_z)
+                        : static_cast<std::size_t>((local_y * 16 + local_z) * 16 + local_x);
+                    runtime_id = layer.data[index];
+                } else if (layer.indices != nullptr) {
+                    const auto local_x = floor_mod(x, 16);
+                    const auto native_index =
+                        static_cast<std::size_t>(local_x * 256 + local_y * 16 + local_z);
+                    runtime_id = layer.palette_handles[layer.indices[native_index]];
+                }
                 if (runtime_id == run_runtime) continue;
                 if (run_runtime != air) {
                     runs.push_back({ run_runtime, run_begin, x - 1 });
@@ -632,6 +664,90 @@ Result<void> encode_batch(
     return Result<void>::success();
 }
 
+Result<void> encode_batch(
+    const ChunkMap& chunks,
+    const RuntimeRegistry& registry,
+    std::uint32_t air,
+    Size size,
+    const BatchBounds& bounds,
+    WorkerContext& context,
+    TaskCommandBuffer& output)
+{
+    return encode_batch_impl(
+        air, size, bounds, context, output,
+        [&](std::size_t chunk_index, std::int32_t sub_y) -> BlockLayerView {
+            const auto* layer = layer_at(
+                chunks,
+                { bounds.batch_x + static_cast<std::int32_t>(chunk_index), bounds.chunk_z },
+                sub_y);
+            return layer == nullptr
+                ? BlockLayerView{}
+                : BlockLayerView{ layer->data(), false };
+        },
+        [&](std::uint32_t runtime, BlockPos position) -> Result<std::string_view> {
+            auto cached = context.state_cache.find(runtime);
+            if (cached == context.state_cache.end()) {
+                auto state = bedrock_state_string(registry, runtime, position);
+                if (!state) return Result<std::string_view>::failure(state.error());
+                cached = context.state_cache.emplace(
+                    runtime, std::move(state.value())).first;
+            }
+            return Result<std::string_view>::success(
+                std::string_view(cached->second));
+        });
+}
+
+struct PaletteSubChunk {
+    // Batch-local handles, one per palette entry; index 0 is "minecraft:air".
+    std::vector<std::uint32_t> palette_handles;
+    // 4096 indices in Bedrock native (x,y,z) order: index = x*256 + y*16 + z.
+    std::vector<std::uint16_t> indices;
+};
+
+struct PaletteChunk {
+    std::unordered_map<std::int32_t, PaletteSubChunk> sub_chunks;
+};
+
+// Palette-mode batch: `formatted` maps batch-local handles to pre-formatted
+// Bedrock state strings (handle 0 = "minecraft:air"). Each subchunk keeps its
+// palette handles and packed indices; the encoder resolves per block as
+// palette_handles[indices[native]].
+struct PaletteBatchData {
+    std::vector<std::string> formatted;
+    std::vector<PaletteChunk> chunks;
+};
+
+Result<void> encode_batch_palette(
+    const PaletteBatchData& data,
+    std::uint32_t air,
+    Size size,
+    const BatchBounds& bounds,
+    WorkerContext& context,
+    TaskCommandBuffer& output)
+{
+    return encode_batch_impl(
+        air, size, bounds, context, output,
+        [&](std::size_t chunk_index, std::int32_t sub_y) -> BlockLayerView {
+            if (chunk_index >= data.chunks.size()) return BlockLayerView{};
+            const auto it = data.chunks[chunk_index].sub_chunks.find(sub_y);
+            if (it == data.chunks[chunk_index].sub_chunks.end()) return BlockLayerView{};
+            return BlockLayerView{
+                nullptr,
+                false,
+                it->second.palette_handles.data(),
+                it->second.indices.data()
+            };
+        },
+        [&](std::uint32_t handle, BlockPos) -> Result<std::string_view> {
+            if (handle >= data.formatted.size()) {
+                return Result<std::string_view>::failure(
+                    "MCFunction writer: palette handle 越界");
+            }
+            return Result<std::string_view>::success(
+                std::string_view(data.formatted[handle]));
+        });
+}
+
 } // namespace
 
 Result<void> write_mcfunction(
@@ -644,10 +760,6 @@ Result<void> write_mcfunction(
     if (size.width <= 0 || size.height <= 0 || size.length <= 0) {
         return Result<void>::failure("MCFunction writer: 结构尺寸无效");
     }
-    if (const auto entities = reject_block_entities(structure, size); !entities) {
-        return entities;
-    }
-
     auto output_buffer = std::make_unique<char[]>(1024 * 1024);
     std::ofstream output;
     output.rdbuf()->pubsetbuf(output_buffer.get(), 1024 * 1024);
@@ -672,39 +784,138 @@ Result<void> write_mcfunction(
     std::vector<ChunkPos> positions;
     positions.reserve(kChunkBatchSize);
     const auto air = registry.air_runtime_id();
-    const auto java_states = registry.java_states_snapshot();
     const auto task_count =
         static_cast<std::size_t>(size.chunk_z_count()) *
         static_cast<std::size_t>(
             (size.chunk_x_count() + kChunkBatchSize - 1) / kChunkBatchSize);
     const auto worker_count = selected_worker_count(options, task_count);
 
+    // Palette fast path: MCWorld feeds subchunk palettes + packed indices
+    // directly, so each distinct state is formatted once instead of resolving
+    // a runtime ID per block. Other structures report "unsupported" and the
+    // writer falls back to the generic get_chunks_layer0() path. The probe
+    // runs once on the first batch and the outcome is cached per conversion.
+    // WATER_STRUCTURE_MCFUNCTION_NO_PALETTE=1 forces the generic path (used by
+    // tests to verify both paths cover identical commands).
+    const bool palette_allowed =
+        std::getenv("WATER_STRUCTURE_MCFUNCTION_NO_PALETTE") == nullptr;
+    bool palette_probed = false;
+    bool use_palette = false;
+
+    struct LoadedBatch {
+        ChunkMap chunks;
+        std::shared_ptr<const PaletteBatchData> palette;
+        BatchBounds bounds;
+    };
+
+    // Conversion-lifetime cache of decoded state -> formatted Bedrock string.
+    // Upgrade + formatting run once per distinct state (utopia-scale worlds
+    // repeat a few hundred states across ~1M palette entries), keyed by the
+    // raw state signature. Batches then only copy the strings they use.
+    std::unordered_map<std::string, std::string> global_states;
+
+    const auto load_palette_batch = [&](
+        std::span<const ChunkPos> batch_positions) -> Result<std::shared_ptr<const PaletteBatchData>> {
+        auto data = std::make_shared<PaletteBatchData>();
+        std::unordered_map<std::string, std::uint32_t> by_formatted;
+        data->formatted.push_back("minecraft:air"); // handle 0
+        by_formatted.emplace("minecraft:air", 0);
+        const bool profile = std::getenv("WATER_STRUCTURE_PROFILE") != nullptr;
+        const auto format_start = profile ? std::chrono::steady_clock::now()
+                                          : std::chrono::steady_clock::time_point{};
+        auto visited = structure.visit_chunk_palettes(
+            batch_positions,
+            [&](ChunkPos, std::span<const SubChunkPaletteData> subchunks) -> Result<void> {
+                PaletteChunk chunk;
+                for (const auto& subchunk : subchunks) {
+                    std::vector<std::uint32_t> palette_handles;
+                    palette_handles.reserve(subchunk.palette.size());
+                    for (const auto& state : subchunk.palette) {
+                        const auto key = palette_state_key(state);
+                        std::string formatted;
+                        const auto global = global_states.find(key);
+                        if (global == global_states.end()) {
+                            auto upgraded = registry.upgrade_state(state);
+                            formatted = format_bedrock_state(upgraded);
+                            global_states.emplace(key, formatted);
+                        } else {
+                            formatted = global->second;
+                        }
+                        const auto found = by_formatted.find(formatted);
+                        std::uint32_t handle = 0;
+                        if (found == by_formatted.end()) {
+                            handle = static_cast<std::uint32_t>(data->formatted.size());
+                            by_formatted.emplace(formatted, handle);
+                            data->formatted.push_back(std::move(formatted));
+                        } else {
+                            handle = found->second;
+                        }
+                        palette_handles.push_back(handle);
+                    }
+                    // Match generic materialization: subchunks whose palette is
+                    // only air are skipped instead of scanned.
+                    if (palette_handles.size() == 1 && palette_handles[0] == 0) {
+                        continue;
+                    }
+                    PaletteSubChunk sub_chunk;
+                    sub_chunk.palette_handles = std::move(palette_handles);
+                    sub_chunk.indices = std::move(subchunk.indices);
+                    chunk.sub_chunks.emplace(subchunk.sub_y, std::move(sub_chunk));
+                }
+                data->chunks.push_back(std::move(chunk));
+                return Result<void>::success();
+            });
+        if (!visited) {
+            return Result<std::shared_ptr<const PaletteBatchData>>::failure(visited.error());
+        }
+        if (profile) {
+            const auto format_seconds = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - format_start).count();
+            std::cerr << "mcfunction_palette_batch_profile format_seconds="
+                      << format_seconds << " states=" << data->formatted.size()
+                      << " chunks=" << data->chunks.size() << '\n';
+        }
+        return Result<std::shared_ptr<const PaletteBatchData>>::success(std::move(data));
+    };
+
     const auto load_batch = [&](std::int32_t chunk_z, std::int32_t batch_x)
-        -> Result<std::pair<ChunkMap, BatchBounds>> {
+        -> Result<LoadedBatch> {
         const auto batch_end =
             std::min(size.chunk_x_count(), batch_x + kChunkBatchSize);
         positions.clear();
         for (auto chunk_x = batch_x; chunk_x < batch_end; ++chunk_x) {
             positions.push_back({ chunk_x, chunk_z });
         }
+        const BatchBounds bounds{
+            chunk_z,
+            batch_x,
+            batch_end,
+            batch_x * 16,
+            std::min(size.width, batch_end * 16),
+            chunk_z * 16,
+            std::min(size.length, chunk_z * 16 + 16)
+        };
+
+        if (palette_allowed && (!palette_probed || use_palette)) {
+            auto palette = load_palette_batch(positions);
+            if (palette) {
+                palette_probed = true;
+                use_palette = true;
+                return Result<LoadedBatch>::success(LoadedBatch{
+                    {}, std::move(palette.value()), bounds });
+            }
+            palette_probed = true;
+            use_palette = false;
+        }
+
         auto chunks = structure.get_chunks_layer0(positions);
         structure.release_cached_chunks();
         if (!chunks) {
-            return Result<std::pair<ChunkMap, BatchBounds>>::failure(
+            return Result<LoadedBatch>::failure(
                 "MCFunction writer 获取 chunks 失败: " + chunks.error());
         }
-        return Result<std::pair<ChunkMap, BatchBounds>>::success({
-            std::move(chunks).value(),
-            BatchBounds{
-                chunk_z,
-                batch_x,
-                batch_end,
-                batch_x * 16,
-                std::min(size.width, batch_end * 16),
-                chunk_z * 16,
-                std::min(size.length, chunk_z * 16 + 16)
-            }
-        });
+        return Result<LoadedBatch>::success(LoadedBatch{
+            std::move(chunks).value(), nullptr, bounds });
     };
 
     if (worker_count == 1) {
@@ -716,14 +927,13 @@ Result<void> write_mcfunction(
                  batch_x += kChunkBatchSize) {
                 auto batch = load_batch(chunk_z, batch_x);
                 if (!batch) return Result<void>::failure(batch.error());
-                const auto encoded = encode_batch(
-                    batch.value().first,
-                    java_states,
-                    air,
-                    size,
-                    batch.value().second,
-                    context,
-                    command_output);
+                const auto encoded = batch.value().palette
+                    ? encode_batch_palette(
+                        *batch.value().palette, 0, size, batch.value().bounds,
+                        context, command_output)
+                    : encode_batch(
+                        batch.value().chunks, registry, air, size,
+                        batch.value().bounds, context, command_output);
                 if (!encoded) return encoded;
             }
         }
@@ -811,54 +1021,151 @@ Result<void> write_mcfunction(
         };
 
         std::size_t sequence = 0;
-        for (std::int32_t chunk_z = 0; chunk_z < size.chunk_z_count(); ++chunk_z) {
-            for (std::int32_t batch_x = 0;
-                 batch_x < size.chunk_x_count();
-                 batch_x += kChunkBatchSize) {
-                while (pending.size() >= max_in_flight) {
-                    if (const auto drained = drain_one(); !drained) return drained;
-                }
+        const auto batches_per_z = static_cast<std::size_t>(
+            (size.chunk_x_count() + kChunkBatchSize - 1) / kChunkBatchSize);
+        const auto total_batches =
+            static_cast<std::size_t>(size.chunk_z_count()) * batches_per_z;
 
-                auto batch = load_batch(chunk_z, batch_x);
-                if (!batch) return Result<void>::failure(batch.error());
-                auto [chunks, bounds] = std::move(batch).value();
-                const auto spill_path =
-                    temp_directory.path /
-                    ("task_" + std::to_string(sequence) + ".tmp");
-                const auto task_sequence = sequence++;
-                pending.push_back({
-                    task_sequence,
-                    pool.submit_indexed(
-                        [chunks = std::move(chunks),
-                         bounds,
-                         spill_path,
-                         &java_states,
-                         &worker_contexts,
-                         air,
-                         size,
-                         task_sequence](std::size_t worker_index) mutable
-                            -> Result<TaskOutput> {
-                            TaskCommandBuffer task_output(spill_path);
-                            const auto encoded = encode_batch(
-                                chunks,
-                                java_states,
-                                air,
-                                size,
-                                bounds,
-                                *worker_contexts[worker_index],
-                                task_output);
-                            if (!encoded) {
-                                return Result<TaskOutput>::failure(
-                                    "MCFunction writer 并行任务 " +
-                                    std::to_string(task_sequence) + " (" +
-                                    std::to_string(bounds.chunk_z) + "," +
-                                    std::to_string(bounds.batch_x) + ") 失败: " +
-                                    encoded.error());
-                            }
-                            return task_output.finish();
-                        })
-                });
+        // Palette-mode pipeline: subchunk loads are independent read-only
+        // LevelDB work, so a dedicated loader thread prefetches batches while
+        // the encode pool works. That overlaps the single-threaded decode
+        // cost with the parallel merge/format stage. The generic path keeps
+        // loading on the main thread (readers may own mutable chunk caches).
+        // The RAII guard cancels and joins the loader on every exit path.
+        struct LoadedSlot {
+            std::size_t index = 0;
+            Result<LoadedBatch> batch;
+        };
+        struct LoaderPipeline {
+            std::thread thread;
+            std::mutex mutex;
+            std::condition_variable cv;
+            std::deque<LoadedSlot> loaded;
+            bool done = false;
+            bool cancel = false;
+
+            void request_cancel() noexcept {
+                std::lock_guard lock(mutex);
+                cancel = true;
+                cv.notify_all();
             }
+
+            ~LoaderPipeline() {
+                if (!thread.joinable()) return;
+                request_cancel();
+                thread.join();
+            }
+        } pipeline;
+        constexpr std::size_t kPrefetchDepth = 3;
+
+        auto first = load_batch(0, 0);
+        if (!first) return Result<void>::failure(first.error());
+        const bool pipeline_enabled = first.value().palette != nullptr;
+        if (pipeline_enabled) {
+            pipeline.thread = std::thread([&]() {
+                try {
+                    for (std::size_t index = 1; index < total_batches; ++index) {
+                        {
+                            std::unique_lock lock(pipeline.mutex);
+                            pipeline.cv.wait(lock, [&] {
+                                return pipeline.loaded.size() < kPrefetchDepth ||
+                                    pipeline.cancel;
+                            });
+                            if (pipeline.cancel) return;
+                        }
+                        const auto chunk_z =
+                            static_cast<std::int32_t>(index / batches_per_z);
+                        const auto batch_x = static_cast<std::int32_t>(
+                            (index % batches_per_z) * kChunkBatchSize);
+                        auto batch = load_batch(chunk_z, batch_x);
+                        {
+                            std::lock_guard lock(pipeline.mutex);
+                            pipeline.loaded.push_back({ index, std::move(batch) });
+                        }
+                        pipeline.cv.notify_all();
+                    }
+                } catch (const std::exception& error) {
+                    std::lock_guard lock(pipeline.mutex);
+                    pipeline.loaded.push_back({
+                        total_batches,
+                        Result<LoadedBatch>::failure(
+                            "MCFunction writer 加载线程异常: " +
+                            std::string(error.what()))
+                    });
+                }
+                {
+                    std::lock_guard lock(pipeline.mutex);
+                    pipeline.done = true;
+                }
+                pipeline.cv.notify_all();
+            });
+        }
+
+        for (std::size_t index = 0; index < total_batches; ++index) {
+            while (pending.size() >= max_in_flight) {
+                if (const auto drained = drain_one(); !drained) return drained;
+            }
+
+            Result<LoadedBatch> batch;
+            if (index == 0) {
+                batch = std::move(first);
+            } else if (pipeline_enabled) {
+                std::unique_lock lock(pipeline.mutex);
+                pipeline.cv.wait(lock, [&] {
+                    return !pipeline.loaded.empty() || pipeline.done ||
+                        pipeline.cancel;
+                });
+                if (pipeline.loaded.empty()) {
+                    return Result<void>::failure(
+                        "MCFunction writer 加载流水线提前结束");
+                }
+                auto slot = std::move(pipeline.loaded.front());
+                pipeline.loaded.pop_front();
+                pipeline.cv.notify_all();
+                batch = std::move(slot.batch);
+            } else {
+                const auto chunk_z =
+                    static_cast<std::int32_t>(index / batches_per_z);
+                const auto batch_x = static_cast<std::int32_t>(
+                    (index % batches_per_z) * kChunkBatchSize);
+                batch = load_batch(chunk_z, batch_x);
+            }
+            if (!batch) return Result<void>::failure(batch.error());
+            const auto spill_path =
+                temp_directory.path /
+                ("task_" + std::to_string(sequence) + ".tmp");
+            const auto task_sequence = sequence++;
+            pending.push_back({
+                task_sequence,
+                pool.submit_indexed(
+                    [loaded = std::move(batch).value(),
+                     spill_path,
+                     &registry,
+                     &worker_contexts,
+                     air,
+                     size,
+                     task_sequence](std::size_t worker_index) mutable
+                        -> Result<TaskOutput> {
+                        TaskCommandBuffer task_output(spill_path);
+                        const auto encoded = loaded.palette
+                            ? encode_batch_palette(
+                                *loaded.palette, 0, size, loaded.bounds,
+                                *worker_contexts[worker_index], task_output)
+                            : encode_batch(
+                                loaded.chunks, registry, air, size,
+                                loaded.bounds,
+                                *worker_contexts[worker_index], task_output);
+                        if (!encoded) {
+                            return Result<TaskOutput>::failure(
+                                "MCFunction writer 并行任务 " +
+                                std::to_string(task_sequence) + " (" +
+                                std::to_string(loaded.bounds.chunk_z) + "," +
+                                std::to_string(loaded.bounds.batch_x) + ") 失败: " +
+                                encoded.error());
+                        }
+                        return task_output.finish();
+                    })
+            });
         }
         while (!pending.empty()) {
             if (const auto drained = drain_one(); !drained) return drained;

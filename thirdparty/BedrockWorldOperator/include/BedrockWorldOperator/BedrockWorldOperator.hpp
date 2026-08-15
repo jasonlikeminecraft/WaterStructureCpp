@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
@@ -118,6 +119,7 @@ struct BlockRuntimeResolver {
 void setBlockRuntimeResolver(BlockRuntimeResolver resolver);
 std::uint32_t airRuntimeId();
 std::optional<std::string> runtimeIdToName(std::uint32_t runtimeId);
+std::optional<BlockState> runtimeIdToState(std::uint32_t runtimeId);
 std::optional<std::uint32_t> nameToRuntimeId(std::string_view name);
 
 class SubChunk {
@@ -180,6 +182,16 @@ struct DecodedSubChunk {
     int index = 0;
 };
 
+// Palette-preserving subchunk view. Decoding keeps the on-disk palette and the
+// 4096 packed indices instead of expanding to 4096 full BlockState objects,
+// so consumers can format each palette entry once and scan indices (native
+// x/y/z order: index = x*256 + y*16 + z).
+struct DecodedSubChunkPalette {
+    bool found = false;
+    BlockStateList palette;
+    std::array<std::uint16_t, 4096> indices{};
+};
+
 struct SubChunkDecodeProfile {
     std::uint64_t calls = 0;
     std::uint64_t sampledCalls = 0;
@@ -223,6 +235,9 @@ public:
     Result<SubChunk> loadSubChunk(Dimension dim, SubChunkPos pos) const;
     Result<std::vector<DecodedSubChunk>> loadSubChunks(Dimension dim, ChunkPos chunk, int minSubY, int maxSubY) const;
     Result<BlockStateList> loadSubChunkBlockStates(Dimension dim, SubChunkPos pos) const;
+    Result<std::optional<DecodedSubChunkPalette>> loadSubChunkPalette(Dimension dim, SubChunkPos pos) const;
+    Result<std::vector<std::pair<int, DecodedSubChunkPalette>>> loadSubChunkPalettes(
+        Dimension dim, ChunkPos chunk, int minSubY, int maxSubY) const;
     Result<std::vector<SubChunkPos>> listSubChunks(Dimension dim) const;
     Result<void> saveSubChunk(Dimension dim, SubChunkPos pos, const SubChunk& subChunk);
     Result<void> saveSubChunksBatch(Dimension dim, std::span<const PositionedSubChunkWrite> writes);

@@ -725,6 +725,40 @@ std::optional<BlockState> RuntimeRegistry::state(std::uint32_t runtime_id) const
     return it == mByRuntimeId.end() ? std::nullopt : std::optional<BlockState>(it->second);
 }
 
+BlockState RuntimeRegistry::upgrade_state(BlockState state) const
+{
+    std::function<BlockState(BlockState)> upgrade;
+    {
+        std::lock_guard lock(mMutex);
+        upgrade = mUpgradeState;
+    }
+    return upgrade ? upgrade(std::move(state)) : state;
+}
+
+std::optional<BlockState> RuntimeRegistry::resolve_state(std::uint32_t runtime_id) const
+{
+    if (auto local = state(runtime_id)) return local;
+    const auto decoded = BedrockWorldOperator::runtimeIdToState(runtime_id);
+    if (!decoded) return std::nullopt;
+    BlockState result;
+    result.name = decoded->name;
+    result.version = decoded->version;
+    result.states.reserve(decoded->states.size());
+    for (const auto& property : decoded->states) {
+        BlockStateProperty item;
+        item.name = property.name;
+        switch (property.type) {
+        case BedrockWorldOperator::BlockStateValueType::Byte: item.type = BlockStateValueType::Byte; item.value = std::to_string(static_cast<std::int8_t>(property.intValue)); break;
+        case BedrockWorldOperator::BlockStateValueType::Short: item.type = BlockStateValueType::Short; item.value = std::to_string(static_cast<std::int16_t>(property.intValue)); break;
+        case BedrockWorldOperator::BlockStateValueType::Long: item.type = BlockStateValueType::Long; item.value = std::to_string(property.intValue); break;
+        case BedrockWorldOperator::BlockStateValueType::String: item.type = BlockStateValueType::String; item.value = property.stringValue; break;
+        default: item.type = BlockStateValueType::Int; item.value = std::to_string(static_cast<std::int32_t>(property.intValue)); break;
+        }
+        result.states.push_back(std::move(item));
+    }
+    return result;
+}
+
 std::optional<BlockState> RuntimeRegistry::java_state(std::uint32_t runtime_id) const
 {
     std::lock_guard lock(mMutex);
