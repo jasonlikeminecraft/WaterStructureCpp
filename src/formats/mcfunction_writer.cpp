@@ -473,8 +473,15 @@ std::size_t selected_worker_count(
 {
     auto workers = options.thread_count;
     if (workers == 0) {
+        // Automatic selection: parallel encoding past 2 threads is
+        // memory-bandwidth limited (utopia measurements: 1/2/3/4/8 threads =
+        // 17.06/9.55/11.31/11.05/11.28 s), so the default is
+        // min(CPU cores, 2); tiny inputs use a single worker to avoid the
+        // thread-pool overhead entirely.
         const auto hardware = std::max(1u, std::thread::hardware_concurrency());
-        workers = std::min<std::size_t>(hardware, 2);
+        workers = task_count <= 1
+            ? 1
+            : std::min<std::size_t>(hardware, 2);
     }
     return std::clamp<std::size_t>(workers, 1, std::max<std::size_t>(task_count, 1));
 }

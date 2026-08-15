@@ -201,7 +201,18 @@ class Context:
         *,
         threads: int = 0,
     ) -> None:
-        """Convert a structure to a supported writer format."""
+        """Convert a structure to a supported writer format.
+
+        ``target_format`` is a registered writer name (for example
+        ``SchemV1``, ``SchemV2``, ``BDX``, ``MCStructure``, ``MCFunction``,
+        ``Schematic``, ``Litematic``, ``AxiomBP``, ``IBImport``,
+        ``FuHongV4`` or ``FuHongV5``).
+
+        ``threads`` selects the worker count for parallel encoding stages.
+        Pass ``0`` (the default) to let the library choose automatically:
+        a single worker for tiny inputs, otherwise ``min(CPU cores, 2)``
+        (parallel encoding beyond 2 threads is memory-bandwidth limited).
+        """
         if threads < 0:
             raise ValueError("threads must be >= 0")
         if not _lib.ws_convert(
