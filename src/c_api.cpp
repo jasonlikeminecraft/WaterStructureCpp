@@ -99,7 +99,7 @@ extern "C" {
 
 WATER_STRUCTURE_API const char* ws_version(void)
 {
-    return "0.1.2";
+    return "0.1.3";
 }
 
 WATER_STRUCTURE_API uint32_t ws_abi_version(void)
