@@ -327,6 +327,50 @@ std::filesystem::path write_ibimport_sample()
     return path;
 }
 
+std::filesystem::path write_ibimport_fill_sample()
+{
+    const auto path = std::filesystem::temp_directory_path() /
+        "water_structure_cpp_fill_test.ibi";
+    std::ofstream file(path, std::ios::binary | std::ios::trunc);
+    file.write("IBImport ", 9);
+    auto segment = [&](std::string_view data) {
+        std::uint64_t length = data.size();
+        do {
+            auto byte = static_cast<std::uint8_t>(length & 0x7fu);
+            length >>= 7u;
+            if (length != 0) byte |= 0x80u;
+            file.put(static_cast<char>(byte));
+        } while (length != 0);
+        constexpr std::uint8_t key = 0xa7;
+        file.put(static_cast<char>(key));
+        for (const auto byte : data)
+            file.put(static_cast<char>(static_cast<std::uint8_t>(byte) ^ key));
+    };
+    segment(
+        "fill ~31 ~31 ~31 ~0 ~0 ~0 minecraft:stone []\r\n"
+        "setblock ~1 ~2 ~3 minecraft:dirt [\"dirt_type\"=\"normal\"]\r\n");
+    segment("[]");
+    return path;
+}
+
+std::filesystem::path write_truncated_large_ibimport_sample()
+{
+    const auto path = std::filesystem::temp_directory_path() /
+        "water_structure_cpp_large_truncated_test.ibi";
+    std::ofstream file(path, std::ios::binary | std::ios::trunc);
+    file.write("IBImport ", 9);
+    std::uint64_t length = 300ull * 1024ull * 1024ull;
+    do {
+        auto byte = static_cast<std::uint8_t>(length & 0x7fu);
+        length >>= 7u;
+        if (length != 0) byte |= 0x80u;
+        file.put(static_cast<char>(byte));
+    } while (length != 0);
+    file.put(static_cast<char>(0x5a));
+    file.write("short", 5);
+    return path;
+}
+
 std::vector<std::uint8_t> compress_zlib(
     std::span<const std::uint8_t> input, int window_bits)
 {
@@ -1808,6 +1852,38 @@ int main()
         check(ib_entities.ok() && ib_entities.value().at({ 0, 0 }).size() == 1,
             "IBImport command block NBT");
         std::filesystem::remove(ibimport_path);
+
+        const auto ibimport_fill_path = write_ibimport_fill_sample();
+        const auto ibimport_fill = water_structure::FormatRegistry::open(
+            ibimport_fill_path, registry);
+        check(ibimport_fill.ok(), "IBImport fill and mixed setblock parse");
+        check(ibimport_fill.value()->size().width == 32 &&
+            ibimport_fill.value()->size().height == 32 &&
+            ibimport_fill.value()->size().length == 32,
+            "IBImport reversed relative fill preserves bounds");
+        check(ibimport_fill.value()->count_non_air_blocks().value() == 32768,
+            "IBImport fill remains compact and setblock overwrite preserves count");
+        const auto ibimport_fill_chunks = ibimport_fill.value()->get_chunks(
+            std::array<water_structure::ChunkPos, 1>{ water_structure::ChunkPos{ 0, 0 } });
+        const std::array dirt_states{
+            water_structure::BlockStateProperty{
+                "dirt_type", water_structure::BlockStateValueType::String, "normal" }
+        };
+        const auto dirt_runtime = registry.find("minecraft:dirt", dirt_states);
+        check(ibimport_fill_chunks.ok() && dirt_runtime &&
+            ibimport_fill_chunks.value().at({ 0, 0 }).sub_chunks.at(-4).layer0[
+                static_cast<std::size_t>((2 * 16 + 3) * 16 + 1)] == *dirt_runtime,
+            "IBImport setblock overrides an earlier fill with state properties");
+        std::filesystem::remove(ibimport_fill_path);
+
+        const auto large_truncated_ibimport_path = write_truncated_large_ibimport_sample();
+        const auto large_truncated_ibimport = water_structure::FormatRegistry::open(
+            large_truncated_ibimport_path, registry);
+        check(!large_truncated_ibimport.ok() &&
+            large_truncated_ibimport.error().find("段数据截断") != std::string::npos &&
+            large_truncated_ibimport.error().find("256 MiB") == std::string::npos,
+            "IBImport reader streams segments larger than the old 256 MiB limit");
+        std::filesystem::remove(large_truncated_ibimport_path);
 
         const auto typed_nbt = water_structure::parse_mianyang_nbt(
             R"({"blockCompleteNBT":"%7Bid%3A%22Chest%22%2CCount%3A1b%2CNums%3A%5BI%3B1%2C2%5D%7D"})");

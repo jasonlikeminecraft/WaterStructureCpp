@@ -8,9 +8,12 @@
 
 namespace water_structure {
 
+struct ConversionOptions;
+
 Result<void> write_ibimport(
     const IStructure& structure,
     RuntimeRegistry& registry,
-    const std::filesystem::path& output_path);
+    const std::filesystem::path& output_path,
+    const ConversionOptions& options);
 
 } // namespace water_structure

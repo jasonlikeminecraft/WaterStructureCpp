@@ -451,7 +451,7 @@ Result<void> FormatRegistry::write(
         return write_schematic(structure, registry, path);
     }
     if (format == StructureId::IBImport) {
-        return write_ibimport(structure, registry, path);
+        return write_ibimport(structure, registry, path, options);
     }
     if (format == StructureId::FuHongV4 || format == StructureId::FuHongV5) {
         return write_fuhong(structure, registry, format, path);

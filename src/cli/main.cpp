@@ -440,14 +440,22 @@ int convert_file(
     progress.start(2);
     progress.stage("读取");
     auto opened = water_structure::FormatRegistry::open(input, registry);
-    if (!opened) { std::cerr << "error: " << opened.error() << '\n'; return kInputError; }
+    if (!opened) {
+        if (!common.quiet) std::cout << '\n';
+        std::cerr << "error: " << opened.error() << '\n';
+        return kInputError;
+    }
     progress.advance();
     progress.stage("写入", true);
     progress.begin_busy();
     auto written = water_structure::FormatRegistry::write(
         *opened.value(), *format, output, registry, {threads, 0});
     progress.end_busy();
-    if (!written) { std::cerr << "error: " << written.error() << '\n'; return kConversionError; }
+    if (!written) {
+        if (!common.quiet) std::cout << '\n';
+        std::cerr << "error: " << written.error() << '\n';
+        return kConversionError;
+    }
     progress.finish();
     const auto seconds = std::chrono::duration<double>(Clock::now() - begin).count();
     if (!common.quiet) {

@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <array>
 #include <charconv>
+#include <cctype>
 #include <cmath>
 #include <chrono>
 #include <cstdint>
@@ -431,29 +432,38 @@ std::vector<BlockStateProperty> parse_block_states(std::string_view encoded)
     std::vector<BlockStateProperty> result;
     std::size_t start = 0;
     bool quoted = false;
+    char separator_mode = 0;
     for (std::size_t index = 0; index <= contents.size(); ++index) {
         if (index < contents.size() && contents[index] == '"' &&
             (index == 0 || contents[index - 1] != '\\')) quoted = !quoted;
         if (index < contents.size() && (contents[index] != ',' || quoted)) continue;
         const auto part = contents.substr(start, index - start);
-        std::size_t equals = std::string_view::npos;
+        std::size_t separator = std::string_view::npos;
         bool key_quoted = false;
         for (std::size_t i = 0; i < part.size(); ++i) {
             if (part[i] == '"' && (i == 0 || part[i - 1] != '\\')) key_quoted = !key_quoted;
-            if (part[i] == '=' && !key_quoted) {
-                equals = i;
+            if ((part[i] == '=' || part[i] == ':') && !key_quoted) {
+                separator = i;
                 break;
             }
         }
-        if (equals == std::string_view::npos) {
-            if (!trim(part).empty()) throw std::runtime_error("BDX block states 缺少 '='");
+        if (separator == std::string_view::npos) {
+            if (!trim(part).empty()) throw std::runtime_error("BDX block states 缺少 ':' 或 '='");
         } else {
+            if (separator_mode == 0) separator_mode = part[separator];
+            else if (separator_mode != part[separator]) {
+                throw std::runtime_error("BDX block states 混用了 ':' 和 '='");
+            }
             BlockStateProperty property;
-            property.name = unquote(trim(part.substr(0, equals)));
-            auto value = trim(part.substr(equals + 1));
-            if (value == "true" || value == "false") {
+            property.name = unquote(trim(part.substr(0, separator)));
+            auto value = trim(part.substr(separator + 1));
+            auto boolean = value;
+            std::transform(boolean.begin(), boolean.end(), boolean.begin(), [](unsigned char character) {
+                return static_cast<char>(std::tolower(character));
+            });
+            if (boolean == "true" || boolean == "false") {
                 property.type = BlockStateValueType::Byte;
-                property.value = value == "true" ? "1" : "0";
+                property.value = boolean == "true" ? "1" : "0";
             } else if (value.size() >= 2 && value.front() == '"' && value.back() == '"') {
                 property.type = BlockStateValueType::String;
                 property.value = unquote(std::move(value));

@@ -164,6 +164,14 @@ MCFunction reader 同样采用有界流式路径：逐行解析后只保留紧�
 `setblock`/`fill` 命令，不会把大 `fill` 展开为逐方块数组；下游按需请求 chunk 时
 才生成该 chunk 的交集。因此导入内存随命令数增长，而不是随填充体积增长。
 
+IBImport writer 的命令段和命令方块 NBT 段均逐 chunk 读取并立即 XOR 写出；段长度
+在结束时回填，不缓存完整命令文本、全部 chunk 坐标或全部方块实体。每个 chunk
+处理完成后主动释放 reader 缓存，峰值工作集受单个 chunk 及其方块实体数量约束。
+方块命令会在单个 chunk 内做有界三维贪心合并：孤立方块使用 `setblock`，连续同状态
+区域使用不超过 32,768 方块的 `fill`。reader 对 XOR 段逐块解码，只紧凑保存
+`setblock`/`fill` 命令，并在下游请求 chunk 时物化交集；不再有旧版 256 MiB 段限制，
+也不会按 `fill` 体积展开常驻方块数组。
+
 ## 性能与内存
 
 流式处理是所有转换器的默认行为：reader 按命令、chunk 或 subchunk 读取，writer
@@ -174,6 +182,7 @@ Release 构建在本机实测的端到端结果，数字用于比较转换器量
 | --- | --- | --- | ---: | ---: |
 | MCWorld → SchemV1 | 乌托邦，`2701×176×2701`，约 2.86 万 chunk 柱 | `.schem` | 约 29.3 秒 | 约 175 MiB（工作集约 348 MiB） |
 | MCWorld → MCFunction | 同上 | `.mcfunction` | 约 13 秒（palette 流水线，本机复测；generic 路径约 16 秒） | 约 154 MiB |
+| MCWorld → IBImport | chenshi，`2716×342×2245` | `.ibi` | 约 10–12 秒（palette 流水线，3 个编码线程） | 私有内存约 136 MiB（工作集约 290 MiB） |
 | MCWorld → BDX | Kuudra，`188×175×185`，270.6 万非空气方块 | `.bdx` | 约 1.49 秒 | 约 152 MiB |
 | BDX → MCWorld | 同一 Kuudra BDX | 世界目录/`.mcworld` | 约 1.68 秒 | 约 159 MiB |
 | Schematic → MCWorld | `519×256×519`，1089 个 chunk | 世界目录/`.mcworld` | 约 3.6 秒 | 约 412 MiB |
@@ -187,6 +196,12 @@ MCFunction 编码默认使用 2 个线程；在乌托邦样本上，1/2/3/4/8 �
 palette 流水线路径（MCWorld → MCFunction）相对通用路径的收益与输入状态多样性
 相关：状态单调的世界两者接近，状态多样的世界差距明显——chenshi 样本
 （`2716×278×2245`）上 palette 路径约 14 秒，而通用路径约 55 秒。
+
+IBImport 的同一 chenshi 样本在纯 `setblock` 版本中耗时约 289.4 秒、输出约
+5.35 GiB；启用 chunk 内三维 `fill` 后输出降至约 386.6 MiB。当前 MCWorld 输入
+进一步直接消费 palette/packed indices，以 32 个 chunk 为读取批次，并用有界任务
+队列保持三线程编码结果的确定顺序，端到端约 10–12 秒；相对最初版本速度约提升
+24–29 倍、文件体积减少约 93%。优化前后输出 SHA-256 一致，峰值内存基本不变。
 
 已经支持的 JSON、MessagePack、NBT、BDX、IBImport、MCFunction 等格式都走相同的
 有界 chunk/subchunk 管线；但没有大型真实样本的格式目前只有最小 fixture 的测试
