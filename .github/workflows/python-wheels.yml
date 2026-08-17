@@ -2,6 +2,17 @@ name: Python platform wheels
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/python-wheels.yml"
+      - "assets/**"
+      - "include/**"
+      - "python/**"
+      - "src/**"
+      - "thirdparty/**"
+      - "xmake.lua"
   pull_request:
     paths:
       - ".github/workflows/python-wheels.yml"
@@ -11,6 +22,10 @@ on:
       - "src/**"
       - "thirdparty/**"
       - "xmake.lua"
+
+concurrency:
+  group: python-wheels-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   wheel:
