@@ -71,6 +71,10 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Build a platform wheel")
     parser.add_argument("--native-library", type=Path)
     parser.add_argument("--output", type=Path, default=Path("dist/python"))
+    parser.add_argument(
+        "--platform-tag",
+        help="Override the wheel platform tag, for example android_24_arm64_v8a",
+    )
     parser.add_argument("--skip-native-build", action="store_true")
     args = parser.parse_args()
 
@@ -89,9 +93,13 @@ def main() -> int:
     copy_package(stage, native_library)
     output = args.output if args.output.is_absolute() else ROOT / args.output
     output.mkdir(parents=True, exist_ok=True)
+    build_environment = os.environ.copy()
+    if args.platform_tag:
+        build_environment["WATER_STRUCTURE_WHEEL_PLATFORM"] = args.platform_tag
     subprocess.run(
         [sys.executable, "-m", "build", str(stage), "--wheel", "--outdir", str(output)],
         cwd=ROOT,
+        env=build_environment,
         check=True,
     )
     wheels = sorted(output.glob("water_structure-*.whl"), key=lambda p: p.stat().st_mtime_ns)

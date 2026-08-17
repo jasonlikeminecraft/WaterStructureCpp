@@ -75,7 +75,9 @@ target("leveldb")
     else
         add_files("thirdparty/LevelDB/util/env_posix.cc")
         add_cxxflags("-fPIC")
-        add_syslinks("pthread", { public = true })
+        if not is_plat("android") then
+            add_syslinks("pthread", { public = true })
+        end
     end
     add_includedirs("thirdparty/LevelDB/include", "thirdparty/LevelDB", { public = true })
     add_packages("zlib", { public = true })

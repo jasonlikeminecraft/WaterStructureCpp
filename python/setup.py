@@ -1,3 +1,5 @@
+import os
+
 from setuptools import setup
 from wheel.bdist_wheel import bdist_wheel as _bdist_wheel
 
@@ -11,6 +13,7 @@ class PlatformWheel(_bdist_wheel):
 
     def get_tag(self):
         _, _, platform_tag = super().get_tag()
+        platform_tag = os.environ.get("WATER_STRUCTURE_WHEEL_PLATFORM", platform_tag)
         return "py3", "none", platform_tag
 
 
