@@ -24,8 +24,8 @@ public:
         worker_count = std::max<std::size_t>(worker_count, 1);
         mWorkers.reserve(worker_count);
         for (std::size_t index = 0; index < worker_count; ++index) {
-            mWorkers.emplace_back([this, index](std::stop_token stop_token) {
-                worker_loop(stop_token, index);
+            mWorkers.emplace_back([this, index] {
+                worker_loop(index);
             });
         }
     }
@@ -95,16 +95,15 @@ public:
     }
 
 private:
-    void worker_loop(std::stop_token stop_token, std::size_t worker_index)
+    void worker_loop(std::size_t worker_index)
     {
-        while (!stop_token.stop_requested()) {
+        while (true) {
             std::function<void(std::size_t)> task;
             {
                 std::unique_lock lock(mMutex);
-                const auto ready = mTaskReady.wait(lock, stop_token, [this] {
+                mTaskReady.wait(lock, [this] {
                     return !mTasks.empty() || !mAccepting;
                 });
-                if (!ready || stop_token.stop_requested()) return;
                 if (mTasks.empty()) {
                     if (!mAccepting) return;
                     continue;
@@ -119,10 +118,10 @@ private:
 
     std::size_t mQueueCapacity;
     std::mutex mMutex;
-    std::condition_variable_any mTaskReady;
+    std::condition_variable mTaskReady;
     std::condition_variable mQueueSpace;
     std::deque<std::function<void(std::size_t)>> mTasks;
-    std::vector<std::jthread> mWorkers;
+    std::vector<std::thread> mWorkers;
     bool mAccepting = true;
 };
 
