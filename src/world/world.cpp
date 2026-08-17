@@ -10,6 +10,8 @@
 
 #if defined(_WIN32)
 #  include <Windows.h>
+#else
+#  include <unistd.h>
 #endif
 
 #include <algorithm>
@@ -75,7 +77,12 @@ std::filesystem::path locate_world_root(const std::filesystem::path& extracted)
 
 std::filesystem::path make_temporary_world_directory()
 {
-    const auto unique = std::to_string(GetCurrentProcessId()) + "-" +
+#if defined(_WIN32)
+    const auto process_id = static_cast<std::uint64_t>(GetCurrentProcessId());
+#else
+    const auto process_id = static_cast<std::uint64_t>(getpid());
+#endif
+    const auto unique = std::to_string(process_id) + "-" +
         std::to_string(std::chrono::high_resolution_clock::now().time_since_epoch().count());
     return std::filesystem::temp_directory_path() / "WaterStructureCpp" / unique;
 }
