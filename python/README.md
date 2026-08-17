@@ -36,7 +36,7 @@ with Context() as ctx:
 ```python
 from water_structure import version, abi_version
 
-print(version())      # '0.1.3' —— 捆绑的原生库版本
+print(version())      # '0.1.4' —— 捆绑的原生库版本
 print(abi_version())  # 1 —— C ABI 版本（不兼容时会直接导入失败）
 ```
 
