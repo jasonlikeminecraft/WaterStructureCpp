@@ -5,9 +5,12 @@
 #include <WaterStructure/world.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
+#include <chrono>
 #include <filesystem>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -71,6 +74,48 @@ StructureId format_id(std::string_view requested)
     }
     return StructureId::Unknown;
 }
+
+class ProgressBridge {
+public:
+    ProgressBridge(ws_progress_callback callback, void* user_data)
+        : mCallback(callback), mUserData(user_data) {}
+
+    void start(std::uint8_t stage, std::size_t total)
+    {
+        mCompleted = 0;
+        mTotal = total;
+        emit(stage, 0, total, true);
+    }
+
+    void advance(std::uint8_t stage)
+    {
+        const auto completed = ++mCompleted;
+        emit(stage, completed, mTotal, completed >= mTotal);
+    }
+
+    void finish(std::uint8_t stage)
+    {
+        emit(stage, 1, 1, true);
+    }
+
+private:
+    void emit(std::uint8_t stage, std::uint64_t completed, std::uint64_t total, bool force)
+    {
+        if (mCallback == nullptr) return;
+        const auto now = std::chrono::steady_clock::now();
+        std::lock_guard lock(mMutex);
+        if (!force && now - mLastEmit < std::chrono::milliseconds(100)) return;
+        mLastEmit = now;
+        mCallback(mUserData, stage, completed, total);
+    }
+
+    ws_progress_callback mCallback = nullptr;
+    void* mUserData = nullptr;
+    std::mutex mMutex;
+    std::chrono::steady_clock::time_point mLastEmit{};
+    std::atomic<std::uint64_t> mCompleted{ 0 };
+    std::size_t mTotal = 0;
+};
 
 } // namespace
 } // namespace water_structure
@@ -202,16 +247,20 @@ WATER_STRUCTURE_API const char* ws_reader_format(const ws_reader* reader)
     return reader == nullptr ? "" : reader->format.c_str();
 }
 
-WATER_STRUCTURE_API int ws_convert(
+static int ws_convert_impl(
     ws_context* context,
     const char* input_path_utf8,
     const char* target_format,
     const char* output_path_utf8,
-    uint64_t thread_count)
+    uint64_t thread_count,
+    ws_progress_callback callback,
+    void* user_data)
 {
     if (context == nullptr || input_path_utf8 == nullptr || target_format == nullptr ||
         output_path_utf8 == nullptr) return 0;
     try {
+        water_structure::ProgressBridge progress(callback, user_data);
+        progress.start(WS_PROGRESS_OPEN, 1);
         const auto target = water_structure::format_id(target_format);
         if (target == water_structure::StructureId::Unknown) {
             set_error(context, "unknown target format: " + std::string(target_format));
@@ -223,8 +272,19 @@ WATER_STRUCTURE_API int ws_convert(
             set_error(context, opened.error());
             return 0;
         }
+        progress.finish(WS_PROGRESS_OPEN);
+        progress.start(WS_PROGRESS_READ, 1);
+        progress.finish(WS_PROGRESS_READ);
         water_structure::ConversionOptions options;
         options.thread_count = static_cast<std::size_t>(thread_count);
+        if (callback != nullptr) {
+            options.callbacks.start = [&progress](std::size_t total) {
+                progress.start(WS_PROGRESS_ENCODE, total);
+            };
+            options.callbacks.progress = [&progress]() {
+                progress.advance(WS_PROGRESS_ENCODE);
+            };
+        }
         auto written = water_structure::FormatRegistry::write(
             *opened.value(), target, water_structure::utf8_path(output_path_utf8),
             context->registry, options);
@@ -232,6 +292,95 @@ WATER_STRUCTURE_API int ws_convert(
             set_error(context, written.error());
             return 0;
         }
+        progress.finish(WS_PROGRESS_FINALIZE);
+        context->error.clear();
+        return 1;
+    } catch (const std::exception& error) {
+        set_error(context, error.what());
+        return 0;
+    } catch (...) {
+        set_error(context, "unknown WaterStructure error");
+        return 0;
+    }
+}
+
+WATER_STRUCTURE_API int ws_convert(
+    ws_context* context,
+    const char* input_path_utf8,
+    const char* target_format,
+    const char* output_path_utf8,
+    uint64_t thread_count)
+{
+    return ws_convert_impl(
+        context, input_path_utf8, target_format, output_path_utf8,
+        thread_count, nullptr, nullptr);
+}
+
+WATER_STRUCTURE_API int ws_convert_with_progress(
+    ws_context* context,
+    const char* input_path_utf8,
+    const char* target_format,
+    const char* output_path_utf8,
+    uint64_t thread_count,
+    ws_progress_callback callback,
+    void* user_data)
+{
+    return ws_convert_impl(
+        context, input_path_utf8, target_format, output_path_utf8,
+        thread_count, callback, user_data);
+}
+
+static int ws_to_world_impl(
+    ws_context* context,
+    const char* input_path_utf8,
+    const char* world_path_utf8,
+    int32_t start_x,
+    int32_t start_y,
+    int32_t start_z,
+    ws_progress_callback callback,
+    void* user_data)
+{
+    if (context == nullptr || input_path_utf8 == nullptr || world_path_utf8 == nullptr) return 0;
+    try {
+        water_structure::ProgressBridge progress(callback, user_data);
+        progress.start(WS_PROGRESS_OPEN, 1);
+        auto opened = water_structure::FormatRegistry::open(
+            water_structure::utf8_path(input_path_utf8), context->registry,
+            { true });
+        if (!opened) {
+            set_error(context, opened.error());
+            return 0;
+        }
+        progress.finish(WS_PROGRESS_OPEN);
+        progress.start(WS_PROGRESS_READ, 1);
+        progress.finish(WS_PROGRESS_READ);
+        auto world = water_structure::BedrockWorldAdapter::open(
+            water_structure::utf8_path(world_path_utf8));
+        if (!world) {
+            set_error(context, world.error());
+            return 0;
+        }
+        water_structure::ConversionCallbacks callbacks;
+        if (callback != nullptr) {
+            callbacks.start = [&progress](std::size_t total) {
+                progress.start(WS_PROGRESS_WRITE, total);
+            };
+            callbacks.progress = [&progress]() {
+                progress.advance(WS_PROGRESS_WRITE);
+            };
+        }
+        auto converted = opened.value()->write_to_world(
+            world.value(), { start_x, start_y, start_z }, std::move(callbacks));
+        if (!converted) {
+            set_error(context, converted.error());
+            return 0;
+        }
+        auto closed = world.value().close();
+        if (!closed) {
+            set_error(context, closed.error());
+            return 0;
+        }
+        progress.finish(WS_PROGRESS_FINALIZE);
         context->error.clear();
         return 1;
     } catch (const std::exception& error) {
@@ -251,41 +400,24 @@ WATER_STRUCTURE_API int ws_to_world(
     int32_t start_y,
     int32_t start_z)
 {
-    if (context == nullptr || input_path_utf8 == nullptr || world_path_utf8 == nullptr) return 0;
-    try {
-        auto opened = water_structure::FormatRegistry::open(
-            water_structure::utf8_path(input_path_utf8), context->registry,
-            { true });
-        if (!opened) {
-            set_error(context, opened.error());
-            return 0;
-        }
-        auto world = water_structure::BedrockWorldAdapter::open(
-            water_structure::utf8_path(world_path_utf8));
-        if (!world) {
-            set_error(context, world.error());
-            return 0;
-        }
-        auto converted = opened.value()->write_to_world(
-            world.value(), { start_x, start_y, start_z }, {});
-        if (!converted) {
-            set_error(context, converted.error());
-            return 0;
-        }
-        auto closed = world.value().close();
-        if (!closed) {
-            set_error(context, closed.error());
-            return 0;
-        }
-        context->error.clear();
-        return 1;
-    } catch (const std::exception& error) {
-        set_error(context, error.what());
-        return 0;
-    } catch (...) {
-        set_error(context, "unknown WaterStructure error");
-        return 0;
-    }
+    return ws_to_world_impl(
+        context, input_path_utf8, world_path_utf8,
+        start_x, start_y, start_z, nullptr, nullptr);
+}
+
+WATER_STRUCTURE_API int ws_to_world_with_progress(
+    ws_context* context,
+    const char* input_path_utf8,
+    const char* world_path_utf8,
+    int32_t start_x,
+    int32_t start_y,
+    int32_t start_z,
+    ws_progress_callback callback,
+    void* user_data)
+{
+    return ws_to_world_impl(
+        context, input_path_utf8, world_path_utf8,
+        start_x, start_y, start_z, callback, user_data);
 }
 
 } // extern "C"

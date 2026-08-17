@@ -1548,12 +1548,23 @@ int main()
             *mcfunction_source.value(), water_structure::StructureId::MCFunction,
             mcfunction_writer_path, registry);
         check(mcfunction_written.ok(), "MCFunction writer succeeds");
+        std::size_t mcfunction_progress_total = 0;
+        std::size_t mcfunction_progress_done = 0;
+        water_structure::ConversionOptions mcfunction_progress_options{
+            .thread_count = 1
+        };
+        mcfunction_progress_options.callbacks.start =
+            [&](std::size_t total) { mcfunction_progress_total = total; };
+        mcfunction_progress_options.callbacks.progress =
+            [&]() { ++mcfunction_progress_done; };
         const auto mcfunction_single_thread_written = water_structure::FormatRegistry::write(
             *mcfunction_source.value(), water_structure::StructureId::MCFunction,
-            mcfunction_single_thread_path, registry,
-            water_structure::ConversionOptions{ .thread_count = 1 });
+            mcfunction_single_thread_path, registry, mcfunction_progress_options);
         check(mcfunction_single_thread_written.ok(),
             "MCFunction single-thread writer succeeds");
+        check(mcfunction_progress_total > 0 &&
+            mcfunction_progress_done == mcfunction_progress_total,
+            "MCFunction writer reports chunk progress");
         {
             std::ifstream parallel(mcfunction_writer_path, std::ios::binary);
             std::ifstream sequential(mcfunction_single_thread_path, std::ios::binary);

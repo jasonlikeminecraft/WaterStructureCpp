@@ -687,9 +687,11 @@ Result<void> convert_to_world(const IStructure& structure, WorldTarget& world, S
     for (std::size_t begin = 0; begin < positions.size(); begin += batch_size) {
         const auto end = std::min(begin + batch_size, positions.size());
         const auto batch = std::span<const ChunkPos>(positions).subspan(begin, end - begin);
+        std::size_t visited_chunk_count = 0;
         const auto visit_chunks_start = Clock::now();
         auto visited_chunks = structure.visit_chunks(batch,
             [&](ChunkPos local_pos, const ChunkData& chunk) -> Result<void> {
+            ++visited_chunk_count;
             const ChunkPos target_pos{ local_pos.x + start.x, local_pos.z + start.z };
             ChunkData shifted;
             const auto sub_y_offset = start.y - kMinSubChunkY;
@@ -719,6 +721,11 @@ Result<void> convert_to_world(const IStructure& structure, WorldTarget& world, S
         });
         visit_chunks_ms += elapsed_ms(visit_chunks_start);
         if (!visited_chunks) return visited_chunks;
+        if (callbacks.progress && visited_chunk_count < batch.size()) {
+            for (std::size_t missing = visited_chunk_count; missing < batch.size(); ++missing) {
+                callbacks.progress();
+            }
+        }
 
         const auto visit_entities_start = Clock::now();
         auto visited_entities = structure.visit_chunk_nbt(batch,

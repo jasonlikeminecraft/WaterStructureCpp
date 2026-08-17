@@ -41,6 +41,144 @@
 namespace water_structure {
 
 namespace {
+
+class ProgressStructure final : public IStructure {
+public:
+    ProgressStructure(const IStructure& source, ConversionCallbacks callbacks)
+        : mSource(source), mCallbacks(std::move(callbacks)) {}
+
+    StructureId id() const noexcept override { return mSource.id(); }
+    std::string_view name() const noexcept override { return mSource.name(); }
+    Size size() const noexcept override { return mSource.size(); }
+    BlockPos offset() const noexcept override { return mSource.offset(); }
+    void set_offset(BlockPos value) noexcept override
+    {
+        const_cast<IStructure&>(mSource).set_offset(value);
+    }
+
+    Result<void> read(const std::filesystem::path& path) override
+    {
+        return const_cast<IStructure&>(mSource).read(path);
+    }
+
+    Result<ChunkMap> get_chunks(std::span<const ChunkPos> positions) const override
+    {
+        auto result = mSource.get_chunks(positions);
+        if (result && mCallbacks.progress) advance(positions.size());
+        return result;
+    }
+
+    Result<ChunkMap> get_chunks_layer0(std::span<const ChunkPos> positions) const override
+    {
+        auto result = mSource.get_chunks_layer0(positions);
+        if (result && mCallbacks.progress) advance(positions.size());
+        return result;
+    }
+
+    Result<void> visit_chunks(
+        std::span<const ChunkPos> positions,
+        const ChunkVisitor& visitor) const override
+    {
+        std::size_t visited = 0;
+        auto result = mSource.visit_chunks(positions,
+            [&](ChunkPos position, const ChunkData& chunk) -> Result<void> {
+                auto result = visitor(position, chunk);
+                if (result) {
+                    ++visited;
+                    if (mCallbacks.progress) advance();
+                }
+                return result;
+            });
+        if (result && mCallbacks.progress && visited < positions.size()) {
+            advance(positions.size() - visited);
+        }
+        return result;
+    }
+
+    Result<void> visit_chunk_nbt(
+        std::span<const ChunkPos> positions,
+        const ChunkNbtVisitor& visitor) const override
+    {
+        return mSource.visit_chunk_nbt(positions, visitor);
+    }
+
+    void release_cached_chunks() const noexcept override
+    {
+        mSource.release_cached_chunks();
+    }
+
+    Result<void> visit_chunk_palettes(
+        std::span<const ChunkPos> positions,
+        const ChunkPaletteVisitor& visitor) const override
+    {
+        std::size_t visited = 0;
+        auto result = mSource.visit_chunk_palettes(positions,
+            [&](ChunkPos position, std::span<const SubChunkPaletteData> palettes) -> Result<void> {
+                auto result = visitor(position, palettes);
+                if (result) {
+                    ++visited;
+                    if (mCallbacks.progress) advance();
+                }
+                return result;
+            });
+        if (result && mCallbacks.progress && visited < positions.size()) {
+            advance(positions.size() - visited);
+        }
+        return result;
+    }
+
+    std::size_t preferred_palette_batch_size() const noexcept override
+    {
+        return mSource.preferred_palette_batch_size();
+    }
+
+    Result<NbtChunkMap> get_chunk_nbt(std::span<const ChunkPos> positions) const override
+    {
+        return mSource.get_chunk_nbt(positions);
+    }
+
+    Result<std::size_t> count_non_air_blocks() const override
+    {
+        return mSource.count_non_air_blocks();
+    }
+
+    Result<void> write_to_world(
+        WorldTarget& world,
+        SubChunkPos start,
+        ConversionCallbacks callbacks) const override
+    {
+        return mSource.write_to_world(world, start, std::move(callbacks));
+    }
+
+    Result<void> read_from_world(
+        WorldSource& world,
+        BlockBox box,
+        ConversionCallbacks callbacks) override
+    {
+        return const_cast<IStructure&>(mSource).read_from_world(
+            world, box, std::move(callbacks));
+    }
+
+    void set_total(std::size_t total)
+    {
+        if (mCallbacks.start) mCallbacks.start(total);
+    }
+
+private:
+    void advance(std::size_t count) const
+    {
+        for (std::size_t index = 0; index < count; ++index) advance();
+    }
+
+    void advance() const
+    {
+        if (mCallbacks.progress) mCallbacks.progress();
+    }
+
+    const IStructure& mSource;
+    ConversionCallbacks mCallbacks;
+};
+
 const std::vector<FormatInfo> kFormats = {
     { StructureId::Schematic, "Schematic", { ".schematic" }, true, true, true, true, { "gzip/NBT:Schematic" } },
     { StructureId::SchemV1, "SchemV1", { ".schem" }, true, true, true, true, { "gzip/NBT:Palette" } },
@@ -432,32 +570,42 @@ Result<void> FormatRegistry::write(
     RuntimeRegistry& registry,
     const ConversionOptions& options)
 {
+    std::unique_ptr<ProgressStructure> progress_structure;
+    const IStructure* input = &structure;
+    if (options.callbacks.start || options.callbacks.progress) {
+        progress_structure = std::make_unique<ProgressStructure>(structure, options.callbacks);
+        const auto size = structure.size();
+        const auto total = static_cast<std::size_t>(size.chunk_x_count()) *
+            static_cast<std::size_t>(size.chunk_z_count());
+        progress_structure->set_total(total);
+        input = progress_structure.get();
+    }
     if (format == StructureId::MCStructure) {
-        return write_mcstructure(structure, registry, path);
+        return write_mcstructure(*input, registry, path);
     }
     if (format == StructureId::BDX) {
-        return write_bdx(structure, registry, path);
+        return write_bdx(*input, registry, path);
     }
     if (format == StructureId::AxiomBP) {
-        return write_axiom_bp(structure, registry, path);
+        return write_axiom_bp(*input, registry, path);
     }
     if (format == StructureId::SchemV1 || format == StructureId::SchemV2) {
-        return write_schem(structure, registry, format, path);
+        return write_schem(*input, registry, format, path);
     }
     if (format == StructureId::Litematic) {
-        return write_litematic(structure, registry, path);
+        return write_litematic(*input, registry, path);
     }
     if (format == StructureId::Schematic) {
-        return write_schematic(structure, registry, path);
+        return write_schematic(*input, registry, path);
     }
     if (format == StructureId::IBImport) {
-        return write_ibimport(structure, registry, path, options);
+        return write_ibimport(*input, registry, path, options);
     }
     if (format == StructureId::FuHongV4 || format == StructureId::FuHongV5) {
-        return write_fuhong(structure, registry, format, path);
+        return write_fuhong(*input, registry, format, path);
     }
     if (format == StructureId::MCFunction) {
-        return write_mcfunction(structure, registry, path, options);
+        return write_mcfunction(*input, registry, path, options);
     }
     return Result<void>::failure(
         "capability error: 目标格式 " + to_string(format) + " 没有已验证的 writer");

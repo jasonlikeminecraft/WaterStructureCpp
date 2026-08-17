@@ -232,6 +232,19 @@ public:
         render(true);
     }
 
+    void start_indeterminate(std::string_view label)
+    {
+        end_busy();
+        std::lock_guard lock(mMutex);
+        mLabel.assign(label);
+        mTotal = 1;
+        mDone = 0;
+        mLastPercent = -1;
+        mBegin = Clock::now();
+        mIndeterminate = true;
+        render(true);
+    }
+
     void stage(std::string_view label, bool indeterminate = false)
     {
         std::lock_guard lock(mMutex);
@@ -433,23 +446,30 @@ int convert_file(
     }
     const auto begin = Clock::now();
     Progress progress(common.quiet);
-    // Conversion writers currently expose no per-block callback.  Treat the
-    // operation as two measurable stages (open and write); while the write
-    // stage is active the background refresh keeps elapsed time visible and
-    // estimates its remaining duration from the completed open stage.
-    progress.start(2);
-    progress.stage("读取");
+    // Reading does not expose a stable total across all formats, so keep it
+    // indeterminate. Writers report a real chunk total below.
+    progress.start_indeterminate("读取");
+    progress.begin_busy();
     auto opened = water_structure::FormatRegistry::open(input, registry);
     if (!opened) {
+        progress.end_busy();
         if (!common.quiet) std::cout << '\n';
         std::cerr << "error: " << opened.error() << '\n';
         return kInputError;
     }
-    progress.advance();
-    progress.stage("写入", true);
-    progress.begin_busy();
+    progress.end_busy();
+    progress.stage("写入");
+    water_structure::ConversionOptions conversion_options;
+    conversion_options.thread_count = threads;
+    conversion_options.callbacks.start = [&progress](std::size_t total) {
+        progress.start(total);
+        progress.begin_busy();
+    };
+    conversion_options.callbacks.progress = [&progress]() {
+        progress.advance();
+    };
     auto written = water_structure::FormatRegistry::write(
-        *opened.value(), *format, output, registry, {threads, 0});
+        *opened.value(), *format, output, registry, conversion_options);
     progress.end_busy();
     if (!written) {
         if (!common.quiet) std::cout << '\n';

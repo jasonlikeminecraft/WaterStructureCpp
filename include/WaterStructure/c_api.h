@@ -19,6 +19,19 @@ extern "C" {
 typedef struct ws_context ws_context;
 typedef struct ws_reader ws_reader;
 
+/* Progress stages reported by the optional conversion callback. */
+#define WS_PROGRESS_OPEN 0
+#define WS_PROGRESS_READ 1
+#define WS_PROGRESS_ENCODE 2
+#define WS_PROGRESS_WRITE 3
+#define WS_PROGRESS_FINALIZE 4
+
+typedef void (*ws_progress_callback)(
+    void* user_data,
+    uint8_t stage,
+    uint64_t completed,
+    uint64_t total);
+
 typedef struct ws_structure_info {
     uint8_t format_id;
     int32_t width;
@@ -55,6 +68,16 @@ WATER_STRUCTURE_API int ws_convert(
     const char* output_path_utf8,
     uint64_t thread_count);
 
+/* Optional progress-enabled variant; ws_convert remains ABI-compatible. */
+WATER_STRUCTURE_API int ws_convert_with_progress(
+    ws_context* context,
+    const char* input_path_utf8,
+    const char* target_format,
+    const char* output_path_utf8,
+    uint64_t thread_count,
+    ws_progress_callback callback,
+    void* user_data);
+
 WATER_STRUCTURE_API int ws_to_world(
     ws_context* context,
     const char* input_path_utf8,
@@ -62,6 +85,16 @@ WATER_STRUCTURE_API int ws_to_world(
     int32_t start_x,
     int32_t start_y,
     int32_t start_z);
+
+WATER_STRUCTURE_API int ws_to_world_with_progress(
+    ws_context* context,
+    const char* input_path_utf8,
+    const char* world_path_utf8,
+    int32_t start_x,
+    int32_t start_y,
+    int32_t start_z,
+    ws_progress_callback callback,
+    void* user_data);
 
 #ifdef __cplusplus
 }

@@ -30,6 +30,10 @@ struct ConversionOptions {
     std::size_t thread_count = 0;
     // Zero keeps at most two tasks per worker in flight.
     std::size_t max_in_flight_tasks = 0;
+    // Optional chunk-level callbacks. Writers report completed source chunks
+    // through a bounded proxy so callers can display progress without adding
+    // per-block overhead.
+    ConversionCallbacks callbacks{};
 };
 
 struct OpenOptions {

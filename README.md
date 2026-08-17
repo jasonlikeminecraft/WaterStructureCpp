@@ -29,6 +29,10 @@ Install a published platform wheel from PyPI with:
 python -m pip install water-structure
 ```
 
+See the [detailed Python tutorial](python/README.md) for virtual environments,
+format inspection, conversions, world output, batching, error handling,
+thread selection, Termux, and current progress-reporting limitations.
+
 The installed package automatically locates its bundled runtime assets:
 
 ```python
@@ -54,9 +58,9 @@ which is a thin wrapper around the same Python builder.
 
 Use `.\python\publish.ps1 -TestPyPI` for a TestPyPI upload and
 `.\python\publish.ps1` only after the TestPyPI installation test succeeds.
-The bindings support Python 3.9+ on Windows, Linux, and macOS. Package and
-native versions must be updated together in `python/pyproject.toml` and
-`ws_version()`.
+The bindings support Python 3.9+ on Windows, Linux, macOS, and Android Termux
+arm64-v8a. Package and native versions must be updated together in
+`python/pyproject.toml` and `ws_version()`.
 
 For CMake consumers, configure with `-DWATER_STRUCTURE_BUILD_SHARED=ON`, then
 install the package. The install tree exports `WaterStructure::water_structure`
@@ -80,8 +84,10 @@ installed rather than silently producing an incomplete package.
 
 The C ABI is versioned independently with `ws_abi_version()`. ABI version 1
 currently exposes reader inspection, validated format conversion, and the
-streaming `to_world` path. New functions will be appended without changing
-existing structures or ownership rules.
+streaming `to_world` path. The optional `ws_convert_with_progress()` and
+`ws_to_world_with_progress()` entry points report throttled stage/chunk progress
+without changing the original blocking functions. New functions are appended
+without changing existing structures or ownership rules.
 
 WaterStructureCpp 是一个面向 Minecraft 建筑结构文件的 C++23 解析、转换与
 Bedrock 世界读写库。项目注册了 37 种结构格式，并提供静态库、命令行工具、

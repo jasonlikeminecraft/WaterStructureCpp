@@ -3,8 +3,9 @@ from __future__ import annotations
 import ctypes
 import os
 import platform
+import time
 from pathlib import Path
-from typing import List, NamedTuple, Optional, Tuple, Union
+from typing import Callable, List, NamedTuple, Optional, Tuple, Union
 
 PathValue = Union[str, os.PathLike[str]]
 
@@ -22,6 +23,18 @@ class StructureInfo(NamedTuple):
     offset_y: int
     offset_z: int
     non_air_blocks: int
+
+
+class Progress(NamedTuple):
+    """A throttled progress snapshot emitted by a native conversion."""
+
+    stage: str
+    completed: int
+    total: Optional[int]
+    percent: Optional[float]
+    elapsed: float
+    eta: Optional[float]
+    indeterminate: bool
 
 
 class _CStructureInfo(ctypes.Structure):
@@ -102,6 +115,21 @@ _lib.ws_convert.argtypes = [
     ctypes.c_uint64,
 ]
 _lib.ws_convert.restype = ctypes.c_int
+_ProgressCallback = ctypes.CFUNCTYPE(
+    None, ctypes.c_void_p, ctypes.c_uint8, ctypes.c_uint64, ctypes.c_uint64
+)
+_ws_convert_with_progress = getattr(_lib, "ws_convert_with_progress", None)
+if _ws_convert_with_progress is not None:
+    _ws_convert_with_progress.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_char_p,
+        ctypes.c_char_p,
+        ctypes.c_char_p,
+        ctypes.c_uint64,
+        _ProgressCallback,
+        ctypes.c_void_p,
+    ]
+    _ws_convert_with_progress.restype = ctypes.c_int
 _lib.ws_to_world.argtypes = [
     ctypes.c_void_p,
     ctypes.c_char_p,
@@ -111,6 +139,19 @@ _lib.ws_to_world.argtypes = [
     ctypes.c_int32,
 ]
 _lib.ws_to_world.restype = ctypes.c_int
+_ws_to_world_with_progress = getattr(_lib, "ws_to_world_with_progress", None)
+if _ws_to_world_with_progress is not None:
+    _ws_to_world_with_progress.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_char_p,
+        ctypes.c_char_p,
+        ctypes.c_int32,
+        ctypes.c_int32,
+        ctypes.c_int32,
+        _ProgressCallback,
+        ctypes.c_void_p,
+    ]
+    _ws_to_world_with_progress.restype = ctypes.c_int
 
 if _lib.ws_abi_version() != 1:
     raise ImportError(f"unsupported WaterStructure C ABI: {_lib.ws_abi_version()}")
@@ -162,6 +203,52 @@ class Context:
         value = _lib.ws_last_error(self._require_open())
         return value.decode("utf-8", "replace") if value else "unknown error"
 
+    @staticmethod
+    def _progress_callback(
+        callback: Callable[[Progress], object],
+    ) -> tuple[_ProgressCallback, list[BaseException]]:
+        stages = ("open", "read", "encode", "write", "finalize")
+        errors: list[BaseException] = []
+        state = {"stage": None, "started": time.monotonic()}
+
+        def native_callback(
+            _user_data: int,
+            stage_code: int,
+            completed: int,
+            total: int,
+        ) -> None:
+            now = time.monotonic()
+            stage = stages[stage_code] if stage_code < len(stages) else "unknown"
+            if state["stage"] != stage:
+                state["stage"] = stage
+                state["started"] = now
+            elapsed = now - state["started"]
+            done = int(completed)
+            total_value = int(total) if total else None
+            percent = None
+            eta = None
+            if total_value is not None:
+                percent = min(100.0, done * 100.0 / total_value)
+                if done > 0 and done < total_value:
+                    eta = elapsed * (total_value - done) / done
+                elif done >= total_value:
+                    eta = 0.0
+            event = Progress(
+                stage,
+                done,
+                total_value,
+                percent,
+                elapsed,
+                eta,
+                total_value is None,
+            )
+            try:
+                callback(event)
+            except BaseException as error:  # ctypes cannot propagate callback exceptions
+                errors.append(error)
+
+        return _ProgressCallback(native_callback), errors
+
     def inspect(
         self,
         path: PathValue,
@@ -209,6 +296,7 @@ class Context:
         output_path: PathValue,
         *,
         threads: int = 0,
+        progress: Optional[Callable[[Progress], object]] = None,
     ) -> None:
         """Convert a structure to a supported writer format.
 
@@ -224,13 +312,34 @@ class Context:
         """
         if threads < 0:
             raise ValueError("threads must be >= 0")
-        if not _lib.ws_convert(
-            self._require_open(),
-            os.fsencode(input_path),
-            target_format.encode("utf-8"),
-            os.fsencode(output_path),
-            threads,
-        ):
+        handle = self._require_open()
+        if progress is None:
+            converted = _lib.ws_convert(
+                handle,
+                os.fsencode(input_path),
+                target_format.encode("utf-8"),
+                os.fsencode(output_path),
+                threads,
+            )
+            callback_errors: list[BaseException] = []
+        else:
+            if not callable(progress):
+                raise TypeError("progress must be callable")
+            if _ws_convert_with_progress is None:
+                raise Error("native library does not provide progress callbacks")
+            callback, callback_errors = self._progress_callback(progress)
+            converted = _ws_convert_with_progress(
+                handle,
+                os.fsencode(input_path),
+                target_format.encode("utf-8"),
+                os.fsencode(output_path),
+                threads,
+                callback,
+                None,
+            )
+        if callback_errors:
+            raise callback_errors[0]
+        if not converted:
             raise Error(self._error())
 
     def to_world(
@@ -239,16 +348,39 @@ class Context:
         world_path: PathValue,
         *,
         start: Tuple[int, int, int] = (0, -4, 0),
+        progress: Optional[Callable[[Progress], object]] = None,
     ) -> None:
         """Stream a structure into a world directory or .mcworld archive."""
         if len(start) != 3:
             raise ValueError("start must contain x, subchunk-y, and z")
-        if not _lib.ws_to_world(
-            self._require_open(),
-            os.fsencode(input_path),
-            os.fsencode(world_path),
-            int(start[0]),
-            int(start[1]),
-            int(start[2]),
-        ):
+        handle = self._require_open()
+        if progress is None:
+            converted = _lib.ws_to_world(
+                handle,
+                os.fsencode(input_path),
+                os.fsencode(world_path),
+                int(start[0]),
+                int(start[1]),
+                int(start[2]),
+            )
+            callback_errors: list[BaseException] = []
+        else:
+            if not callable(progress):
+                raise TypeError("progress must be callable")
+            if _ws_to_world_with_progress is None:
+                raise Error("native library does not provide progress callbacks")
+            callback, callback_errors = self._progress_callback(progress)
+            converted = _ws_to_world_with_progress(
+                handle,
+                os.fsencode(input_path),
+                os.fsencode(world_path),
+                int(start[0]),
+                int(start[1]),
+                int(start[2]),
+                callback,
+                None,
+            )
+        if callback_errors:
+            raise callback_errors[0]
+        if not converted:
             raise Error(self._error())
