@@ -837,7 +837,10 @@ Result<void> write_mcfunction(
                 for (const auto& subchunk : subchunks) {
                     std::vector<std::uint32_t> palette_handles;
                     palette_handles.reserve(subchunk.palette.size());
-                    for (const auto& state : subchunk.palette) {
+                    const auto& palette = subchunk.shared_palette
+                        ? *subchunk.shared_palette
+                        : subchunk.palette;
+                    for (const auto& state : palette) {
                         const auto key = palette_state_key(state);
                         std::string formatted;
                         const auto global = global_states.find(key);

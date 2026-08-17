@@ -14,8 +14,9 @@ keywords = ["minecraft", "bedrock", "schematic", "schem", "bdx", "mcworld"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
-    "Operating System :: Microsoft :: Windows :: Windows 10",
-    "Operating System :: Microsoft :: Windows :: Windows 11",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS :: MacOS X",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
     "Topic :: Software Development :: Libraries :: Python Modules",
@@ -37,12 +38,12 @@ namespaces = true
 [tool.setuptools.package-data]
 water_structure = [
     "*.dll",
+    "*.so",
+    "*.dylib",
+    "*.pyd",
     "*.pyi",
     "py.typed",
     "assets/*.json",
     "assets/*-LICENSE",
     "assets/block_upgrade_schemas/*.json",
 ]
-
-[tool.distutils.bdist_wheel]
-plat-name = "win_amd64"

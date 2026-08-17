@@ -5,6 +5,7 @@
 
 #include <filesystem>
 #include <cstdint>
+#include <memory>
 #include <unordered_map>
 #include <vector>
 
@@ -30,6 +31,10 @@ public:
     void set_streaming_world_import(bool enabled) noexcept { mStreamingWorldImport = enabled; }
     Result<ChunkMap> get_chunks(std::span<const ChunkPos> positions) const override;
     Result<void> visit_chunks(std::span<const ChunkPos> positions, const ChunkVisitor& visitor) const override;
+    Result<void> visit_chunk_palettes(
+        std::span<const ChunkPos> positions,
+        const ChunkPaletteVisitor& visitor) const override;
+    std::size_t preferred_palette_batch_size() const noexcept override;
     Result<NbtChunkMap> get_chunk_nbt(std::span<const ChunkPos> positions) const override;
     Result<std::size_t> count_non_air_blocks() const override;
     Result<void> write_to_world(WorldTarget& world, SubChunkPos start, ConversionCallbacks callbacks) const override;
@@ -52,6 +57,9 @@ private:
     std::uint32_t mMaxPaletteIndex = 0;
     std::unordered_map<std::uint32_t, std::uint32_t> mPalette;
     std::vector<std::uint32_t> mDensePalette;
+    mutable std::shared_ptr<const std::vector<BlockState>> mSharedPaletteStates;
+    mutable std::vector<std::uint8_t> mSharedAirPaletteFlags;
+    mutable std::uint16_t mSharedAirPaletteIndex = 0;
     std::uint32_t mUnknownRuntimeId = 0;
     bool mNonAirCountValid = false;
     bool mStreamingWorldImport = false;

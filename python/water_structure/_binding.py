@@ -40,17 +40,26 @@ class _CStructureInfo(ctypes.Structure):
 def _library_candidates() -> List[Path]:
     configured = os.environ.get("WATER_STRUCTURE_LIBRARY")
     package = Path(__file__).resolve().parent
-    candidates = [package / "water_structure_shared.dll"]
+    system = platform.system()
+    if system == "Windows":
+        names = ["water_structure_shared.dll"]
+        names.extend(path.name for path in package.glob("_water_structure*.pyd"))
+    elif system == "Linux":
+        names = ["libwater_structure_shared.so", "water_structure_shared.so"]
+    elif system == "Darwin":
+        names = ["libwater_structure_shared.dylib", "water_structure_shared.dylib"]
+    else:
+        names = []
+    candidates = [package / name for name in names]
     if configured:
         candidates.insert(0, Path(configured).expanduser())
     return candidates
 
 
 def _load_library() -> ctypes.CDLL:
-    if platform.system() != "Windows":
-        raise ImportError(
-            "water-structure 0.1 currently publishes native wheels for Windows only"
-        )
+    system = platform.system()
+    if system not in {"Windows", "Linux", "Darwin"}:
+        raise ImportError(f"water-structure does not support {system or 'this platform'}")
     errors: List[str] = []
     for candidate in _library_candidates():
         if not candidate.is_file():
@@ -59,10 +68,10 @@ def _load_library() -> ctypes.CDLL:
             return ctypes.CDLL(str(candidate))
         except OSError as exc:
             errors.append(f"{candidate}: {exc}")
-    detail = "; ".join(errors) if errors else "bundled DLL is missing"
+    detail = "; ".join(errors) if errors else "bundled native library is missing"
     raise ImportError(
         "unable to load WaterStructure native library (" + detail + "). "
-        "Reinstall the wheel or set WATER_STRUCTURE_LIBRARY to a compatible DLL."
+        "Reinstall the wheel or set WATER_STRUCTURE_LIBRARY to a compatible library."
     )
 
 

@@ -1627,6 +1627,30 @@ int main()
             ibimport_round_trip_chunks.value().at({ 0, 0 }).sub_chunks.at(-4).layer0[0] ==
                 registry.schematic_runtime_id(1, 0).value(),
             "IBImport writer round-trip block state");
+        const auto ibimport_parallel_path = std::filesystem::temp_directory_path() /
+            "water_structure_cpp_writer_parallel.ibi";
+        const auto ibimport_single_thread_path = std::filesystem::temp_directory_path() /
+            "water_structure_cpp_writer_single_thread.ibi";
+        const auto ibimport_parallel = water_structure::FormatRegistry::write(
+            *mcfunction_source.value(), water_structure::StructureId::IBImport,
+            ibimport_parallel_path, registry,
+            water_structure::ConversionOptions{ .thread_count = 4 });
+        const auto ibimport_single_thread = water_structure::FormatRegistry::write(
+            *mcfunction_source.value(), water_structure::StructureId::IBImport,
+            ibimport_single_thread_path, registry,
+            water_structure::ConversionOptions{ .thread_count = 1 });
+        check(ibimport_parallel.ok() && ibimport_single_thread.ok(),
+            "IBImport generic writer supports configured thread counts");
+        {
+            std::ifstream parallel(ibimport_parallel_path, std::ios::binary);
+            std::ifstream sequential(ibimport_single_thread_path, std::ios::binary);
+            const std::string parallel_bytes{
+                std::istreambuf_iterator<char>(parallel), std::istreambuf_iterator<char>() };
+            const std::string sequential_bytes{
+                std::istreambuf_iterator<char>(sequential), std::istreambuf_iterator<char>() };
+            check(parallel_bytes == sequential_bytes,
+                "IBImport generic thread counts preserve deterministic output");
+        }
         for (const auto fuhong_format : {
             water_structure::StructureId::FuHongV4,
             water_structure::StructureId::FuHongV5 }) {
@@ -1651,6 +1675,8 @@ int main()
             std::filesystem::remove(fuhong_writer_path);
         }
         std::filesystem::remove(ibimport_writer_path);
+        std::filesystem::remove(ibimport_parallel_path);
+        std::filesystem::remove(ibimport_single_thread_path);
         std::filesystem::remove(mcfunction_single_thread_path);
         std::filesystem::remove(mcfunction_writer_path);
         std::filesystem::remove(mcfunction_source_path);

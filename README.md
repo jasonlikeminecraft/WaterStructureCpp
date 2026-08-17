@@ -6,13 +6,15 @@ The project now provides three consumption layers:
 
 - `water_structure`: the existing C++23 static library for applications that
   want the native `WaterStructure/*` API.
-- `water_structure_shared`: a Windows DLL with the stable C ABI declared in
+- `water_structure_shared`: a platform shared library (`.dll`, `.so`, or
+  `.dylib`) with the stable C ABI declared in
   [`include/WaterStructure/c_api.h`](include/WaterStructure/c_api.h). The ABI
   uses opaque handles, UTF-8 paths, integer result codes, and a context-owned
   error string; C++ STL types and exceptions never cross the DLL boundary.
-- `python/`: a dependency-free `ctypes` wrapper. The PyPI wheel bundles the
-  DLL and assets; source-tree users can set `WATER_STRUCTURE_LIBRARY` to a
-  locally built DLL. Use `Context.inspect()`, `Context.convert()`, and
+- `python/`: a dependency-free `ctypes` wrapper. Each platform wheel bundles
+  its native library and assets; source-tree users can set
+  `WATER_STRUCTURE_LIBRARY` to a locally built shared library. Use
+  `Context.inspect()`, `Context.convert()`, and
   `Context.to_world()`.
 
 Build the native targets with:
@@ -21,7 +23,7 @@ Build the native targets with:
 xmake build -m release water_structure water_structure_shared water_structure_cli
 ```
 
-Install the prebuilt Windows x64 wheel from PyPI with:
+Install a published platform wheel from PyPI with:
 
 ```text
 python -m pip install water-structure
@@ -37,18 +39,24 @@ with Context() as ctx:
     ctx.convert(r"D:\import\input.bdx", "SchemV1", r"D:\import\output.schem")
 ```
 
-To build and validate a wheel locally, install `build` and `twine`, then run:
+To build a wheel on Windows, Linux, or macOS, install `build` and `twine`, then
+run the platform-neutral builder:
 
-```powershell
+```text
 python -m pip install build twine
-.\python\build_wheel.ps1
-python -m twine check .\dist\python\*.whl
+python python/build_wheel.py
+python -m twine check dist/python/*.whl
 ```
+
+The builder lets xmake choose its default parallelism; it does not force a
+thread count. Windows users may continue to call `python/build_wheel.ps1`,
+which is a thin wrapper around the same Python builder.
 
 Use `.\python\publish.ps1 -TestPyPI` for a TestPyPI upload and
 `.\python\publish.ps1` only after the TestPyPI installation test succeeds.
-The first release supports Python 3.9+ on Windows x64. Package and native
-versions must be updated together in `python/pyproject.toml` and `ws_version()`.
+The bindings support Python 3.9+ on Windows, Linux, and macOS. Package and
+native versions must be updated together in `python/pyproject.toml` and
+`ws_version()`.
 
 For CMake consumers, configure with `-DWATER_STRUCTURE_BUILD_SHARED=ON`, then
 install the package. The install tree exports `WaterStructure::water_structure`
@@ -61,8 +69,8 @@ cmake --install build/cmake-release --prefix dist/install
 ```
 
 The repository also contains `cmake/copy_runtime.ps1` for a relocatable
-Windows runtime directory, `python/build_wheel.ps1` for a wheel that bundles
-the DLL and mapping assets, `nuget/pack.ps1` for the native NuGet package, and
+Windows runtime directory, `python/build_wheel.py` for a wheel that bundles
+the platform library and mapping assets, `nuget/pack.ps1` for the native NuGet package, and
 an overlay port under `ports/water-structure` for vcpkg integration.
 
 The current source tree verifies xmake, DLL loading, C ABI calls, and Python
@@ -166,11 +174,21 @@ MCFunction reader 同样采用有界流式路径：逐行解析后只保留紧�
 
 IBImport writer 的命令段和命令方块 NBT 段均逐 chunk 读取并立即 XOR 写出；段长度
 在结束时回填，不缓存完整命令文本、全部 chunk 坐标或全部方块实体。每个 chunk
-处理完成后主动释放 reader 缓存，峰值工作集受单个 chunk 及其方块实体数量约束。
+处理完成后主动释放 reader 缓存，峰值工作集受自适应读取批次和有界编码队列约束。
 方块命令会在单个 chunk 内做有界三维贪心合并：孤立方块使用 `setblock`，连续同状态
 区域使用不超过 32,768 方块的 `fill`。reader 对 XOR 段逐块解码，只紧凑保存
 `setblock`/`fill` 命令，并在下游请求 chunk 时物化交集；不再有旧版 256 MiB 段限制，
 也不会按 `fill` 体积展开常驻方块数组。
+
+IBImport 的有界编码线程池同时用于 palette 和通用 `ChunkData` 路径，因此 Schem、
+BDX、MCStructure 等任意 reader 都可通过 `--threads` 并行执行三维合并与命令编码。
+reader 加载仍固定在调用线程，避免并发访问格式内部缓存；编码结果按 chunk 原始顺序
+写入，所以不同线程数生成的 IBI 字节完全一致。若某种格式的 reader 解码本身占主导，
+通用路径会按结构高度在约 96 MiB 预算内扩大 X 批次，让 Schem 等行式格式尽量一次
+解码完整行，避免固定32 chunk批次反复读取同一 BlockData。Schem 还会直接输出
+结构级共享 palette 和原生索引，绕过 runtime ID `ChunkData`；空气 subchunk 不分配，
+palette 升级与文本编码仅执行一次。乌托邦 Schem 实测由最初约90.8秒降至54.0秒，
+再降至约44–46秒（3线程），输出818.4 MiB且各路径 SHA-256 一致。
 
 ## 性能与内存
 
@@ -183,6 +201,7 @@ Release 构建在本机实测的端到端结果，数字用于比较转换器量
 | MCWorld → SchemV1 | 乌托邦，`2701×176×2701`，约 2.86 万 chunk 柱 | `.schem` | 约 29.3 秒 | 约 175 MiB（工作集约 348 MiB） |
 | MCWorld → MCFunction | 同上 | `.mcfunction` | 约 13 秒（palette 流水线，本机复测；generic 路径约 16 秒） | 约 154 MiB |
 | MCWorld → IBImport | chenshi，`2716×342×2245` | `.ibi` | 约 10–12 秒（palette 流水线，3 个编码线程） | 私有内存约 136 MiB（工作集约 290 MiB） |
+| Schem → IBImport | 乌托邦，`2701×176×2701` | `.ibi`（818.4 MiB） | 约 44–46 秒（共享 palette 流水线，3 个编码线程） | 私有内存/工作集约 144 MiB |
 | MCWorld → BDX | Kuudra，`188×175×185`，270.6 万非空气方块 | `.bdx` | 约 1.49 秒 | 约 152 MiB |
 | BDX → MCWorld | 同一 Kuudra BDX | 世界目录/`.mcworld` | 约 1.68 秒 | 约 159 MiB |
 | Schematic → MCWorld | `519×256×519`，1089 个 chunk | 世界目录/`.mcworld` | 约 3.6 秒 | 约 412 MiB |

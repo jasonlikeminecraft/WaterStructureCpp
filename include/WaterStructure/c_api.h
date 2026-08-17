@@ -6,6 +6,8 @@
 #  define WATER_STRUCTURE_API __declspec(dllexport)
 #elif defined(_WIN32) && defined(WATER_STRUCTURE_USE_SHARED)
 #  define WATER_STRUCTURE_API __declspec(dllimport)
+#elif defined(WATER_STRUCTURE_BUILD_SHARED) && (defined(__GNUC__) || defined(__clang__))
+#  define WATER_STRUCTURE_API __attribute__((visibility("default")))
 #else
 #  define WATER_STRUCTURE_API
 #endif

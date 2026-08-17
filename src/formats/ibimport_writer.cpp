@@ -326,8 +326,9 @@ void write_dense_commands(
     }
 }
 
+template<class Writer>
 void write_chunk_commands(
-    SegmentWriter& script,
+    Writer& script,
     const ChunkData& chunk,
     RuntimeRegistry& registry,
     int x_begin,
@@ -363,9 +364,15 @@ void write_chunk_commands(
         script, blocks, air, x_begin, z_begin, width, depth, height, state_for);
 }
 
+struct SharedPaletteEncoding {
+    std::vector<std::uint32_t> handles;
+    std::vector<std::string> states;
+};
+
 struct PreparedPaletteChunk {
     std::vector<std::uint32_t> blocks;
     std::vector<std::string> states;
+    std::shared_ptr<const std::vector<std::string>> shared_states;
     int x_begin = 0;
     int z_begin = 0;
     int width = 0;
@@ -376,6 +383,8 @@ struct PreparedPaletteChunk {
 Result<PreparedPaletteChunk> prepare_palette_chunk(
     std::span<const SubChunkPaletteData> subchunks,
     PaletteStateCache& states,
+    std::unordered_map<const std::vector<BlockState>*,
+        std::shared_ptr<const SharedPaletteEncoding>>& shared_encodings,
     int x_begin,
     int x_end,
     int z_begin,
@@ -395,6 +404,70 @@ Result<PreparedPaletteChunk> prepare_palette_chunk(
     result.width = width;
     result.depth = depth;
     result.height = height;
+
+    const std::vector<BlockState>* shared_palette = nullptr;
+    if (!subchunks.empty() && subchunks.front().shared_palette) {
+        shared_palette = subchunks.front().shared_palette.get();
+        for (const auto& subchunk : subchunks) {
+            if (subchunk.shared_palette.get() != shared_palette) {
+                shared_palette = nullptr;
+                break;
+            }
+        }
+    }
+    if (shared_palette) {
+        auto found = shared_encodings.find(shared_palette);
+        if (found == shared_encodings.end()) {
+            auto encoding = std::make_shared<SharedPaletteEncoding>();
+            encoding->handles.reserve(shared_palette->size());
+            encoding->states.emplace_back();
+            std::unordered_map<std::uint32_t, std::uint32_t> local_handles;
+            local_handles.reserve(shared_palette->size());
+            local_handles.emplace(0, 0);
+            for (const auto& state : *shared_palette) {
+                const auto global = states.handle(state);
+                const auto existing = local_handles.find(global);
+                if (existing != local_handles.end()) {
+                    encoding->handles.push_back(existing->second);
+                    continue;
+                }
+                const auto local = static_cast<std::uint32_t>(encoding->states.size());
+                encoding->states.emplace_back(states.state(global));
+                local_handles.emplace(global, local);
+                encoding->handles.push_back(local);
+            }
+            found = shared_encodings.emplace(shared_palette, std::move(encoding)).first;
+        }
+        const auto& encoding = *found->second;
+        result.shared_states = std::shared_ptr<const std::vector<std::string>>(
+            found->second, &encoding.states);
+        for (const auto& subchunk : subchunks) {
+            if (subchunk.indices.size() != 4096) {
+                return Result<PreparedPaletteChunk>::failure(
+                    "IBImport palette subchunk indices 不是 4096 项");
+            }
+            if (!subchunk.indices.empty() &&
+                *std::max_element(subchunk.indices.begin(), subchunk.indices.end()) >=
+                    encoding.handles.size()) {
+                return Result<PreparedPaletteChunk>::failure(
+                    "IBImport palette index 越界");
+            }
+            for (int local_y = 0; local_y < 16; ++local_y) {
+                const auto y = subchunk.sub_y * 16 + 64 + local_y;
+                if (y < 0 || y >= height) continue;
+                for (int z = 0; z < depth; ++z) {
+                    for (int x = 0; x < width; ++x) {
+                        const auto native = static_cast<std::size_t>(
+                            x * 256 + local_y * 16 + z);
+                        result.blocks[index(x, y, z)] =
+                            encoding.handles[subchunk.indices[native]];
+                    }
+                }
+            }
+        }
+        return Result<PreparedPaletteChunk>::success(std::move(result));
+    }
+
     std::unordered_map<std::uint32_t, std::uint32_t> local_handles;
     local_handles.emplace(0, 0);
     for (const auto& subchunk : subchunks) {
@@ -404,7 +477,10 @@ Result<PreparedPaletteChunk> prepare_palette_chunk(
         }
         std::vector<std::uint32_t> handles;
         handles.reserve(subchunk.palette.size());
-        for (const auto& state : subchunk.palette) {
+        const auto& palette = subchunk.shared_palette
+            ? *subchunk.shared_palette
+            : subchunk.palette;
+        for (const auto& state : palette) {
             const auto global = states.handle(state);
             const auto found = local_handles.find(global);
             if (found != local_handles.end()) {
@@ -442,11 +518,29 @@ std::string encode_palette_chunk(PreparedPaletteChunk input)
 {
     StringWriter output;
     const auto state_for = [&](std::uint32_t handle) -> std::string_view {
-        return handle < input.states.size() ? input.states[handle] : std::string_view{};
+        const auto& states = input.shared_states ? *input.shared_states : input.states;
+        return handle < states.size() ? states[handle] : std::string_view{};
     };
     write_dense_commands(
         output, input.blocks, 0, input.x_begin, input.z_begin,
         input.width, input.depth, input.height, state_for);
+    return output.take();
+}
+
+std::string encode_generic_chunk(
+    ChunkData chunk,
+    RuntimeRegistry& registry,
+    int x_begin,
+    int x_end,
+    int z_begin,
+    int z_end,
+    int height,
+    std::unordered_map<std::uint32_t, std::string>& state_cache)
+{
+    StringWriter output;
+    write_chunk_commands(
+        output, chunk, registry, x_begin, x_end, z_begin, z_end,
+        height, state_cache);
     return output.take();
 }
 
@@ -531,12 +625,27 @@ Result<void> write_ibimport(
         double nbt_ms = 0.0;
         output.write("IBImport ", 9);
         SegmentWriter script(output);
-        std::unordered_map<std::uint32_t, std::string> state_cache;
-        state_cache.reserve(256);
         PaletteStateCache palette_states(registry);
-        constexpr int kChunkBatchSize = 32;
+        std::unordered_map<const std::vector<BlockState>*,
+            std::shared_ptr<const SharedPaletteEncoding>> shared_palette_encodings;
+        constexpr std::size_t kDefaultPaletteBatchSize = 32;
+        constexpr std::size_t kGenericBatchMemoryBudget = 96ull * 1024ull * 1024ull;
+        const auto estimated_subchunks = static_cast<std::size_t>(
+            std::max(1, (size.height + 15) / 16));
+        const auto estimated_chunk_bytes = estimated_subchunks * sizeof(SubChunkData) +
+            64ull * 1024ull;
+        const auto generic_batch_size = std::max<std::size_t>(1, std::min<std::size_t>(
+            static_cast<std::size_t>(size.chunk_x_count()),
+            kGenericBatchMemoryBudget / std::max<std::size_t>(1, estimated_chunk_bytes)));
+        const auto preferred_palette_batch = structure.preferred_palette_batch_size();
+        const auto palette_batch_size = std::max<std::size_t>(1,
+            preferred_palette_batch == 0
+                ? kDefaultPaletteBatchSize
+                : std::min<std::size_t>(
+                    static_cast<std::size_t>(size.chunk_x_count()),
+                    preferred_palette_batch));
         std::vector<ChunkPos> positions;
-        positions.reserve(kChunkBatchSize);
+        positions.reserve(std::max(palette_batch_size, generic_batch_size));
         const auto worker_count = std::max<std::size_t>(
             1, options.thread_count == 0 ? 3 : options.thread_count);
         const auto max_in_flight = std::max<std::size_t>(
@@ -544,24 +653,36 @@ Result<void> write_ibimport(
                 ? worker_count * 2
                 : options.max_in_flight_tasks);
         detail::BoundedThreadPool encode_pool(worker_count, max_in_flight);
+        struct WorkerContext {
+            std::unordered_map<std::uint32_t, std::string> state_cache;
+        };
+        std::vector<std::unique_ptr<WorkerContext>> worker_contexts;
+        worker_contexts.reserve(worker_count);
+        for (std::size_t index = 0; index < worker_count; ++index) {
+            auto context = std::make_unique<WorkerContext>();
+            context->state_cache.reserve(256);
+            worker_contexts.push_back(std::move(context));
+        }
         struct EncodedChunk {
             std::string commands;
             double encode_ms = 0.0;
+            bool palette = false;
         };
         std::deque<std::future<EncodedChunk>> pending;
         const auto drain_one = [&]() {
             auto encoded = pending.front().get();
             pending.pop_front();
-            palette_encode_ms += encoded.encode_ms;
+            if (encoded.palette) palette_encode_ms += encoded.encode_ms;
+            else generic_encode_ms += encoded.encode_ms;
             script.write(encoded.commands);
         };
         bool palette_enabled = true;
         bool palette_used = false;
         for (int chunk_z = 0; chunk_z < size.chunk_z_count(); ++chunk_z) {
-            for (int batch_x = 0; batch_x < size.chunk_x_count();
-                 batch_x += kChunkBatchSize) {
-                const auto batch_end = std::min(
-                    size.chunk_x_count(), batch_x + kChunkBatchSize);
+            for (int batch_x = 0; batch_x < size.chunk_x_count();) {
+                auto batch_end = std::min(
+                    size.chunk_x_count(), batch_x + static_cast<int>(
+                        palette_enabled ? palette_batch_size : generic_batch_size));
                 positions.clear();
                 for (auto chunk_x = batch_x; chunk_x < batch_end; ++chunk_x)
                     positions.push_back({ chunk_x, chunk_z });
@@ -576,7 +697,7 @@ Result<void> write_ibimport(
                             callback_called = true;
                             const auto prepare_start = Clock::now();
                             auto prepared = prepare_palette_chunk(
-                                subchunks, palette_states,
+                                subchunks, palette_states, shared_palette_encodings,
                                 position.x * 16,
                                 std::min(size.width, (position.x + 1) * 16),
                                 position.z * 16,
@@ -590,7 +711,7 @@ Result<void> write_ibimport(
                                     auto commands = encode_palette_chunk(std::move(input));
                                     const auto duration = std::chrono::duration<double, std::milli>(
                                         Clock::now() - start).count();
-                                    return EncodedChunk{ std::move(commands), duration };
+                                    return EncodedChunk{ std::move(commands), duration, true };
                                 }));
                             if (pending.size() >= max_in_flight) drain_one();
                             return Result<void>::success();
@@ -598,6 +719,7 @@ Result<void> write_ibimport(
                     palette_total_ms += elapsed_ms(palette_start);
                     if (palette) {
                         palette_used = true;
+                        batch_x = batch_end;
                         continue;
                     }
                     if (callback_called || palette_used) {
@@ -605,26 +727,45 @@ Result<void> write_ibimport(
                             "IBImport palette 流水线中途失败: " + palette.error());
                     }
                     palette_enabled = false;
+                    // The first 32-chunk call was only a capability probe. Rebuild
+                    // this same range using the larger generic batch so Schem does
+                    // not decode the first rows twice.
+                    batch_end = std::min(
+                        size.chunk_x_count(), batch_x + static_cast<int>(generic_batch_size));
+                    positions.clear();
+                    for (auto chunk_x = batch_x; chunk_x < batch_end; ++chunk_x)
+                        positions.push_back({ chunk_x, chunk_z });
                 }
 
                 const auto load_start = Clock::now();
                 auto chunks = structure.get_chunks_layer0(positions);
                 generic_load_ms += elapsed_ms(load_start);
                 if (!chunks) throw std::runtime_error("生成 IBImport chunk 失败: " + chunks.error());
-                const auto encode_start = Clock::now();
                 for (const auto position : positions) {
                     const auto found = chunks.value().find(position);
-                    const ChunkData empty;
-                    const auto& chunk = found == chunks.value().end() ? empty : found->second;
-                    write_chunk_commands(script, chunk, registry,
-                        position.x * 16,
-                        std::min(size.width, (position.x + 1) * 16),
-                        position.z * 16,
-                        std::min(size.length, (position.z + 1) * 16),
-                        size.height, state_cache);
+                    ChunkData chunk;
+                    if (found != chunks.value().end()) chunk = std::move(found->second);
+                    const auto x_begin = position.x * 16;
+                    const auto x_end = std::min(size.width, (position.x + 1) * 16);
+                    const auto z_begin = position.z * 16;
+                    const auto z_end = std::min(size.length, (position.z + 1) * 16);
+                    pending.push_back(encode_pool.submit_indexed(
+                        [chunk = std::move(chunk), &registry, &worker_contexts,
+                         x_begin, x_end, z_begin, z_end, height = size.height]
+                        (std::size_t worker_index) mutable {
+                            const auto start = Clock::now();
+                            auto commands = encode_generic_chunk(
+                                std::move(chunk), registry,
+                                x_begin, x_end, z_begin, z_end, height,
+                                worker_contexts[worker_index]->state_cache);
+                            const auto duration = std::chrono::duration<double, std::milli>(
+                                Clock::now() - start).count();
+                            return EncodedChunk{ std::move(commands), duration, false };
+                        }));
+                    if (pending.size() >= max_in_flight) drain_one();
                 }
-                generic_encode_ms += elapsed_ms(encode_start);
                 structure.release_cached_chunks();
+                batch_x = batch_end;
             }
         }
         while (!pending.empty()) drain_one();
@@ -709,6 +850,7 @@ Result<void> write_ibimport(
                       << " palette_encode_ms=" << palette_encode_ms
                       << " generic_load_ms=" << generic_load_ms
                       << " generic_encode_ms=" << generic_encode_ms
+                      << " generic_batch_size=" << generic_batch_size
                       << " nbt_ms=" << nbt_ms
                       << " total_ms=" << elapsed_ms(total_start) << '\n';
         }

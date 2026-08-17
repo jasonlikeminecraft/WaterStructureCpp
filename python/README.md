@@ -3,8 +3,8 @@
 Python bindings for the streaming Minecraft structure conversion library
 [WaterStructureCpp](https://github.com/jasonlikeminecraft/WaterStructureCpp).
 
-The Windows x64 wheel bundles the native DLL and runtime mapping assets, so it
-does not require a separate C++ installation.
+Platform wheels bundle the native library and runtime mapping assets, so they
+do not require a separate C++ installation.
 
 ## 安装
 
@@ -12,9 +12,9 @@ does not require a separate C++ installation.
 python -m pip install water-structure
 ```
 
-要求：Windows x64、Python 3.9+。源码树调试时可以设置
-`WATER_STRUCTURE_LIBRARY` 指向本地构建的
-`build/windows/x64/release/water_structure_shared.dll`，无需安装 wheel。
+要求：Python 3.9+，支持 Windows、Linux 和 macOS。源码树调试时可以设置
+`WATER_STRUCTURE_LIBRARY` 指向本地构建的 `.dll`/`.so`/`.dylib`，
+无需安装 wheel。
 
 ## 快速开始
 
@@ -149,15 +149,19 @@ except Error as e:
 - **VS Code 报"无法解析导入 water_structure"**：Pylance 选中的 Python 解释器
   与安装 wheel 的解释器不一致。`Ctrl+Shift+P` → `Python: Select Interpreter`
   选择与 `pip show water-structure` 输出一致的解释器。
-- **导入时报"unable to load ... DLL"**：确认是 Windows x64 平台；源码树使用
-  需要设置 `WATER_STRUCTURE_LIBRARY`。
+- **导入时报"unable to load WaterStructure native library"**：确认安装了
+  当前系统和 CPU 架构对应的 wheel；源码树使用需要设置
+  `WATER_STRUCTURE_LIBRARY`。
 - **支持的输入格式**：除 SIBI（规范缺失，两端均未实现）外的 36 种格式全部
   可读。详见项目根目录 README 的格式能力表。
 
 ## 从源码构建 wheel
 
-```powershell
+```text
 python -m pip install build twine
-.\python\build_wheel.ps1          # 构建 wheel（会自动编译原生 DLL）
-python -m twine check .\dist\python\*.whl
+python python/build_wheel.py       # 自动编译当前平台原生库并构建 wheel
+python -m twine check dist/python/*.whl
 ```
+
+Windows 也可继续使用 `.\python\build_wheel.ps1`。构建脚本不指定线程数，
+交由 xmake 使用默认并行度。

@@ -1,0 +1,42 @@
+name: Python platform wheels
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/python-wheels.yml"
+      - "assets/**"
+      - "include/**"
+      - "python/**"
+      - "src/**"
+      - "thirdparty/**"
+      - "xmake.lua"
+
+jobs:
+  wheel:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: xmake-io/github-action-setup-xmake@v1
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install Python build tools
+        run: python -m pip install build twine
+      - name: Build platform wheel
+        run: python python/build_wheel.py
+      - name: Validate wheel metadata
+        run: python -m twine check dist/python/*.whl
+      - name: Install and import wheel
+        shell: bash
+        run: |
+          python -m pip install --force-reinstall dist/python/*.whl
+          python -c "import water_structure; print(water_structure.version(), water_structure.abi_version())"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: water-structure-${{ runner.os }}-${{ runner.arch }}
+          path: dist/python/*.whl

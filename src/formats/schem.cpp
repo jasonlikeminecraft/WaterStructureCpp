@@ -255,6 +255,9 @@ void SchemStructure::release_block_data() noexcept
     mChunkOffsetCount = 0;
     mMaxPaletteIndex = 0;
     mNonAirCountValid = false;
+    mSharedPaletteStates.reset();
+    mSharedAirPaletteFlags.clear();
+    mSharedAirPaletteIndex = 0;
 }
 
 void SchemStructure::set_offset(BlockPos offset) noexcept
@@ -679,6 +682,196 @@ Result<ChunkMap> SchemStructure::get_chunks(std::span<const ChunkPos> positions)
         }
     }
     return Result<ChunkMap>::success(std::move(result));
+}
+
+std::size_t SchemStructure::preferred_palette_batch_size() const noexcept
+{
+    constexpr std::size_t kBudget = 96ull * 1024ull * 1024ull;
+    const auto subchunks = static_cast<std::size_t>(
+        std::max(1, (mSize.height + 15) / 16));
+    const auto bytes_per_chunk = subchunks * 4096ull * sizeof(std::uint16_t) +
+        64ull * 1024ull;
+    return std::max<std::size_t>(1, std::min<std::size_t>(
+        static_cast<std::size_t>(std::max(1, mSize.chunk_x_count())),
+        kBudget / std::max<std::size_t>(1, bytes_per_chunk)));
+}
+
+Result<void> SchemStructure::visit_chunk_palettes(
+    std::span<const ChunkPos> positions,
+    const ChunkPaletteVisitor& visitor) const
+{
+    if (!visitor) return Result<void>::failure("chunk palette visitor is empty");
+    if (positions.empty()) return Result<void>::success();
+    if (mOffset != BlockPos{}) {
+        return Result<void>::failure("Schem palette 快速路径暂不支持 offset");
+    }
+    if (mMaxPaletteIndex > std::numeric_limits<std::uint16_t>::max()) {
+        return Result<void>::failure("Schem palette 超过 uint16 容量");
+    }
+    const auto chunk_z = positions.front().z;
+    int min_chunk_x = std::numeric_limits<int>::max();
+    int max_chunk_x = std::numeric_limits<int>::min();
+    std::unordered_map<int, std::size_t> target_by_x;
+    target_by_x.reserve(positions.size());
+    for (std::size_t index = 0; index < positions.size(); ++index) {
+        const auto position = positions[index];
+        if (position.z != chunk_z) {
+            return Result<void>::failure("Schem palette 批次必须位于同一 chunk Z");
+        }
+        if (position.x < 0 || position.x >= mSize.chunk_x_count() ||
+            position.z < 0 || position.z >= mSize.chunk_z_count()) {
+            return Result<void>::failure("Schem palette chunk 坐标越界");
+        }
+        target_by_x.emplace(position.x, index);
+        min_chunk_x = std::min(min_chunk_x, position.x);
+        max_chunk_x = std::max(max_chunk_x, position.x);
+    }
+
+    if (!mSharedPaletteStates) {
+        auto states = std::make_shared<std::vector<BlockState>>(
+            static_cast<std::size_t>(mMaxPaletteIndex) + 1,
+            BlockState{ "minecraft:unknown", {}, 0 });
+        mSharedAirPaletteFlags.assign(states->size(), 0);
+        bool found_air = false;
+        const auto air_runtime = mRegistry.air_runtime_id();
+        for (std::uint32_t index = 0; index <= mMaxPaletteIndex; ++index) {
+            const auto runtime = index < mDensePalette.size()
+                ? mDensePalette[index]
+                : (mPalette.contains(index) ? mPalette.at(index) : mUnknownRuntimeId);
+            if (auto state = mRegistry.state(runtime)) (*states)[index] = std::move(*state);
+            if (runtime == air_runtime) {
+                mSharedAirPaletteFlags[index] = 1;
+                if (!found_air) {
+                    mSharedAirPaletteIndex = static_cast<std::uint16_t>(index);
+                    found_air = true;
+                }
+            }
+        }
+        if (!found_air) {
+            if (states->size() > std::numeric_limits<std::uint16_t>::max()) {
+                return Result<void>::failure("Schem palette 没有 air 且无法追加 uint16 索引");
+            }
+            mSharedAirPaletteIndex = static_cast<std::uint16_t>(states->size());
+            states->push_back(BlockState{ "minecraft:air", {}, 0 });
+            mSharedAirPaletteFlags.push_back(1);
+        }
+        mSharedPaletteStates = std::move(states);
+    }
+
+    struct PaletteChunk {
+        std::vector<std::unique_ptr<SubChunkPaletteData>> subchunks;
+    };
+    const auto min_sub_y = floor_div(-64, 16);
+    const auto max_sub_y = floor_div(mSize.height - 1 - 64, 16);
+    const auto subchunk_count = static_cast<std::size_t>(max_sub_y - min_sub_y + 1);
+    std::vector<PaletteChunk> chunks(positions.size());
+    for (auto& chunk : chunks) {
+        chunk.subchunks.resize(subchunk_count);
+    }
+
+    EncodedReader encoded(mBlockDataPath);
+    if (!encoded.good()) {
+        return Result<void>::failure("无法打开 Schem 临时 BlockData 文件");
+    }
+    std::vector<std::uint8_t> encoded_row;
+    const auto read_row_range = [this, &encoded, &encoded_row](
+        std::size_t row_index,
+        int begin_x,
+        int end_x,
+        std::span<std::uint32_t> output) -> bool {
+        if (row_index >= mRowOffsets.size() || begin_x < 0 || end_x < begin_x ||
+            output.size() != static_cast<std::size_t>(end_x - begin_x + 1)) return false;
+        const auto checkpoint_index = static_cast<std::size_t>(begin_x) / kIndexStride;
+        if (checkpoint_index >= mChunkOffsetCount) return false;
+        const auto checkpoint = mChunkOffsets[row_index * mChunkOffsetCount + checkpoint_index];
+        int source_x = static_cast<int>(checkpoint_index * kIndexStride);
+        std::uint64_t source_offset = mRowOffsets[row_index];
+        if (checkpoint == kMissingChunkOffset) source_x = 0;
+        else source_offset += checkpoint;
+        if (!encoded.seek(source_offset)) return false;
+        const auto row_end = row_index + 1 < mRowOffsets.size()
+            ? mRowOffsets[row_index + 1]
+            : static_cast<std::uint64_t>(mBlockDataBytes);
+        if (source_offset > row_end ||
+            row_end - source_offset > std::numeric_limits<std::size_t>::max()) return false;
+        encoded_row.resize(static_cast<std::size_t>(row_end - source_offset));
+        if (!encoded.read_exact(encoded_row)) return false;
+        std::size_t cursor = 0;
+        for (; source_x <= end_x; ++source_x) {
+            std::uint64_t value = 0;
+            int shift = 0;
+            for (;;) {
+                if (cursor >= encoded_row.size()) return false;
+                const auto byte = encoded_row[cursor++];
+                value |= static_cast<std::uint64_t>(byte & 0x7fu) << shift;
+                if ((byte & 0x80u) == 0) break;
+                shift += 7;
+                if (shift >= 35) return false;
+            }
+            if (value > mMaxPaletteIndex) return false;
+            if (source_x >= begin_x)
+                output[static_cast<std::size_t>(source_x - begin_x)] =
+                    static_cast<std::uint32_t>(value);
+        }
+        return true;
+    };
+
+    const auto min_x = min_chunk_x * 16;
+    const auto max_x = std::min(mSize.width - 1, max_chunk_x * 16 + 15);
+    const auto min_z = chunk_z * 16;
+    const auto max_z = std::min(mSize.length - 1, min_z + 15);
+    std::vector<std::uint32_t> row_data(
+        static_cast<std::size_t>(max_x - min_x + 1));
+    constexpr auto kMissingTarget = std::numeric_limits<std::size_t>::max();
+    std::vector<std::size_t> target_for_x(row_data.size(), kMissingTarget);
+    std::vector<std::uint8_t> local_x_for_x(row_data.size(), 0);
+    for (std::size_t offset = 0; offset < row_data.size(); ++offset) {
+        const auto x = min_x + static_cast<int>(offset);
+        const auto target = target_by_x.find(floor_div(x, 16));
+        if (target != target_by_x.end()) target_for_x[offset] = target->second;
+        local_x_for_x[offset] = static_cast<std::uint8_t>(floor_mod(x, 16));
+    }
+    for (int y = 0; y < mSize.height; ++y) {
+        const auto sub_y = floor_div(y - 64, 16);
+        const auto sub_index = static_cast<std::size_t>(sub_y - min_sub_y);
+        const auto local_y = y - (sub_y * 16 + 64);
+        for (int z = min_z; z <= max_z; ++z) {
+            const auto row_index = static_cast<std::size_t>(y) *
+                static_cast<std::size_t>(mSize.length) + static_cast<std::size_t>(z);
+            if (!read_row_range(row_index, min_x, max_x, row_data)) {
+                return Result<void>::failure("Schem palette BlockData 行读取失败");
+            }
+            const auto local_z = z - min_z;
+            for (std::size_t x_offset = 0; x_offset < row_data.size(); ++x_offset) {
+                const auto target = target_for_x[x_offset];
+                if (target == kMissingTarget) continue;
+                const auto palette_index = row_data[x_offset];
+                if (mSharedAirPaletteFlags[palette_index]) continue;
+                auto& subchunk = chunks[target].subchunks[sub_index];
+                if (!subchunk) {
+                    subchunk = std::make_unique<SubChunkPaletteData>();
+                    subchunk->sub_y = sub_y;
+                    subchunk->shared_palette = mSharedPaletteStates;
+                    subchunk->indices.assign(4096, mSharedAirPaletteIndex);
+                }
+                const auto native_index = static_cast<std::size_t>(
+                    local_x_for_x[x_offset] * 256 + local_y * 16 + local_z);
+                subchunk->indices[native_index] =
+                    static_cast<std::uint16_t>(palette_index);
+            }
+        }
+    }
+
+    for (std::size_t index = 0; index < positions.size(); ++index) {
+        std::vector<SubChunkPaletteData> populated;
+        populated.reserve(chunks[index].subchunks.size());
+        for (auto& subchunk : chunks[index].subchunks) {
+            if (subchunk) populated.push_back(std::move(*subchunk));
+        }
+        auto visited = visitor(positions[index], populated);
+        if (!visited) return visited;
+    }
+    return Result<void>::success();
 }
 
 Result<void> SchemStructure::visit_chunks(std::span<const ChunkPos> positions, const ChunkVisitor& visitor) const

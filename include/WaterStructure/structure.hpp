@@ -67,6 +67,10 @@ using ChunkNbtVisitor = std::function<Result<void>(ChunkPos, std::span<const Blo
 struct SubChunkPaletteData {
     std::int32_t sub_y = 0;
     std::vector<BlockState> palette;
+    // Readers with one structure-wide palette can share it across all
+    // subchunks instead of deep-copying BlockState strings thousands of times.
+    // Consumers use shared_palette when non-null, otherwise palette.
+    std::shared_ptr<const std::vector<BlockState>> shared_palette;
     std::vector<std::uint16_t> indices; // 4096 entries, native (x,y,z) order
 };
 
@@ -146,6 +150,9 @@ public:
         if (!visitor) return Result<void>::failure("chunk palette visitor is empty");
         return Result<void>::failure("此格式不支持 palette 流式读取");
     }
+    // Zero lets the writer choose its default. Row-oriented readers may
+    // request a wider batch so each encoded row is decoded only once.
+    virtual std::size_t preferred_palette_batch_size() const noexcept { return 0; }
     virtual Result<NbtChunkMap> get_chunk_nbt(std::span<const ChunkPos> positions) const = 0;
     virtual Result<std::size_t> count_non_air_blocks() const = 0;
     virtual Result<void> write_to_world(WorldTarget& world, SubChunkPos start, ConversionCallbacks callbacks) const = 0;

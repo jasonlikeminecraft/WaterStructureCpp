@@ -1,6 +1,3 @@
-#define NOMINMAX
-#include <Windows.h>
-
 #include <BedrockWorldOperator/BedrockWorldOperator.hpp>
 
 #include <leveldb/db.h>

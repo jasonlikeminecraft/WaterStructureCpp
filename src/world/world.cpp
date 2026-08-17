@@ -8,7 +8,9 @@
 #include <tag_compound.h>
 #include <tag_primitive.h>
 
-#include <Windows.h>
+#if defined(_WIN32)
+#  include <Windows.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -179,13 +181,20 @@ Result<void> BedrockWorldAdapter::close()
         temporary_archive += ".water_structure_tmp";
         const auto packed = archive::create_zip(mDirectory, temporary_archive);
         if (!packed) return packed;
-        if (!MoveFileExW(
-                temporary_archive.c_str(),
-                mArchivePath.c_str(),
+#if defined(_WIN32)
+        if (!MoveFileExW(temporary_archive.c_str(), mArchivePath.c_str(),
                 MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
             const auto error = GetLastError();
             return Result<void>::failure("替换 .mcworld 失败，Win32 error=" + std::to_string(error));
         }
+#else
+        std::error_code replace_error;
+        std::filesystem::rename(temporary_archive, mArchivePath, replace_error);
+        if (replace_error) {
+            return Result<void>::failure(
+                "替换 .mcworld 失败: " + replace_error.message());
+        }
+#endif
         std::error_code cleanup_error;
         std::filesystem::remove_all(mTemporaryDirectory, cleanup_error);
         if (cleanup_error) {
