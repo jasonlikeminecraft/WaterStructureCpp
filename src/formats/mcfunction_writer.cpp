@@ -306,8 +306,8 @@ void write_fill(
     std::int32_t z2,
     std::string_view state)
 {
-    output << "fill " << x1 << ' ' << y1 << ' ' << z1 << ' '
-           << x2 << ' ' << y2 << ' ' << z2 << ' ' << state << '\n';
+    output << "fill ~" << x1 << " ~" << y1 << " ~" << z1 << ' '
+           << '~' << x2 << " ~" << y2 << " ~" << z2 << ' ' << state << '\n';
 }
 
 void write_task_fill(
@@ -321,16 +321,22 @@ void write_task_fill(
     std::string_view state)
 {
     output.append_text("fill ");
+    output.append_character('~');
     output.append_integer(x1);
     output.append_character(' ');
+    output.append_character('~');
     output.append_integer(y1);
     output.append_character(' ');
+    output.append_character('~');
     output.append_integer(z1);
     output.append_character(' ');
+    output.append_character('~');
     output.append_integer(x2);
     output.append_character(' ');
+    output.append_character('~');
     output.append_integer(y2);
     output.append_character(' ');
+    output.append_character('~');
     output.append_integer(z2);
     output.append_character(' ');
     output.append_text(state);
@@ -345,10 +351,13 @@ void write_task_setblock(
     std::string_view state)
 {
     output.append_text("setblock ");
+    output.append_character('~');
     output.append_integer(x);
     output.append_character(' ');
+    output.append_character('~');
     output.append_integer(y);
     output.append_character(' ');
+    output.append_character('~');
     output.append_integer(z);
     output.append_character(' ');
     output.append_text(state);

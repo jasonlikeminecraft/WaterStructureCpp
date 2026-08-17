@@ -156,6 +156,8 @@ water_structure_cli to-world input.schem output.mcworld --start 0,-4,0
 MCFunction writer 按 chunk 批次流式读取，只输出非空气方块，并用不超过 32,768
 方块的 `fill` 命令清空结构范围以保留空气和尺寸。MCFunction 没有统一的
 Bedrock 方块实体协议，因此方块实体 NBT 会按约定跳过，不会静默改写。
+生成的 `fill`/`setblock` 坐标使用 `~x ~y ~z` 相对坐标，执行函数时以执行位置
+作为结构锚点，而不是固定写入世界绝对坐标。
 MCFunction 默认使用 2 个编码线程；`--threads 1` 可关闭并行，显式指定更高线程数
 可用于按目标机器重新测量，但内存带宽受限的大型世界并不一定更快。
 

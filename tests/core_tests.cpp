@@ -1584,20 +1584,50 @@ int main()
             std::ifstream written(mcfunction_writer_path, std::ios::binary);
             std::string line;
             bool found_state = false;
+            bool all_coordinates_relative = true;
             while (std::getline(written, line)) {
                 if (line.find("setblock ") != std::string::npos ||
                     line.find("fill ") != std::string::npos) found_state = true;
+                if (line.starts_with("setblock ")) {
+                    std::istringstream fields(line);
+                    std::string command;
+                    std::array<std::string, 3> coordinates;
+                    fields >> command >> coordinates[0] >> coordinates[1] >> coordinates[2];
+                    for (const auto& coordinate : coordinates) {
+                        if (coordinate.empty() || coordinate.front() != '~') {
+                            all_coordinates_relative = false;
+                        }
+                    }
+                    continue;
+                }
                 if (!line.starts_with("fill ")) continue;
                 std::istringstream fields(line);
                 std::string command;
-                std::int32_t x1 = 0, y1 = 0, z1 = 0, x2 = 0, y2 = 0, z2 = 0;
-                fields >> command >> x1 >> y1 >> z1 >> x2 >> y2 >> z2;
+                std::array<std::string, 6> coordinates;
+                fields >> command >> coordinates[0] >> coordinates[1] >> coordinates[2]
+                    >> coordinates[3] >> coordinates[4] >> coordinates[5];
+                for (const auto& coordinate : coordinates) {
+                    if (coordinate.empty() || coordinate.front() != '~') {
+                        all_coordinates_relative = false;
+                    }
+                }
+                const auto parse_relative = [](const std::string& coordinate) {
+                    return std::stoi(coordinate.size() > 1 ? coordinate.substr(1) : "0");
+                };
+                const auto x1 = parse_relative(coordinates[0]);
+                const auto y1 = parse_relative(coordinates[1]);
+                const auto z1 = parse_relative(coordinates[2]);
+                const auto x2 = parse_relative(coordinates[3]);
+                const auto y2 = parse_relative(coordinates[4]);
+                const auto z2 = parse_relative(coordinates[5]);
                 const auto fill_volume =
                     static_cast<std::int64_t>(std::abs(x2 - x1) + 1) *
                     (std::abs(y2 - y1) + 1) * (std::abs(z2 - z1) + 1);
                 check(fill_volume <= 32768, "MCFunction fill respects command block limit");
             }
             check(found_state, "MCFunction writer emits Bedrock block states");
+            check(all_coordinates_relative,
+                "MCFunction writer emits relative coordinates");
         }
         const auto mcfunction_nbt_path = std::filesystem::temp_directory_path() /
             "water_structure_cpp_writer_nbt.mcfunction";
