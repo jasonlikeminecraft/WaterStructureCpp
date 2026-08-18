@@ -29,6 +29,7 @@ public:
     // random-access row/checkpoint index.  Allow that path to defer the
     // validation/index pass so opening a large Schem does not scan it twice.
     void set_streaming_world_import(bool enabled) noexcept { mStreamingWorldImport = enabled; }
+    void set_direct_world_stream(bool enabled) noexcept { mDirectWorldStream = enabled; }
     Result<ChunkMap> get_chunks(std::span<const ChunkPos> positions) const override;
     Result<void> visit_chunks(std::span<const ChunkPos> positions, const ChunkVisitor& visitor) const override;
     Result<void> visit_chunk_palettes(
@@ -47,13 +48,14 @@ private:
     Size mSize{};
     Size mOriginalSize{};
     BlockPos mOffset{};
-    std::filesystem::path mBlockDataPath;
-    std::vector<std::uint64_t> mRowOffsets;
-    std::vector<std::uint16_t> mChunkOffsets;
+    mutable std::filesystem::path mBlockDataPath;
+    std::filesystem::path mSourcePath;
+    mutable std::vector<std::uint64_t> mRowOffsets;
+    mutable std::vector<std::uint16_t> mChunkOffsets;
     std::size_t mBlockCount = 0;
     std::size_t mNonAirCount = 0;
-    std::size_t mBlockDataBytes = 0;
-    std::size_t mChunkOffsetCount = 0;
+    mutable std::size_t mBlockDataBytes = 0;
+    mutable std::size_t mChunkOffsetCount = 0;
     std::uint32_t mMaxPaletteIndex = 0;
     std::unordered_map<std::uint32_t, std::uint32_t> mPalette;
     std::vector<std::uint32_t> mDensePalette;
@@ -63,6 +65,8 @@ private:
     std::uint32_t mUnknownRuntimeId = 0;
     bool mNonAirCountValid = false;
     bool mStreamingWorldImport = false;
+    bool mDirectWorldStream = false;
+    mutable bool mBlockDataDeferred = false;
 };
 
 } // namespace water_structure

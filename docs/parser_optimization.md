@@ -396,6 +396,42 @@ the 1.38 billion block placements, while encoding and database work remain
 mostly overlapped. A templated parser experiment intended to inline the consumer
 regressed Greenfield to 179.606 s and was rejected.
 
+## MCFunction bounded parallel reader
+
+The MCFunction reader now treats Bedrock block states as the primary command
+semantics and uses Java compatibility only as a fallback. Large files are read
+as bounded 16 MiB blocks ending on complete lines. Up to four persistent worker
+threads parse blocks concurrently, maintain worker-local state-to-runtime caches,
+and return compact command batches. The consumer drains those batches in source
+order, so later `fill`/`setblock` commands retain their overwrite semantics.
+
+The hot parser no longer constructs an `istringstream`, `vector<string>`, and
+temporary substrings for every line. It uses `string_view`, fixed coordinate
+slots, and `from_chars`; runtime lookup happens only on each worker's first
+encounter with a state. The 1.05 GiB Utopia file contains 16,362,935 commands but
+only 625 distinct states. Its parsing time fell from 88.52s to about 3.1-3.4s.
+
+Chunk replay now uses a contiguous CSR command index instead of an unordered map
+of separately allocated vectors. Cuboid intersections are applied with contiguous
+row fills, all-air subchunks are initialized once while remaining explicit so an
+existing destination is still cleared, and broad/local command slices are merged
+by source index. MCFunction world writes use eight-chunk BWO batches; larger
+batches were rejected because their cache/memory cost regressed the same sample.
+
+Release measurements for the Utopia MCFunction reader:
+
+| Parse workers | Parse time | Peak private memory |
+| ---: | ---: | ---: |
+| 1 | 6.62s | 700 MiB |
+| 2 | 4.17s | 709 MiB |
+| 4 (default) | 3.10-3.37s | 753-755 MiB |
+| 8 | 3.74s | 826 MiB |
+
+The final direct CLI `MCFunction -> MCWorld` run completed in 13.246s. Bounded
+chunk materialization plus BWO/LevelDB writing accounted for 8.404s, including
+5.565s in batched world saves. The checksum stayed fixed at
+`517685715720987` across 1/2/4/8 parser threads.
+
 ## MCFunction bounded parallel writer
 
 The MCFunction writer now uses a fixed-size bounded thread pool for independent

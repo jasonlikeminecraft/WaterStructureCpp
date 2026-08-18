@@ -89,14 +89,15 @@ void print_usage(std::ostream& output = std::cout)
         "Usage:\n"
         "  water_structure_cli inspect <input> [--assets <dir>]\n"
         "  water_structure_cli formats [--writers-only]\n"
-        "  water_structure_cli convert <input> <output> [--format <name>] [--threads <n>]\n"
-        "  water_structure_cli to-world <input> <world-or-mcworld> [--start <x,y,z>]\n\n"
+        "  water_structure_cli convert <input> <output> [--format <name>] [--threads <n>] [--no-clear-air]\n"
+        "  water_structure_cli to-world <input> <world-directory-or-output.mcworld> [--start <x,y,z>]\n\n"
         "Compatibility syntax:\n"
         "  water_structure_cli convert <input> --format <name> --output <output>\n\n"
         "Options:\n"
         "  -f, --format <name>  Target registry name; inferred from output extension when unique\n"
         "  -o, --output <path>  Output path for compatibility syntax\n"
         "  -j, --threads <n>    Writer worker count (0 = conservative automatic default)\n"
+        "      --no-clear-air   MCFunction: do not clear the destination bounds first\n"
         "      --start <x,y,z>  Target subchunk position; default 0,-4,0\n"
         "      --assets <dir>   Runtime asset directory\n"
         "      --profile        Print internal conversion stage timing\n"
@@ -411,6 +412,7 @@ int convert_file(
     const std::filesystem::path& output,
     std::optional<StructureId> format,
     std::size_t threads,
+    bool clear_air,
     const std::filesystem::path& executable,
     const CommonOptions& common)
 {
@@ -461,6 +463,7 @@ int convert_file(
     progress.stage("写入");
     water_structure::ConversionOptions conversion_options;
     conversion_options.thread_count = threads;
+    conversion_options.clear_air = clear_air;
     conversion_options.callbacks.start = [&progress](std::size_t total) {
         progress.start(total);
         progress.begin_busy();
@@ -500,7 +503,10 @@ int to_world(
         return kInputError;
     }
     auto opened = water_structure::FormatRegistry::open(
-        input, registry, {.streaming_world_import = true});
+        input, registry, {
+            .streaming_world_import = true,
+            .direct_schem_world_stream = true
+        });
     if (!opened) { std::cerr << "error: " << opened.error() << '\n'; return kInputError; }
     auto world = water_structure::BedrockWorldAdapter::open(output);
     if (!world) { std::cerr << "error: " << world.error() << '\n'; return kInputError; }
@@ -617,16 +623,18 @@ int interactive(const std::filesystem::path& executable)
 
     const auto suggested = default_output_path(source, target);
     const auto output_text = prompt(
-        target_world ? "请输入已有世界目录或 .mcworld 路径" : "请输入输出文件路径",
+        target_world ? "请输入世界目录或新的 .mcworld 输出路径" : "请输入输出文件路径",
         utf8(suggested));
     if (output_text.empty() || lower(output_text) == "q") return 0;
     const auto output = path_from_utf8(output_text);
 
     CommonOptions common;
     if (target_world) {
-        if (!std::filesystem::exists(output)) {
-            std::cerr << "错误：目标世界必须已经存在。请提供包含 level.dat/db 的世界目录，"
-                         "或一个可写回的 .mcworld 模板。\n";
+        const auto extension = lower(output.extension().string());
+        const bool new_archive = extension == ".mcworld" || extension == ".zip";
+        if (!std::filesystem::exists(output) && !new_archive) {
+            std::cerr << "错误：目标世界目录必须已经存在；如果要新建归档，"
+                         "请使用 .mcworld 或 .zip 输出路径。\n";
             return kInputError;
         }
         auto start = water_structure::SubChunkPos{0, -4, 0};
@@ -652,8 +660,18 @@ int interactive(const std::filesystem::path& executable)
         std::cerr << "错误：线程数无效\n";
         return kUsageError;
     }
+    bool clear_air = true;
+    if (target->id == water_structure::StructureId::MCFunction) {
+        const auto clear_text = lower(prompt("执行前清空结构范围（y/n）", "y"));
+        if (clear_text == "q") return 0;
+        if (clear_text == "n" || clear_text == "no") clear_air = false;
+        else if (clear_text != "y" && clear_text != "yes") {
+            std::cerr << "错误：请输入 y 或 n\n";
+            return kUsageError;
+        }
+    }
     std::cout << "\n正在转换 " << detected.value().name << " -> " << target->name << "……\n";
-    const auto result = convert_file(source, output, target->id, threads, executable, common);
+    const auto result = convert_file(source, output, target->id, threads, clear_air, executable, common);
     if (result == 0) std::cout << "本次转换完成，可以继续处理其他文件。\n\n";
     else std::cerr << "本次转换失败，可以继续处理其他文件。\n\n";
     }
@@ -684,6 +702,7 @@ int main(int argc, char** argv)
         std::optional<StructureId> format;
         std::filesystem::path explicit_output;
         std::size_t threads = 0;
+        bool clear_air = true;
         water_structure::SubChunkPos start{0, -4, 0};
         for (int i = 2; i < argc; ++i) {
             const std::string_view argument = argv[i];
@@ -707,6 +726,8 @@ int main(int argc, char** argv)
                 const auto parsed = parse_size(value);
                 if (!parsed) { std::cerr << "error: invalid thread count: " << value << '\n'; return kUsageError; }
                 threads = *parsed;
+            } else if (argument == "--no-clear-air") {
+                clear_air = false;
             } else if (argument == "--start") {
                 if (!take_option_value(argc, argv, i, value)) { std::cerr << "error: --start needs x,y,z\n"; return kUsageError; }
                 const auto parsed = parse_start(value);
@@ -737,7 +758,7 @@ int main(int argc, char** argv)
         if (command == "convert" && (positional.size() == 1 || positional.size() == 2)) {
             const auto output = positional.size() == 2 ? positional[1] : explicit_output;
             if (output.empty()) { std::cerr << "error: output path is required\n"; return kUsageError; }
-            return convert_file(positional[0], output, format, threads, executable, common);
+            return convert_file(positional[0], output, format, threads, clear_air, executable, common);
         }
         if (command == "to-world" && positional.size() == 2) {
             return to_world(positional[0], positional[1], start, executable, common);

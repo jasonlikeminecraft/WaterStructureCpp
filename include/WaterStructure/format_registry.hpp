@@ -34,12 +34,21 @@ struct ConversionOptions {
     // through a bounded proxy so callers can display progress without adding
     // per-block overhead.
     ConversionCallbacks callbacks{};
+    // MCFunction clears the destination bounding box before placing blocks by
+    // default. Set false to emit only non-air placement commands and preserve
+    // existing blocks outside the emitted structure.
+    bool clear_air = true;
 };
 
 struct OpenOptions {
     // Let readers with a dedicated world path defer expensive block and NBT
     // construction until write_to_world() consumes the source stream.
     bool streaming_world_import = false;
+    // For direct to-world conversion, allow SchemV1/V2 to defer BlockData
+    // inflation until write_to_world() can consume it. This removes the
+    // full-size temporary BlockData write/read round-trip while keeping the
+    // normal reader/inspect path fully materialized and random-access capable.
+    bool direct_schem_world_stream = false;
 };
 
 class FormatRegistry {

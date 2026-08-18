@@ -327,6 +327,30 @@ std::filesystem::path write_ibimport_sample()
     return path;
 }
 
+std::filesystem::path write_schem_v1_ordered_sample()
+{
+    const auto path = std::filesystem::temp_directory_path() /
+        "water_structure_cpp_schem_ordered.schem";
+    std::ofstream file(path, std::ios::binary | std::ios::trunc);
+    if (!file) throw std::runtime_error("create ordered SchemV1 sample");
+    zlib::ozlibstream compressed(file, Z_DEFAULT_COMPRESSION, true);
+    nbt::io::stream_writer writer(compressed, endian::big);
+    writer.write_type(nbt::tag_type::Compound);
+    writer.write_string("Schematic");
+    writer.write_tag("Width", nbt::tag_short(2));
+    writer.write_tag("Height", nbt::tag_short(1));
+    writer.write_tag("Length", nbt::tag_short(1));
+    nbt::tag_compound palette;
+    palette["minecraft:air"] = std::int32_t{ 0 };
+    palette["minecraft:stone"] = std::int32_t{ 1 };
+    writer.write_tag("Palette", palette);
+    writer.write_tag("BlockData", nbt::tag_byte_array(std::vector<std::int8_t>{ 1, 0 }));
+    writer.write_type(nbt::tag_type::End);
+    compressed.close();
+    file.close();
+    return path;
+}
+
 std::filesystem::path write_ibimport_fill_sample()
 {
     const auto path = std::filesystem::temp_directory_path() /
@@ -1148,6 +1172,37 @@ void test_zip_round_trip()
     check(!cleanup_error, "mcworld zip cleanup");
 }
 
+void test_new_mcworld_archive()
+{
+    const auto unique = std::to_string(
+        std::chrono::high_resolution_clock::now().time_since_epoch().count());
+    const auto root = std::filesystem::temp_directory_path() /
+        ("water_structure_cpp_new_mcworld_" + unique);
+    const auto archive_path = root / "created.mcworld";
+    const auto extracted = root / "extracted";
+    std::filesystem::create_directories(root);
+
+    auto world = water_structure::BedrockWorldAdapter::open(archive_path);
+    check(world.ok(), "missing .mcworld opens as archive output");
+    check(world.ok() && std::filesystem::is_directory(world.value().directory()),
+        "new .mcworld uses a temporary world directory");
+    if (world) {
+        const auto closed = world.value().close();
+        check(closed.ok(), "new .mcworld closes and packs");
+    }
+    check(std::filesystem::is_regular_file(archive_path),
+        "new .mcworld output is a regular archive, not a directory");
+    const auto unpacked = water_structure::archive::extract_zip(archive_path, extracted);
+    check(unpacked.ok(), "new .mcworld archive extracts");
+    check(std::filesystem::is_regular_file(extracted / "level.dat") &&
+        std::filesystem::is_directory(extracted / "db"),
+        "new .mcworld contains Bedrock world metadata and LevelDB");
+
+    std::error_code cleanup_error;
+    std::filesystem::remove_all(root, cleanup_error);
+    check(!cleanup_error, "new .mcworld cleanup");
+}
+
 class TestStructure final : public water_structure::IStructure {
 public:
     water_structure::StructureId id() const noexcept override { return water_structure::StructureId::Unknown; }
@@ -1414,6 +1469,7 @@ int main()
                 "MianYang reader capability");
         }
         test_zip_round_trip();
+        test_new_mcworld_archive();
 
         const auto schematic_path = write_schematic_sample();
         const auto schematic = water_structure::FormatRegistry::open(schematic_path, registry);
@@ -1534,6 +1590,8 @@ int main()
             "water_structure_cpp_writer_roundtrip.mcfunction";
         const auto mcfunction_single_thread_path = std::filesystem::temp_directory_path() /
             "water_structure_cpp_writer_single_thread.mcfunction";
+        const auto mcfunction_no_clear_path = std::filesystem::temp_directory_path() /
+            "water_structure_cpp_writer_no_clear.mcfunction";
         {
             std::ofstream source(mcfunction_source_path, std::ios::binary | std::ios::trunc);
             source << "setblock 0 0 0 minecraft:oak_log[axis=x]\n"
@@ -1544,6 +1602,19 @@ int main()
         const auto mcfunction_source = water_structure::FormatRegistry::open(
             mcfunction_source_path, registry);
         check(mcfunction_source.ok(), "MCFunction writer source parses");
+        _putenv_s("WATER_STRUCTURE_MCFUNCTION_PARSE_THREADS", "2");
+        const auto mcfunction_parallel_source = water_structure::FormatRegistry::open(
+            mcfunction_source_path, registry);
+        _putenv_s("WATER_STRUCTURE_MCFUNCTION_PARSE_THREADS", "");
+        check(mcfunction_parallel_source.ok(),
+            "MCFunction bounded parallel reader parses");
+        check(mcfunction_parallel_source.value()->size().width ==
+                  mcfunction_source.value()->size().width &&
+              mcfunction_parallel_source.value()->size().height ==
+                  mcfunction_source.value()->size().height &&
+              mcfunction_parallel_source.value()->size().length ==
+                  mcfunction_source.value()->size().length,
+            "MCFunction parallel reader preserves bounds");
         const auto mcfunction_written = water_structure::FormatRegistry::write(
             *mcfunction_source.value(), water_structure::StructureId::MCFunction,
             mcfunction_writer_path, registry);
@@ -1565,6 +1636,21 @@ int main()
         check(mcfunction_progress_total > 0 &&
             mcfunction_progress_done == mcfunction_progress_total,
             "MCFunction writer reports chunk progress");
+        water_structure::ConversionOptions mcfunction_no_clear_options{
+            .clear_air = false
+        };
+        const auto mcfunction_no_clear_written = water_structure::FormatRegistry::write(
+            *mcfunction_source.value(), water_structure::StructureId::MCFunction,
+            mcfunction_no_clear_path, registry, mcfunction_no_clear_options);
+        check(mcfunction_no_clear_written.ok(),
+            "MCFunction writer supports disabling destination clearing");
+        {
+            std::ifstream no_clear(mcfunction_no_clear_path, std::ios::binary);
+            const std::string no_clear_bytes{
+                std::istreambuf_iterator<char>(no_clear), std::istreambuf_iterator<char>() };
+            check(no_clear_bytes.find("minecraft:air") == std::string::npos,
+                "MCFunction no-clear mode emits no air commands");
+        }
         {
             std::ifstream parallel(mcfunction_writer_path, std::ios::binary);
             std::ifstream sequential(mcfunction_single_thread_path, std::ios::binary);
@@ -1734,6 +1820,26 @@ int main()
         check(schem_v2.value()->id() == water_structure::StructureId::SchemV2,
             "SchemV2 trial detection");
         check(schem_v2.value()->count_non_air_blocks().value() == 1, "synthetic SchemV2 non-air count");
+        const auto schem_direct_path = write_schem_v1_ordered_sample();
+        const auto schem_direct = water_structure::FormatRegistry::open_as(
+            schem_direct_path, water_structure::StructureId::SchemV1, registry,
+            {
+                .streaming_world_import = true,
+                .direct_schem_world_stream = true
+            });
+        check(schem_direct.ok(), "Schem direct world stream opens without BlockData spool");
+        TestWorld schem_direct_world;
+        const auto schem_direct_written = schem_direct.value()->write_to_world(
+            schem_direct_world, { 0, -4, 0 }, {});
+        check(schem_direct_written.ok(), "Schem direct gzip stream writes to world");
+        check(schem_direct_world.saved_chunk.layout == water_structure::BlockLayerLayout::Native &&
+                schem_direct_world.saved_chunk.sub_chunks.contains(-4) &&
+                schem_direct_world.saved_chunk.sub_chunks.at(-4).layer0[0] !=
+                    registry.air_runtime_id() &&
+                schem_direct_world.saved_chunk.sub_chunks.at(-4).layer0[256] ==
+                    registry.air_runtime_id(),
+            "Schem direct stream preserves palette indices and native coordinates");
+        std::filesystem::remove(schem_direct_path);
         std::filesystem::remove(schem_v2_path);
 
         std::vector<std::int8_t> boundary_block_data(17, 0);
@@ -1773,6 +1879,19 @@ int main()
         check(!schem_extra_varint.ok() &&
                 schem_extra_varint.error().find("方块数超过 size") != std::string::npos,
             "SchemV1 rejects an extra complete varint");
+        const auto schem_extra_direct = water_structure::FormatRegistry::open_as(
+            schem_extra_varint_path, water_structure::StructureId::SchemV1, registry,
+            {
+                .streaming_world_import = true,
+                .direct_schem_world_stream = true
+            });
+        check(schem_extra_direct.ok(), "SchemV1 direct stream defers BlockData validation");
+        TestWorld schem_extra_world;
+        const auto schem_extra_written = schem_extra_direct.value()->write_to_world(
+            schem_extra_world, { 0, -4, 0 }, {});
+        check(!schem_extra_written.ok() &&
+                schem_extra_written.error().find("方块数超过 size") != std::string::npos,
+            "SchemV1 direct stream rejects an extra complete varint while writing");
         std::filesystem::remove(schem_extra_varint_path);
 
         const auto schem_multibit_path = write_schem_v1_multibit_sample();

@@ -68,6 +68,16 @@ WATER_STRUCTURE_API int ws_convert(
     const char* output_path_utf8,
     uint64_t thread_count);
 
+/* Extended conversion variant. clear_air is non-zero for the default
+ * bounding-box clear; pass zero to emit only non-air placement commands. */
+WATER_STRUCTURE_API int ws_convert_ex(
+    ws_context* context,
+    const char* input_path_utf8,
+    const char* target_format,
+    const char* output_path_utf8,
+    uint64_t thread_count,
+    int clear_air);
+
 /* Optional progress-enabled variant; ws_convert remains ABI-compatible. */
 WATER_STRUCTURE_API int ws_convert_with_progress(
     ws_context* context,
@@ -75,6 +85,16 @@ WATER_STRUCTURE_API int ws_convert_with_progress(
     const char* target_format,
     const char* output_path_utf8,
     uint64_t thread_count,
+    ws_progress_callback callback,
+    void* user_data);
+
+WATER_STRUCTURE_API int ws_convert_with_progress_ex(
+    ws_context* context,
+    const char* input_path_utf8,
+    const char* target_format,
+    const char* output_path_utf8,
+    uint64_t thread_count,
+    int clear_air,
     ws_progress_callback callback,
     void* user_data);
 

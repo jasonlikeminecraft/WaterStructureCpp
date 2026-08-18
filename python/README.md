@@ -220,6 +220,14 @@ IBImport writer 会把连续同类方块尽量合并为 `fill`，其命令坐标
 
 ```python
 ctx.convert("building.mcworld", "MCFunction", "building.mcfunction")
+
+# 合并到已有世界时不清空目标范围，只输出非空气方块
+ctx.convert(
+    "building.mcworld",
+    "MCFunction",
+    "building-merge.mcfunction",
+    clear_air=False,
+)
 ```
 
 生成的是 Bedrock 方块状态命令。`fill` 和 `setblock` 坐标使用 `~x ~y ~z`，执行
@@ -240,6 +248,10 @@ ctx.convert(source, "MCFunction", output, threads=2)  # 显式两个编码线程
 
 线程数只控制支持并行编码的阶段，不会让所有解析器和压缩步骤自动变成 N 线程。
 大型转换常受磁盘、LevelDB、压缩或内存带宽限制，超过 2 个编码线程不保证更快。
+
+SchemV1/V2 写入世界时会走直接 gzip 流路径，跳过完整 BlockData 临时文件；即使
+`Palette` 位于 `BlockData`/`Data` 后面，也只做不落盘的元数据扫描。超过 `uint16`
+palette 容量等特殊输入自动回退到索引临时文件路径。
 
 ## 6. `to_world()`：写入 Bedrock 世界
 
@@ -266,24 +278,22 @@ with Context() as ctx:
 
 ### 写入 `.mcworld`
 
-`.mcworld` 输出需要一个已经存在的模板文件。建议复制空白世界，而不是直接覆盖唯一
-原件：
+输出路径使用 `.mcworld` 或 `.zip` 扩展名时，可以直接创建新的世界归档，不需要先
+准备模板：
 
 ```python
 from pathlib import Path
-import shutil
 from water_structure import Context
 
-template = Path("empty-template.mcworld")
 target = Path("building.mcworld")
-shutil.copy2(template, target)
 
 with Context() as ctx:
     ctx.to_world("building.schem", target, start=(0, -4, 0))
 ```
 
-如果目标路径不存在，即使文件名以 `.mcworld` 结尾，当前实现也会把它当作目录世界创建。
-要得到压缩归档，必须先准备真实存在的 `.mcworld` 模板。
+库会先创建私有临时世界目录并流式写入 LevelDB，成功关闭后再 deflate 打包为
+`.mcworld`。目标已经是现有 `.mcworld` 时仍会安全解压、写回并重新打包；修改现有
+世界前请保留备份。
 
 ## 7. 批量转换
 

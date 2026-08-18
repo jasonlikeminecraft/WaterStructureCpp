@@ -30,6 +30,8 @@ public:
     Result<void> read_from_world(WorldSource&, BlockBox, ConversionCallbacks) override;
 
 private:
+    Result<void> read_parallel(const std::filesystem::path& path);
+
     // Keep commands instead of expanding fill cuboids into one entry per
     // block.  A command is tiny and can be replayed against one requested
     // chunk at a time, which keeps MCFunction import memory bounded even for
@@ -45,8 +47,15 @@ private:
     Size mOriginalSize{};
     BlockPos mOffset{};
     std::vector<Command> mCommands;
-    mutable std::unordered_map<ChunkPos, std::vector<std::uint32_t>, ChunkPosHash> mCommandIndex;
+    // Compact CSR index: each chunk owns a contiguous slice in
+    // mCommandIndices. This avoids one allocation and hash node per chunk.
+    mutable std::vector<std::size_t> mCommandOffsets;
+    mutable std::vector<std::uint32_t> mCommandIndices;
     mutable std::vector<std::uint32_t> mBroadCommands;
+    mutable std::int32_t mIndexMinX = 0;
+    mutable std::int32_t mIndexMinZ = 0;
+    mutable std::int32_t mIndexWidth = 0;
+    mutable std::int32_t mIndexLength = 0;
     mutable bool mCommandIndexReady = false;
     mutable std::optional<std::size_t> mNonAirBlocks;
 };

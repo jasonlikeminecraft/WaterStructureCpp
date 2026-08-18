@@ -136,7 +136,7 @@ xmake run water_structure_tests
 water_structure_cli formats [--writers-only]
 water_structure_cli inspect <input>
 water_structure_cli convert <input> <output> [--format <target>] [--threads <count>]
-water_structure_cli to-world <input> <world-or-mcworld> [--start <x,y,z>]
+water_structure_cli to-world <input> <world-directory-or-output.mcworld> [--start <x,y,z>]
 ```
 
 CLI 参考 Go 版任意结构转换流程：自动识别输入格式、检查目标 writer capability、
@@ -155,12 +155,17 @@ water_structure_cli convert input.bdx output.schem --format SchemV1
 water_structure_cli to-world input.schem output.mcworld --start 0,-4,0
 ```
 
+`to-world` 会按输出路径自动选择模式：目录路径写入 Bedrock 目录世界；不存在的
+`.mcworld`/`.zip` 路径会先在临时目录中流式写入 LevelDB，完成后自动 deflate 打包并
+原子替换为归档文件。已有 `.mcworld` 仍按安全解压、写回、重新打包流程处理。
+
 旧的 `convert <input> --format <target> --output <path>` 参数形式继续兼容。仅当目标
 格式存在已实现且已验证的 writer 时，`convert` 才允许输出；`formats --writers-only`
 可以查看当前可用目标。
 
-MCFunction writer 按 chunk 批次流式读取，只输出非空气方块，并用不超过 32,768
-方块的 `fill` 命令清空结构范围以保留空气和尺寸。MCFunction 没有统一的
+MCFunction writer 按 chunk 批次流式读取，只输出非空气方块；默认还会用不超过
+32,768 方块的 `fill` 命令清空结构范围以保留空气和尺寸。命令行可使用
+`--no-clear-air` 关闭清空，只保留非空气放置命令。MCFunction 没有统一的
 Bedrock 方块实体协议，因此方块实体 NBT 会按约定跳过，不会静默改写。
 生成的 `fill`/`setblock` 坐标使用 `~x ~y ~z` 相对坐标，执行函数时以执行位置
 作为结构锚点，而不是固定写入世界绝对坐标。
@@ -176,9 +181,18 @@ palette 读取方块状态——每个不同状态只升级并格式化一次（
 MCWorld 输入的加载（LevelDB 读取 + 子区块解码）由独立线程预取，与编码线程
 流水线重叠，避免单线程解码成为整条链路的瓶颈。
 
-MCFunction reader 同样采用有界流式路径：逐行解析后只保留紧凑的
-`setblock`/`fill` 命令，不会把大 `fill` 展开为逐方块数组；下游按需请求 chunk 时
-才生成该 chunk 的交集。因此导入内存随命令数增长，而不是随填充体积增长。
+SchemV1/V2 写入 MCWorld 时，读取器会延迟 BlockData 物化，在
+`write_to_world()` 阶段重新打开 gzip，并把 BlockData 直接送入 16 层 slab 和
+LevelDB，不再创建完整的临时 BlockData 文件。`Palette` 位于 Data 后面的文件会在
+轻量元数据扫描中跳过 Data 后再执行直接转换；超过 `uint16` palette 容量等特殊输入
+自动回退到临时文件路径，兼容性不变。
+
+MCFunction reader 同样采用有界流式路径：大文件按 16 MiB 完整行块读取，默认由最多
+4 个解析线程并行处理，再严格按源文件顺序合并；每个线程缓存重复 block state，并用
+`string_view`/`from_chars` 解析，避免逐行 `istringstream` 和字段数组分配。reader 只保留
+紧凑的 `setblock`/`fill` 命令，不会把大 `fill` 展开为逐方块数组；下游使用连续 CSR
+chunk 索引按需生成交集，并以 8 chunk 小批次写入世界。环境变量
+`WATER_STRUCTURE_MCFUNCTION_PARSE_THREADS` 可覆盖解析线程数。
 
 IBImport writer 的命令段和命令方块 NBT 段均逐 chunk 读取并立即 XOR 写出；段长度
 在结束时回填，不缓存完整命令文本、全部 chunk 坐标或全部方块实体。每个 chunk
@@ -208,6 +222,7 @@ Release 构建在本机实测的端到端结果，数字用于比较转换器量
 | --- | --- | --- | ---: | ---: |
 | MCWorld → SchemV1 | 乌托邦，`2701×176×2701`，约 2.86 万 chunk 柱 | `.schem` | 约 29.3 秒 | 约 175 MiB（工作集约 348 MiB） |
 | MCWorld → MCFunction | 同上 | `.mcfunction` | 约 13 秒（palette 流水线，本机复测；generic 路径约 16 秒） | 约 154 MiB |
+| MCFunction → MCWorld | 乌托邦，1.05 GiB、约 1636 万条命令 | 世界目录 | 约 13.25 秒（优化前约 100 秒） | 私有内存约 755 MiB（工作集约 670 MiB） |
 | MCWorld → IBImport | chenshi，`2716×342×2245` | `.ibi` | 约 10–12 秒（palette 流水线，3 个编码线程） | 私有内存约 136 MiB（工作集约 290 MiB） |
 | Schem → IBImport | 乌托邦，`2701×176×2701` | `.ibi`（818.4 MiB） | 约 44–46 秒（共享 palette 流水线，3 个编码线程） | 私有内存/工作集约 144 MiB |
 | MCWorld → BDX | Kuudra，`188×175×185`，270.6 万非空气方块 | `.bdx` | 约 1.49 秒 | 约 152 MiB |

@@ -518,6 +518,7 @@ Result<std::unique_ptr<IStructure>> FormatRegistry::open_as(
         for (const auto format : { StructureId::SchemV1, StructureId::SchemV2 }) {
             auto reader = std::make_unique<SchemStructure>(registry, format);
             reader->set_streaming_world_import(options.streaming_world_import);
+            reader->set_direct_world_stream(options.direct_schem_world_stream);
             auto parsed = reader->read(path);
             if (parsed) {
                 return Result<std::unique_ptr<IStructure>>::success(std::move(reader));

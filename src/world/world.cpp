@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cctype>
 #include <cstring>
 #include <cstdlib>
 #include <iostream>
@@ -121,9 +122,13 @@ Result<BedrockWorldAdapter> BedrockWorldAdapter::open(
     std::filesystem::path world_directory = directory;
     std::filesystem::path temporary_directory;
     std::filesystem::path archive_path;
+    auto extension = directory.extension().string();
+    std::transform(extension.begin(), extension.end(), extension.begin(), [](unsigned char value) {
+        return static_cast<char>(std::tolower(value));
+    });
+    const bool archive_extension = extension == ".mcworld" || extension == ".zip";
     if (std::filesystem::is_regular_file(directory)) {
-        const auto extension = directory.extension().string();
-        if (extension != ".mcworld" && extension != ".zip") {
+        if (!archive_extension) {
             return Result<BedrockWorldAdapter>::failure("世界文件扩展名不是 .mcworld 或 .zip");
         }
         temporary_directory = make_temporary_world_directory();
@@ -140,6 +145,20 @@ Result<BedrockWorldAdapter> BedrockWorldAdapter::open(
             return Result<BedrockWorldAdapter>::failure(".mcworld 中未找到包含 db 的世界目录");
         }
         archive_path = std::filesystem::absolute(directory);
+    } else if (!std::filesystem::exists(directory) && archive_extension) {
+        // A missing .mcworld/.zip is an output archive request. Build the
+        // world in a private directory first, then close() packs it and
+        // atomically moves the archive into place. This keeps LevelDB away
+        // from the final archive path and preserves streaming writes.
+        temporary_directory = make_temporary_world_directory();
+        world_directory = temporary_directory;
+        archive_path = std::filesystem::absolute(directory);
+        std::error_code parent_error;
+        std::filesystem::create_directories(archive_path.parent_path(), parent_error);
+        if (parent_error) {
+            return Result<BedrockWorldAdapter>::failure(
+                "创建 .mcworld 输出目录失败: " + parent_error.message());
+        }
     } else if (std::filesystem::is_directory(directory) && !write_back_archive) {
         temporary_directory = make_temporary_world_directory();
         const auto copied = copy_world_directory(directory, temporary_directory);
@@ -683,11 +702,17 @@ Result<void> convert_to_world(const IStructure& structure, WorldTarget& world, S
     const std::size_t batch_size =
         (structure.id() == StructureId::SchemV1 || structure.id() == StructureId::SchemV2)
         ? static_cast<std::size_t>(structure_size.chunk_x_count())
+        : structure.id() == StructureId::MCFunction
+        ? 8
         : 64;
     for (std::size_t begin = 0; begin < positions.size(); begin += batch_size) {
         const auto end = std::min(begin + batch_size, positions.size());
         const auto batch = std::span<const ChunkPos>(positions).subspan(begin, end - begin);
         std::size_t visited_chunk_count = 0;
+        std::vector<ChunkPos> target_positions;
+        std::vector<ChunkData> shifted_chunks;
+        target_positions.reserve(batch.size());
+        shifted_chunks.reserve(batch.size());
         const auto visit_chunks_start = Clock::now();
         auto visited_chunks = structure.visit_chunks(batch,
             [&](ChunkPos local_pos, const ChunkData& chunk) -> Result<void> {
@@ -705,22 +730,35 @@ Result<void> convert_to_world(const IStructure& structure, WorldTarget& world, S
                 }
                 shifted.sub_chunks.emplace(target_sub_y, sub_chunk);
             }
-            const auto save_start = Clock::now();
-            auto saved = world.save_chunk(target_pos, shifted);
-            save_chunks_ms += elapsed_ms(save_start);
-            if (!saved) {
-                return Result<void>::failure(
-                    "保存区块 (" + std::to_string(target_pos.x) + ", " + std::to_string(target_pos.z) + ") 失败: " +
-                    saved.error()
-                );
-            }
-            if (callbacks.progress) {
-                callbacks.progress();
-            }
+            target_positions.push_back(target_pos);
+            shifted_chunks.push_back(std::move(shifted));
             return Result<void>::success();
         });
-        visit_chunks_ms += elapsed_ms(visit_chunks_start);
         if (!visited_chunks) return visited_chunks;
+        std::vector<ChunkWrite> writes;
+        writes.reserve(shifted_chunks.size());
+        for (std::size_t index = 0; index < shifted_chunks.size(); ++index) {
+            writes.push_back({ target_positions[index], &shifted_chunks[index] });
+        }
+        if (!writes.empty()) {
+            const auto save_start = Clock::now();
+            auto saved = world.save_chunks(writes);
+            save_chunks_ms += elapsed_ms(save_start);
+            if (!saved) {
+                const auto first = target_positions.front();
+                const auto last = target_positions.back();
+                return Result<void>::failure(
+                    "批量保存区块 (" + std::to_string(first.x) + ", " + std::to_string(first.z) +
+                    ")..(" + std::to_string(last.x) + ", " + std::to_string(last.z) + ") 失败: " +
+                    saved.error());
+            }
+        }
+        if (callbacks.progress) {
+            for (std::size_t completed = 0; completed < visited_chunk_count; ++completed) {
+                callbacks.progress();
+            }
+        }
+        visit_chunks_ms += elapsed_ms(visit_chunks_start);
         if (callbacks.progress && visited_chunk_count < batch.size()) {
             for (std::size_t missing = visited_chunk_count; missing < batch.size(); ++missing) {
                 callbacks.progress();

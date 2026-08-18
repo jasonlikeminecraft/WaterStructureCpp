@@ -144,7 +144,7 @@ extern "C" {
 
 WATER_STRUCTURE_API const char* ws_version(void)
 {
-    return "0.1.5";
+    return "0.1.6";
 }
 
 WATER_STRUCTURE_API uint32_t ws_abi_version(void)
@@ -253,6 +253,7 @@ static int ws_convert_impl(
     const char* target_format,
     const char* output_path_utf8,
     uint64_t thread_count,
+    int clear_air,
     ws_progress_callback callback,
     void* user_data)
 {
@@ -277,6 +278,7 @@ static int ws_convert_impl(
         progress.finish(WS_PROGRESS_READ);
         water_structure::ConversionOptions options;
         options.thread_count = static_cast<std::size_t>(thread_count);
+        options.clear_air = clear_air != 0;
         if (callback != nullptr) {
             options.callbacks.start = [&progress](std::size_t total) {
                 progress.start(WS_PROGRESS_ENCODE, total);
@@ -313,7 +315,20 @@ WATER_STRUCTURE_API int ws_convert(
 {
     return ws_convert_impl(
         context, input_path_utf8, target_format, output_path_utf8,
-        thread_count, nullptr, nullptr);
+        thread_count, 1, nullptr, nullptr);
+}
+
+WATER_STRUCTURE_API int ws_convert_ex(
+    ws_context* context,
+    const char* input_path_utf8,
+    const char* target_format,
+    const char* output_path_utf8,
+    uint64_t thread_count,
+    int clear_air)
+{
+    return ws_convert_impl(
+        context, input_path_utf8, target_format, output_path_utf8,
+        thread_count, clear_air, nullptr, nullptr);
 }
 
 WATER_STRUCTURE_API int ws_convert_with_progress(
@@ -327,7 +342,22 @@ WATER_STRUCTURE_API int ws_convert_with_progress(
 {
     return ws_convert_impl(
         context, input_path_utf8, target_format, output_path_utf8,
-        thread_count, callback, user_data);
+        thread_count, 1, callback, user_data);
+}
+
+WATER_STRUCTURE_API int ws_convert_with_progress_ex(
+    ws_context* context,
+    const char* input_path_utf8,
+    const char* target_format,
+    const char* output_path_utf8,
+    uint64_t thread_count,
+    int clear_air,
+    ws_progress_callback callback,
+    void* user_data)
+{
+    return ws_convert_impl(
+        context, input_path_utf8, target_format, output_path_utf8,
+        thread_count, clear_air, callback, user_data);
 }
 
 static int ws_to_world_impl(
@@ -346,7 +376,10 @@ static int ws_to_world_impl(
         progress.start(WS_PROGRESS_OPEN, 1);
         auto opened = water_structure::FormatRegistry::open(
             water_structure::utf8_path(input_path_utf8), context->registry,
-            { true });
+            {
+                .streaming_world_import = true,
+                .direct_schem_world_stream = true
+            });
         if (!opened) {
             set_error(context, opened.error());
             return 0;

@@ -114,6 +114,90 @@ private:
     std::size_t mSize = 0;
 };
 
+// Bounded reader over the BlockData payload inside the live gzip/NBT stream.
+// It never reads beyond the byte-array length, so the NBT parser can resume
+// immediately after the direct world conversion and validate trailing tags.
+class LimitedEncodedReader {
+public:
+    LimitedEncodedReader(std::istream& input, std::uint64_t length)
+        : mInput(input), mRemaining(length), mBuffer(1u << 20) {}
+
+    bool get(std::uint8_t& value)
+    {
+        if (mPosition == mSize && !refill()) return false;
+        value = static_cast<std::uint8_t>(mBuffer[mPosition++]);
+        return true;
+    }
+
+    bool read_varint_u32(std::uint32_t& result)
+    {
+        if (mPosition < mSize) {
+            const auto remaining = mSize - mPosition;
+            const auto* bytes = reinterpret_cast<const std::uint8_t*>(mBuffer.data()) + mPosition;
+            const auto first = bytes[0];
+            if ((first & 0x80u) == 0) {
+                result = first;
+                ++mPosition;
+                return true;
+            }
+            if (remaining >= 5) {
+                std::uint64_t value = first & 0x7fu;
+                int shift = 7;
+                for (std::size_t index = 1; index < 5; ++index, shift += 7) {
+                    const auto byte = bytes[index];
+                    value |= static_cast<std::uint64_t>(byte & 0x7fu) << shift;
+                    if ((byte & 0x80u) == 0) {
+                        if (value > std::numeric_limits<std::uint32_t>::max()) return false;
+                        result = static_cast<std::uint32_t>(value);
+                        mPosition += index + 1;
+                        return true;
+                    }
+                }
+                return false;
+            }
+        }
+        std::uint64_t value = 0;
+        int shift = 0;
+        for (;;) {
+            std::uint8_t byte = 0;
+            if (!get(byte)) return false;
+            value |= static_cast<std::uint64_t>(byte & 0x7fu) << shift;
+            if ((byte & 0x80u) == 0) {
+                if (value > std::numeric_limits<std::uint32_t>::max()) return false;
+                result = static_cast<std::uint32_t>(value);
+                return true;
+            }
+            shift += 7;
+            if (shift >= 35) return false;
+        }
+    }
+
+    std::uint64_t remaining() const noexcept
+    {
+        return mRemaining + (mSize - mPosition);
+    }
+
+private:
+    bool refill()
+    {
+        mPosition = mSize = 0;
+        if (mRemaining == 0) return false;
+        const auto amount = static_cast<std::streamsize>(
+            std::min<std::uint64_t>(mRemaining, mBuffer.size()));
+        mInput.read(mBuffer.data(), amount);
+        if (mInput.gcount() != amount) return false;
+        mRemaining -= static_cast<std::uint64_t>(amount);
+        mSize = static_cast<std::size_t>(amount);
+        return true;
+    }
+
+    std::istream& mInput;
+    std::uint64_t mRemaining = 0;
+    std::vector<char> mBuffer;
+    std::size_t mPosition = 0;
+    std::size_t mSize = 0;
+};
+
 bool is_integer_type(nbt::tag_type type) noexcept
 {
     return type == nbt::tag_type::Byte || type == nbt::tag_type::Short ||
@@ -233,6 +317,90 @@ bool read_encoded_index_fast(
     return result <= max_value;
 }
 
+bool read_encoded_index_fast(
+    LimitedEncodedReader& input,
+    std::uint32_t& result,
+    std::uint16_t max_value)
+{
+    if (!input.read_varint_u32(result)) return false;
+    return result <= max_value;
+}
+
+template <typename Callback>
+Result<void> consume_deferred_block_data(
+    const std::filesystem::path& path,
+    StructureId format,
+    std::size_t expected_length,
+    Callback&& callback)
+{
+    std::ifstream input(path, std::ios::binary);
+    if (!input) return Result<void>::failure("无法重新打开 Schem 文件: " + path.string());
+    try {
+        zlib::izlibstream decompressed(input);
+        NbtReader reader(decompressed, endian::big);
+        if (reader.read_type() != nbt::tag_type::Compound) {
+            return Result<void>::failure("Schem 根标签不是 Compound");
+        }
+        const auto root_name = reader.read_string();
+        bool found = false;
+        std::function<Result<void>(bool)> parse_document = [&](bool blocks_payload) -> Result<void> {
+            for (;;) {
+                const auto type = reader.read_type(true);
+                if (type == nbt::tag_type::End) break;
+                const auto key = reader.read_string();
+                const bool target = type == nbt::tag_type::Byte_Array &&
+                    ((format == StructureId::SchemV1 && !blocks_payload && key == "BlockData") ||
+                     (format == StructureId::SchemV2 && blocks_payload && key == "Data"));
+                if (target) {
+                    if (found) return Result<void>::failure("Schem 包含重复 BlockData");
+                    std::int32_t length = 0;
+                    reader.read_num(length);
+                    if (length < 0 || static_cast<std::size_t>(length) != expected_length) {
+                        return Result<void>::failure("Schem BlockData 长度在流式写入前后不一致");
+                    }
+                    LimitedEncodedReader encoded(decompressed, static_cast<std::uint32_t>(length));
+                    auto consumed = callback(encoded);
+                    if (!consumed) return consumed;
+                    if (encoded.remaining() != 0) {
+                        return Result<void>::failure("Schem BlockData 未被完整消费");
+                    }
+                    found = true;
+                } else if (key == "Blocks" && type == nbt::tag_type::Compound && !blocks_payload) {
+                    auto nested = parse_document(true);
+                    if (!nested) return nested;
+                } else {
+                    skip_payload(reader, type);
+                }
+            }
+            return Result<void>::success();
+        };
+
+        Result<void> parsed = Result<void>::success();
+        if (root_name == "Schematic") {
+            parsed = parse_document(false);
+        } else if (root_name.empty()) {
+            for (;;) {
+                const auto type = reader.read_type(true);
+                if (type == nbt::tag_type::End) break;
+                const auto key = reader.read_string();
+                if (key == "Schematic" && type == nbt::tag_type::Compound) {
+                    parsed = parse_document(false);
+                    if (!parsed) break;
+                } else {
+                    skip_payload(reader, type);
+                }
+            }
+        } else {
+            return Result<void>::failure("Schem 根标签缺少 Schematic 文档");
+        }
+        if (!parsed) return parsed;
+        if (!found) return Result<void>::failure("Schem 流式写入时未找到 BlockData");
+        return Result<void>::success();
+    } catch (const std::exception& error) {
+        return Result<void>::failure("Schem 直接流式解压失败: " + std::string(error.what()));
+    }
+}
+
 } // namespace
 
 SchemStructure::~SchemStructure()
@@ -247,6 +415,7 @@ void SchemStructure::release_block_data() noexcept
         std::filesystem::remove(mBlockDataPath, error);
     }
     mBlockDataPath.clear();
+    mSourcePath.clear();
     mRowOffsets.clear();
     mChunkOffsets.clear();
     mBlockCount = 0;
@@ -258,6 +427,7 @@ void SchemStructure::release_block_data() noexcept
     mSharedPaletteStates.reset();
     mSharedAirPaletteFlags.clear();
     mSharedAirPaletteIndex = 0;
+    mBlockDataDeferred = false;
 }
 
 void SchemStructure::set_offset(BlockPos offset) noexcept
@@ -288,8 +458,7 @@ Result<void> SchemStructure::read(const std::filesystem::path& path)
         const auto unique = std::to_string(std::chrono::high_resolution_clock::now().time_since_epoch().count()) +
             "-" + std::to_string(reinterpret_cast<std::uintptr_t>(this));
         mBlockDataPath = std::filesystem::temp_directory_path() / ("water_structure_schem_" + unique + ".blockdata");
-        std::ofstream raw(mBlockDataPath, std::ios::binary | std::ios::trunc);
-        if (!raw) return Result<void>::failure("无法创建 Schem 临时 BlockData 文件");
+        std::ofstream raw;
 
         bool has_palette = false;
         bool has_data = false;
@@ -329,8 +498,33 @@ Result<void> SchemStructure::read(const std::filesystem::path& path)
         auto read_data = [&]() -> Result<void> {
             std::int32_t length = 0; reader.read_num(length);
             if (length < 0) return Result<void>::failure("Schem BlockData 长度无效");
+            if (mDirectWorldStream && !has_data &&
+                mMaxPaletteIndex <= std::numeric_limits<std::uint16_t>::max()) {
+                mBlockDataBytes = static_cast<std::size_t>(length);
+                if (mOriginalSize.width > 0 && mOriginalSize.height > 0 && mOriginalSize.length > 0) {
+                    mBlockCount = static_cast<std::size_t>(mOriginalSize.volume());
+                }
+                mSourcePath = path;
+                mBlockDataDeferred = true;
+                has_data = true;
+                // If Palette follows BlockData, consume the byte array once
+                // without materializing it so the remaining NBT metadata can
+                // still be parsed. write_to_world() then reopens the gzip
+                // stream and performs the only varint/materialization pass.
+                const bool metadata_ready = has_palette &&
+                    mOriginalSize.width > 0 && mOriginalSize.height > 0 &&
+                    mOriginalSize.length > 0;
+                if (!metadata_ready) {
+                    skip_bytes(decompressed, static_cast<std::uint32_t>(length));
+                }
+                return Result<void>::success();
+            }
             const auto build_index = !has_data && !mStreamingWorldImport &&
                 mOriginalSize.width > 0 && mOriginalSize.height > 0 && mOriginalSize.length > 0;
+            if (!raw.is_open()) {
+                raw.open(mBlockDataPath, std::ios::binary | std::ios::trunc);
+                if (!raw) return Result<void>::failure("无法创建 Schem 临时 BlockData 文件");
+            }
             const auto width = static_cast<std::size_t>(mOriginalSize.width);
             const auto rows = static_cast<std::size_t>(mOriginalSize.height) *
                 static_cast<std::size_t>(mOriginalSize.length);
@@ -428,6 +622,10 @@ Result<void> SchemStructure::read(const std::filesystem::path& path)
                     has_size = true;
                 } else if (key == "Palette" && type == nbt::tag_type::Compound) {
                     auto parsed = parse_palette(reader.read_payload(type)); if (!parsed) return parsed;
+                    if (mBlockDataDeferred && mOriginalSize.width > 0 &&
+                        mOriginalSize.height > 0 && mOriginalSize.length > 0) {
+                        return Result<void>::success();
+                    }
                 } else if (key == "Blocks" && type == nbt::tag_type::Compound && !blocks_payload &&
                            mFormat == StructureId::SchemV1) {
                     // Reject the other Schem version before consuming its
@@ -440,8 +638,14 @@ Result<void> SchemStructure::read(const std::filesystem::path& path)
                     auto parsed = read_data(); if (!parsed) return parsed;
                     if (blocks_payload) has_nested_block_data = true;
                     else has_root_block_data = true;
+                    if (mBlockDataDeferred && has_palette &&
+                        mOriginalSize.width > 0 && mOriginalSize.height > 0 &&
+                        mOriginalSize.length > 0) return Result<void>::success();
                 } else if (key == "Blocks" && type == nbt::tag_type::Compound && !blocks_payload) {
                     auto parsed = parse_document(true); if (!parsed) return parsed;
+                    if (mBlockDataDeferred && has_palette &&
+                        mOriginalSize.width > 0 && mOriginalSize.height > 0 &&
+                        mOriginalSize.length > 0) return Result<void>::success();
                 } else {
                     skip_payload(reader, type);
                 }
@@ -462,7 +666,7 @@ Result<void> SchemStructure::read(const std::filesystem::path& path)
                     parsed = parse_document(false);
                 }
                 else skip_payload(reader, type);
-                if (!parsed) break;
+                if (!parsed || mBlockDataDeferred) break;
             }
         }
         if (!parsed) return parsed;
@@ -478,6 +682,13 @@ Result<void> SchemStructure::read(const std::filesystem::path& path)
             return Result<void>::failure("SchemV2 缺少 Blocks/Data");
         raw.close();
         mBlockCount = static_cast<std::size_t>(mOriginalSize.volume());
+        if (mBlockDataDeferred) {
+            std::error_code cleanup_error;
+            std::filesystem::remove(mBlockDataPath, cleanup_error);
+            mBlockDataPath.clear();
+            set_offset({});
+            return Result<void>::success();
+        }
         if (!index_built_during_read &&
             (!mStreamingWorldImport || mMaxPaletteIndex > std::numeric_limits<std::uint16_t>::max())) {
             EncodedReader encoded(mBlockDataPath);
@@ -898,6 +1109,32 @@ Result<NbtChunkMap> SchemStructure::get_chunk_nbt(std::span<const ChunkPos> posi
 Result<std::size_t> SchemStructure::count_non_air_blocks() const
 {
     if (mNonAirCountValid) return Result<std::size_t>::success(mNonAirCount);
+    if (mBlockDataDeferred) {
+        std::size_t result = 0;
+        const auto air_runtime_id = mRegistry.air_runtime_id();
+        const auto* dense_palette = mDensePalette.empty() ? nullptr : mDensePalette.data();
+        const auto consumed = consume_deferred_block_data(
+            mSourcePath, mFormat, mBlockDataBytes,
+            [&](auto& encoded) -> Result<void> {
+                for (std::size_t i = 0; i < mBlockCount; ++i) {
+                    std::uint32_t index = 0;
+                    if (!encoded.read_varint_u32(index) || index > mMaxPaletteIndex) {
+                        return Result<void>::failure("Schem BlockData varint 读取失败或 palette 索引越界");
+                    }
+                    const auto runtime_id = dense_palette && index < mDensePalette.size()
+                        ? dense_palette[index]
+                        : (mPalette.contains(index) ? mPalette.at(index) : mUnknownRuntimeId);
+                    if (runtime_id != air_runtime_id) ++result;
+                }
+                std::uint8_t trailing = 0;
+                if (encoded.get(trailing)) {
+                    return Result<void>::failure("Schem BlockData 方块数超过 size");
+                }
+                return Result<void>::success();
+            });
+        if (!consumed) return Result<std::size_t>::failure(consumed.error());
+        return Result<std::size_t>::success(result);
+    }
     EncodedReader encoded(mBlockDataPath);
     if (!encoded.good()) return Result<std::size_t>::failure("无法打开 Schem 临时 BlockData 文件");
     const auto* dense_palette = mDensePalette.empty() ? nullptr : mDensePalette.data();
@@ -916,13 +1153,71 @@ Result<std::size_t> SchemStructure::count_non_air_blocks() const
 
 Result<void> SchemStructure::write_to_world(WorldTarget& world, SubChunkPos start, ConversionCallbacks callbacks) const
 {
+    if (mBlockDataDeferred && mMaxPaletteIndex > std::numeric_limits<std::uint16_t>::max()) {
+        const auto unique = std::to_string(
+            std::chrono::high_resolution_clock::now().time_since_epoch().count()) +
+            "-" + std::to_string(reinterpret_cast<std::uintptr_t>(this));
+        const auto fallback_path = std::filesystem::temp_directory_path() /
+            ("water_structure_schem_" + unique + ".blockdata");
+        std::ofstream raw(fallback_path, std::ios::binary | std::ios::trunc);
+        if (!raw) return Result<void>::failure("无法创建 Schem BlockData fallback 文件");
+        const auto width = static_cast<std::size_t>(mOriginalSize.width);
+        const auto rows = static_cast<std::size_t>(mOriginalSize.height) *
+            static_cast<std::size_t>(mOriginalSize.length);
+        mChunkOffsetCount = (width + kIndexStride - 1) / kIndexStride;
+        mRowOffsets.assign(rows, 0);
+        mChunkOffsets.assign(rows * mChunkOffsetCount, kMissingChunkOffset);
+        std::uint64_t encoded_offset = 0;
+        const auto materialized = consume_deferred_block_data(
+            mSourcePath, mFormat, mBlockDataBytes,
+            [&](auto& encoded) -> Result<void> {
+                for (std::size_t index = 0; index < mBlockCount; ++index) {
+                    std::uint32_t value = 0;
+                    if (!encoded.read_varint_u32(value) || value > mMaxPaletteIndex) {
+                        return Result<void>::failure("Schem BlockData varint 读取失败或 palette 索引越界");
+                    }
+                    const auto row = index / width;
+                    const auto x = index % width;
+                    if (x == 0) mRowOffsets[row] = encoded_offset;
+                    if (x % kIndexStride == 0) {
+                        const auto relative_offset = encoded_offset - mRowOffsets[row];
+                        if (relative_offset < kMissingChunkOffset) {
+                            mChunkOffsets[row * mChunkOffsetCount + x / kIndexStride] =
+                                static_cast<std::uint16_t>(relative_offset);
+                        }
+                    }
+                    std::uint64_t encoded_size = 0;
+                    do {
+                        const auto byte = static_cast<char>(
+                            (value & 0x7fu) | (value >= 0x80u ? 0x80u : 0));
+                        raw.put(byte);
+                        ++encoded_size;
+                        value >>= 7u;
+                    } while (value != 0);
+                    encoded_offset += encoded_size;
+                }
+                std::uint8_t trailing = 0;
+                if (encoded.get(trailing)) {
+                    return Result<void>::failure("Schem BlockData 方块数超过 size");
+                }
+                return raw ? Result<void>::success() :
+                    Result<void>::failure("写入 Schem BlockData fallback 失败");
+            });
+        raw.close();
+        if (!materialized) {
+            std::error_code cleanup_error;
+            std::filesystem::remove(fallback_path, cleanup_error);
+            return materialized;
+        }
+        mBlockDataBytes = static_cast<std::size_t>(encoded_offset);
+        mBlockDataPath = fallback_path;
+        mBlockDataDeferred = false;
+    }
     if (mOffset != BlockPos{} || mMaxPaletteIndex > std::numeric_limits<std::uint16_t>::max()) {
         return convert_to_world(*this, world, start, std::move(callbacks));
     }
 
-    EncodedReader encoded(mBlockDataPath);
-    if (!encoded.good()) return Result<void>::failure("无法打开 Schem 临时 BlockData 文件");
-
+    auto write_from_reader = [this, &world, start, callbacks](auto& encoded) mutable -> Result<void> {
     const auto width = static_cast<std::size_t>(mOriginalSize.width);
     const auto height = static_cast<std::size_t>(mOriginalSize.height);
     const auto length = static_cast<std::size_t>(mOriginalSize.length);
@@ -1066,13 +1361,31 @@ Result<void> SchemStructure::write_to_world(WorldTarget& world, SubChunkPos star
         return Result<void>::failure("Schem BlockData 方块数超过 size");
     }
     if (profile) {
-        std::cerr << "schem_world_profile decode_ms=" << decode_ms
+        std::cerr << "schem_world_profile source="
+                  << (mBlockDataDeferred ? "gzip_direct" : "temp_file")
+                  << " decode_ms=" << decode_ms
                   << " materialize_ms=" << materialize_ms
                   << " save_ms=" << save_ms
                   << '\n';
     }
     if (verify) std::cerr << "schem_world_checksum=" << verification_checksum << '\n';
     return Result<void>::success();
+    };
+
+    if (mBlockDataDeferred) {
+        if (mSourcePath.empty()) {
+            return Result<void>::failure("Schem 延迟 BlockData 缺少源文件路径");
+        }
+        return consume_deferred_block_data(
+            mSourcePath, mFormat, mBlockDataBytes,
+            [&write_from_reader](auto& encoded) -> Result<void> {
+                return write_from_reader(encoded);
+            });
+    }
+
+    EncodedReader encoded(mBlockDataPath);
+    if (!encoded.good()) return Result<void>::failure("无法打开 Schem 临时 BlockData 文件");
+    return write_from_reader(encoded);
 }
 
 Result<void> SchemStructure::read_from_world(WorldSource&, BlockBox, ConversionCallbacks)

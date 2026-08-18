@@ -115,6 +115,17 @@ _lib.ws_convert.argtypes = [
     ctypes.c_uint64,
 ]
 _lib.ws_convert.restype = ctypes.c_int
+_ws_convert_ex = getattr(_lib, "ws_convert_ex", None)
+if _ws_convert_ex is not None:
+    _ws_convert_ex.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_char_p,
+        ctypes.c_char_p,
+        ctypes.c_char_p,
+        ctypes.c_uint64,
+        ctypes.c_int,
+    ]
+    _ws_convert_ex.restype = ctypes.c_int
 _ProgressCallback = ctypes.CFUNCTYPE(
     None, ctypes.c_void_p, ctypes.c_uint8, ctypes.c_uint64, ctypes.c_uint64
 )
@@ -130,6 +141,19 @@ if _ws_convert_with_progress is not None:
         ctypes.c_void_p,
     ]
     _ws_convert_with_progress.restype = ctypes.c_int
+_ws_convert_with_progress_ex = getattr(_lib, "ws_convert_with_progress_ex", None)
+if _ws_convert_with_progress_ex is not None:
+    _ws_convert_with_progress_ex.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_char_p,
+        ctypes.c_char_p,
+        ctypes.c_char_p,
+        ctypes.c_uint64,
+        ctypes.c_int,
+        _ProgressCallback,
+        ctypes.c_void_p,
+    ]
+    _ws_convert_with_progress_ex.restype = ctypes.c_int
 _lib.ws_to_world.argtypes = [
     ctypes.c_void_p,
     ctypes.c_char_p,
@@ -296,6 +320,7 @@ class Context:
         output_path: PathValue,
         *,
         threads: int = 0,
+        clear_air: bool = True,
         progress: Optional[Callable[[Progress], object]] = None,
     ) -> None:
         """Convert a structure to a supported writer format.
@@ -309,18 +334,28 @@ class Context:
         Pass ``0`` (the default) to let the library choose automatically:
         a single worker for tiny inputs, otherwise ``min(CPU cores, 2)``
         (parallel encoding beyond 2 threads is memory-bandwidth limited).
+
+        ``clear_air`` controls MCFunction's destination reset. The default
+        clears the complete structure bounds; set it to ``False`` to emit
+        only non-air placement commands and preserve existing blocks.
         """
         if threads < 0:
             raise ValueError("threads must be >= 0")
         handle = self._require_open()
         if progress is None:
-            converted = _lib.ws_convert(
+            args = (
                 handle,
                 os.fsencode(input_path),
                 target_format.encode("utf-8"),
                 os.fsencode(output_path),
                 threads,
             )
+            if clear_air:
+                converted = _lib.ws_convert(*args)
+            elif _ws_convert_ex is None:
+                raise Error("native library does not support clear_air")
+            else:
+                converted = _ws_convert_ex(*args, 0)
             callback_errors: list[BaseException] = []
         else:
             if not callable(progress):
@@ -328,15 +363,23 @@ class Context:
             if _ws_convert_with_progress is None:
                 raise Error("native library does not provide progress callbacks")
             callback, callback_errors = self._progress_callback(progress)
-            converted = _ws_convert_with_progress(
+            args = (
                 handle,
                 os.fsencode(input_path),
                 target_format.encode("utf-8"),
                 os.fsencode(output_path),
                 threads,
-                callback,
-                None,
             )
+            if clear_air:
+                converted = _ws_convert_with_progress(
+                    *args, callback, None,
+                )
+            elif _ws_convert_with_progress_ex is None:
+                raise Error("native library does not support clear_air")
+            else:
+                converted = _ws_convert_with_progress_ex(
+                    *args, 0, callback, None,
+                )
         if callback_errors:
             raise callback_errors[0]
         if not converted:
