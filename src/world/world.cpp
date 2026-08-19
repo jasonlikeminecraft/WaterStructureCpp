@@ -2,6 +2,7 @@
 #include <WaterStructure/coordinates.hpp>
 
 #include "archive.hpp"
+#include "../core/bounded_thread_pool.hpp"
 
 #include <io/stream_reader.h>
 #include <io/stream_writer.h>
@@ -16,13 +17,25 @@
 
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <chrono>
 #include <cctype>
 #include <cstring>
 #include <cstdlib>
 #include <iostream>
+#include <iterator>
 #include <limits>
 #include <sstream>
+#include <thread>
+
+namespace water_structure::detail {
+
+void BoundedThreadPoolDeleter::operator()(BoundedThreadPool* pool) const noexcept
+{
+    delete pool;
+}
+
+} // namespace water_structure::detail
 
 namespace water_structure {
 
@@ -30,6 +43,29 @@ namespace {
 constexpr std::int32_t kMinSubChunkY = kOverworldMinY / 16;
 constexpr std::int32_t kMaxSubChunkY = 19;
 using Clock = std::chrono::steady_clock;
+
+std::size_t world_encode_worker_count(std::size_t chunk_count)
+{
+    if (chunk_count < 2) return 1;
+    // Encoding is CPU-heavy, while the following LevelDB commit is a single
+    // writer. Two workers are the conservative default: it overlaps BWO
+    // encoding without competing excessively for memory bandwidth. The
+    // setting is intentionally process-local so callers that already own a
+    // larger scheduler can tune it without changing the public ABI.
+    std::size_t configured = 2;
+    if (const auto* text = std::getenv("WATER_STRUCTURE_WORLD_ENCODE_THREADS");
+        text && *text) {
+        std::size_t parsed = 0;
+        const auto* end = text + std::char_traits<char>::length(text);
+        const auto [next, error] = std::from_chars(text, end, parsed);
+        if (error == std::errc{} && next == end && parsed != 0) configured = parsed;
+        else if (error == std::errc{} && next == end && parsed == 0) configured = 1;
+    }
+    // Avoid accidental thread explosions from an environment value while
+    // still allowing explicit tuning for high-core machines.
+    configured = std::min<std::size_t>(configured, 16);
+    return std::min(configured, chunk_count);
+}
 
 std::string error_for(const char* operation, const std::string& detail)
 {
@@ -194,6 +230,11 @@ BedrockWorldAdapter::~BedrockWorldAdapter()
 
 Result<void> BedrockWorldAdapter::close()
 {
+    // All save_chunks() calls join their encoding futures before returning,
+    // so releasing the reusable pool here is safe and avoids keeping worker
+    // threads alive during archive packing.
+    mEncodePool.reset();
+    mEncodePoolWorkers = 0;
     if (!mWorld) {
         return Result<void>::success();
     }
@@ -399,76 +440,137 @@ Result<std::vector<EncodedSubChunkData>> BedrockWorldAdapter::encode_chunks(
     if (!valid()) {
         return Result<std::vector<EncodedSubChunkData>>::failure("世界未打开");
     }
-
-    std::vector<EncodedSubChunkData> result;
-    std::size_t sub_chunk_count = 0;
+    const auto air_runtime_id = BedrockWorldOperator::airRuntimeId();
     for (const auto& write : chunks) {
         if (!write.chunk) {
             return Result<std::vector<EncodedSubChunkData>>::failure("chunk write is empty");
         }
-        sub_chunk_count += write.chunk->sub_chunks.size();
     }
-    result.reserve(sub_chunk_count);
-    const auto air_runtime_id = BedrockWorldOperator::airRuntimeId();
-    for (const auto& chunk_write : chunks) {
-        const auto pos = chunk_write.pos;
-        for (const auto& [sub_y, data] : chunk_write.chunk->sub_chunks) {
-            if (sub_y < kMinSubChunkY || sub_y > kMaxSubChunkY) {
-                return Result<std::vector<EncodedSubChunkData>>::failure(
-                    "subchunk Y 超出 Overworld 范围: " + std::to_string(sub_y)
-                );
-            }
-            auto sub_chunk = BedrockWorldOperator::SubChunk::createAirFilled();
-            BlockLayer native_layer0{};
-            const bool has_layer1 = std::any_of(
-                data.layer1.begin(), data.layer1.end(),
-                [air_runtime_id](const auto runtime_id) { return runtime_id != air_runtime_id; });
-            BlockLayer native_layer1{};
-            const auto* layer0 = &native_layer0;
-            const auto* layer1 = &native_layer1;
-            if (chunk_write.chunk->layout == BlockLayerLayout::Native) {
-                // Schem/BDX producers already emit Bedrock's native x/y/z
-                // order. Pass their arrays directly to BWO; setBlocks() owns
-                // its storage, so an intermediate 4096-entry copy is wasted.
-                layer0 = &data.layer0;
-                if (has_layer1) layer1 = &data.layer1;
-            } else {
-                for (int x = 0; x < 16; ++x) {
-                    for (int y = 0; y < 16; ++y) {
-                        for (int z = 0; z < 16; ++z) {
-                            const auto native_index = static_cast<std::size_t>(x * 256 + y * 16 + z);
-                            const auto internal_index = static_cast<std::size_t>((y * 16 + z) * 16 + x);
-                            native_layer0[native_index] = data.layer0[internal_index];
-                            if (has_layer1) native_layer1[native_index] = data.layer1[internal_index];
+    if (chunks.empty()) {
+        return Result<std::vector<EncodedSubChunkData>>::success({});
+    }
+
+    // BWO's database writer is deliberately kept out of this worker pool.
+    // Each task only creates independent subchunk payloads; the caller later
+    // submits the merged vector through one WriteBatch. This avoids competing
+    // DB::Write calls while overlapping the expensive palette encoding stage.
+    const auto encode_range = [chunks, air_runtime_id](std::size_t begin,
+                                                        std::size_t end)
+        -> Result<std::vector<EncodedSubChunkData>> {
+        std::size_t sub_chunk_count = 0;
+        for (std::size_t index = begin; index < end; ++index) {
+            sub_chunk_count += chunks[index].chunk->sub_chunks.size();
+        }
+        std::vector<EncodedSubChunkData> result;
+        result.reserve(sub_chunk_count);
+        try {
+            for (std::size_t index = begin; index < end; ++index) {
+                const auto& chunk_write = chunks[index];
+                const auto pos = chunk_write.pos;
+                for (const auto& [sub_y, data] : chunk_write.chunk->sub_chunks) {
+                    if (sub_y < kMinSubChunkY || sub_y > kMaxSubChunkY) {
+                        return Result<std::vector<EncodedSubChunkData>>::failure(
+                            "subchunk Y 超出 Overworld 范围: " + std::to_string(sub_y));
+                    }
+                    auto sub_chunk = BedrockWorldOperator::SubChunk::createAirFilled();
+                    BlockLayer native_layer0{};
+                    const bool has_layer1 = std::any_of(
+                        data.layer1.begin(), data.layer1.end(),
+                        [air_runtime_id](const auto runtime_id) {
+                            return runtime_id != air_runtime_id;
+                        });
+                    BlockLayer native_layer1{};
+                    const auto* layer0 = &native_layer0;
+                    const auto* layer1 = &native_layer1;
+                    if (chunk_write.chunk->layout == BlockLayerLayout::Native) {
+                        // Schem/BDX producers already emit Bedrock's native
+                        // x/y/z order. Pass their arrays directly to BWO;
+                        // setBlocks() owns its storage, so an intermediate
+                        // 4096-entry copy is wasted.
+                        layer0 = &data.layer0;
+                        if (has_layer1) layer1 = &data.layer1;
+                    } else {
+                        for (int x = 0; x < 16; ++x) {
+                            for (int y = 0; y < 16; ++y) {
+                                for (int z = 0; z < 16; ++z) {
+                                    const auto native_index = static_cast<std::size_t>(
+                                        x * 256 + y * 16 + z);
+                                    const auto internal_index = static_cast<std::size_t>(
+                                        (y * 16 + z) * 16 + x);
+                                    native_layer0[native_index] = data.layer0[internal_index];
+                                    if (has_layer1) {
+                                        native_layer1[native_index] = data.layer1[internal_index];
+                                    }
+                                }
+                            }
                         }
                     }
+                    if (!sub_chunk.setBlocks(
+                        std::span<const std::uint32_t>(layer0->data(), layer0->size()), 0)) {
+                        return Result<std::vector<EncodedSubChunkData>>::failure(
+                            "创建 subchunk layer 0 失败");
+                    }
+                    if (has_layer1 && !sub_chunk.setBlocks(
+                        std::span<const std::uint32_t>(layer1->data(), layer1->size()), 1)) {
+                        return Result<std::vector<EncodedSubChunkData>>::failure(
+                            "创建 subchunk layer 1 失败");
+                    }
+                    auto encoded = BedrockWorldOperator::encodeSubChunkPayload(
+                        sub_chunk,
+                        BedrockWorldOperator::Encoding::Disk,
+                        kOverworldMinY,
+                        319,
+                        sub_y - kMinSubChunkY);
+                    if (!encoded) {
+                        return Result<std::vector<EncodedSubChunkData>>::failure(
+                            "编码 subchunk 失败: " + encoded.error);
+                    }
+                    result.push_back({
+                        { pos.x, sub_y, pos.z },
+                        std::move(encoded.value)
+                    });
                 }
             }
-            if (!sub_chunk.setBlocks(
-                std::span<const std::uint32_t>(layer0->data(), layer0->size()), 0)) {
-                return Result<std::vector<EncodedSubChunkData>>::failure(
-                    "创建 subchunk layer 0 失败");
-            }
-            if (has_layer1 && !sub_chunk.setBlocks(
-                std::span<const std::uint32_t>(layer1->data(), layer1->size()), 1)) {
-                return Result<std::vector<EncodedSubChunkData>>::failure(
-                    "创建 subchunk layer 1 失败");
-            }
-            auto encoded = BedrockWorldOperator::encodeSubChunkPayload(
-                sub_chunk,
-                BedrockWorldOperator::Encoding::Disk,
-                kOverworldMinY,
-                319,
-                sub_y - kMinSubChunkY);
-            if (!encoded) {
-                return Result<std::vector<EncodedSubChunkData>>::failure(
-                    "编码 subchunk 失败: " + encoded.error);
-            }
-            result.push_back({
-                { pos.x, sub_y, pos.z },
-                std::move(encoded.value)
-            });
+        } catch (const std::exception& error) {
+            return Result<std::vector<EncodedSubChunkData>>::failure(
+                std::string("并行编码 subchunk 失败: ") + error.what());
         }
+        return Result<std::vector<EncodedSubChunkData>>::success(std::move(result));
+    };
+
+    const auto worker_count = world_encode_worker_count(chunks.size());
+    if (worker_count == 1) return encode_range(0, chunks.size());
+
+    // Keep the pool on the world adapter. Schem and other row-oriented
+    // writers call save_chunks() many times; constructing/joining threads for
+    // every stripe would erase the benefit of parallel encoding.
+    if (!mEncodePool || mEncodePoolWorkers != worker_count) {
+        mEncodePool.reset(new detail::BoundedThreadPool(worker_count, worker_count));
+        mEncodePoolWorkers = worker_count;
+    }
+    std::vector<std::future<Result<std::vector<EncodedSubChunkData>>>> pending;
+    pending.reserve(worker_count);
+    const auto base = chunks.size() / worker_count;
+    const auto remainder = chunks.size() % worker_count;
+    std::size_t begin = 0;
+    for (std::size_t worker = 0; worker < worker_count; ++worker) {
+        const auto count = base + (worker < remainder ? 1 : 0);
+        const auto end = begin + count;
+        pending.push_back(mEncodePool->submit([&encode_range, begin, end] {
+            return encode_range(begin, end);
+        }));
+        begin = end;
+    }
+
+    std::vector<EncodedSubChunkData> result;
+    for (auto& task : pending) {
+        auto encoded = task.get();
+        if (!encoded) return Result<std::vector<EncodedSubChunkData>>::failure(encoded.error());
+        auto values = std::move(encoded).value();
+        result.insert(
+            result.end(),
+            std::make_move_iterator(values.begin()),
+            std::make_move_iterator(values.end()));
     }
     return Result<std::vector<EncodedSubChunkData>>::success(std::move(result));
 }
@@ -631,9 +733,27 @@ Result<void> BedrockWorldAdapter::save_subchunk_payloads(
 
 Result<void> BedrockWorldAdapter::save_chunks(std::span<const ChunkWrite> chunks)
 {
+    const bool detail_profile =
+        std::getenv("WATER_STRUCTURE_PROFILE_DETAIL") != nullptr;
+    const auto encode_start = detail_profile ? Clock::now() : Clock::time_point{};
     auto encoded = encode_chunks(chunks);
     if (!encoded) return Result<void>::failure(encoded.error());
-    return save_subchunk_payloads(std::move(encoded).value());
+    auto payloads = std::move(encoded).value();
+    const auto encode_ms = detail_profile
+        ? std::chrono::duration<double, std::milli>(Clock::now() - encode_start).count()
+        : 0.0;
+    const auto payload_count = payloads.size();
+    const auto save_start = detail_profile ? Clock::now() : Clock::time_point{};
+    auto saved = save_subchunk_payloads(std::move(payloads));
+    if (detail_profile) {
+        const auto leveldb_ms = std::chrono::duration<double, std::milli>(
+            Clock::now() - save_start).count();
+        std::cerr << "world_save_chunks_profile chunks=" << chunks.size()
+                  << " subchunks=" << payload_count
+                  << " encode_ms=" << encode_ms
+                  << " leveldb_ms=" << leveldb_ms << '\n';
+    }
+    return saved;
 }
 
 Result<void> BedrockWorldAdapter::save_chunk_nbt(ChunkPos pos, std::span<const BlockEntity> entities)

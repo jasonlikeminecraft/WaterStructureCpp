@@ -126,6 +126,18 @@ if _ws_convert_ex is not None:
         ctypes.c_int,
     ]
     _ws_convert_ex.restype = ctypes.c_int
+_ws_convert_ex2 = getattr(_lib, "ws_convert_ex2", None)
+if _ws_convert_ex2 is not None:
+    _ws_convert_ex2.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_char_p,
+        ctypes.c_char_p,
+        ctypes.c_char_p,
+        ctypes.c_uint64,
+        ctypes.c_int,
+        ctypes.c_int,
+    ]
+    _ws_convert_ex2.restype = ctypes.c_int
 _ProgressCallback = ctypes.CFUNCTYPE(
     None, ctypes.c_void_p, ctypes.c_uint8, ctypes.c_uint64, ctypes.c_uint64
 )
@@ -154,6 +166,22 @@ if _ws_convert_with_progress_ex is not None:
         ctypes.c_void_p,
     ]
     _ws_convert_with_progress_ex.restype = ctypes.c_int
+_ws_convert_with_progress_ex2 = getattr(
+    _lib, "ws_convert_with_progress_ex2", None
+)
+if _ws_convert_with_progress_ex2 is not None:
+    _ws_convert_with_progress_ex2.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_char_p,
+        ctypes.c_char_p,
+        ctypes.c_char_p,
+        ctypes.c_uint64,
+        ctypes.c_int,
+        ctypes.c_int,
+        _ProgressCallback,
+        ctypes.c_void_p,
+    ]
+    _ws_convert_with_progress_ex2.restype = ctypes.c_int
 _lib.ws_to_world.argtypes = [
     ctypes.c_void_p,
     ctypes.c_char_p,
@@ -321,6 +349,7 @@ class Context:
         *,
         threads: int = 0,
         clear_air: bool = True,
+        chunk_partition: bool = False,
         progress: Optional[Callable[[Progress], object]] = None,
     ) -> None:
         """Convert a structure to a supported writer format.
@@ -338,6 +367,9 @@ class Context:
         ``clear_air`` controls MCFunction's destination reset. The default
         clears the complete structure bounds; set it to ``False`` to emit
         only non-air placement commands and preserve existing blocks.
+
+        ``chunk_partition`` keeps MCFunction's 3D optimizer inside individual
+        16x16 chunks. It is disabled by default for backward-compatible output.
         """
         if threads < 0:
             raise ValueError("threads must be >= 0")
@@ -350,7 +382,13 @@ class Context:
                 os.fsencode(output_path),
                 threads,
             )
-            if clear_air:
+            if chunk_partition:
+                if _ws_convert_ex2 is None:
+                    raise Error("native library does not support chunk_partition")
+                converted = _ws_convert_ex2(
+                    *args, int(clear_air), 1,
+                )
+            elif clear_air:
                 converted = _lib.ws_convert(*args)
             elif _ws_convert_ex is None:
                 raise Error("native library does not support clear_air")
@@ -370,7 +408,13 @@ class Context:
                 os.fsencode(output_path),
                 threads,
             )
-            if clear_air:
+            if chunk_partition:
+                if _ws_convert_with_progress_ex2 is None:
+                    raise Error("native library does not support chunk_partition")
+                converted = _ws_convert_with_progress_ex2(
+                    *args, int(clear_air), 1, callback, None,
+                )
+            elif clear_air:
                 converted = _ws_convert_with_progress(
                     *args, callback, None,
                 )

@@ -351,6 +351,35 @@ std::filesystem::path write_schem_v1_ordered_sample()
     return path;
 }
 
+std::filesystem::path write_schem_v1_multibyte_varint_sample()
+{
+    const auto path = std::filesystem::temp_directory_path() /
+        "water_structure_cpp_schem_multibyte_varint.schem";
+    std::ofstream file(path, std::ios::binary | std::ios::trunc);
+    if (!file) throw std::runtime_error("create multi-byte varint SchemV1 sample");
+    zlib::ozlibstream compressed(file, Z_DEFAULT_COMPRESSION, true);
+    nbt::io::stream_writer writer(compressed, endian::big);
+    writer.write_type(nbt::tag_type::Compound);
+    writer.write_string("Schematic");
+    writer.write_tag("Width", nbt::tag_short(2));
+    writer.write_tag("Height", nbt::tag_short(1));
+    writer.write_tag("Length", nbt::tag_short(1));
+    nbt::tag_compound palette;
+    palette["minecraft:air"] = std::int32_t{ 0 };
+    palette["minecraft:stone"] = std::int32_t{ 128 };
+    writer.write_tag("Palette", palette);
+    writer.write_tag("BlockData", nbt::tag_byte_array(
+        std::vector<std::int8_t>{
+            static_cast<std::int8_t>(0x80),
+            static_cast<std::int8_t>(0x01),
+            static_cast<std::int8_t>(0x00)
+        }));
+    writer.write_type(nbt::tag_type::End);
+    compressed.close();
+    file.close();
+    return path;
+}
+
 std::filesystem::path write_ibimport_fill_sample()
 {
     const auto path = std::filesystem::temp_directory_path() /
@@ -1592,11 +1621,15 @@ int main()
             "water_structure_cpp_writer_single_thread.mcfunction";
         const auto mcfunction_no_clear_path = std::filesystem::temp_directory_path() /
             "water_structure_cpp_writer_no_clear.mcfunction";
+        const auto mcfunction_chunk_path = std::filesystem::temp_directory_path() /
+            "water_structure_cpp_writer_chunk_partition.mcfunction";
         {
             std::ofstream source(mcfunction_source_path, std::ios::binary | std::ios::trunc);
             source << "setblock 0 0 0 minecraft:oak_log[axis=x]\n"
                    << "setblock 1 0 0 minecraft:green_candle[candles=3,lit=false]\n"
                    << "setblock 2 0 0 minecraft:water[level=0]\n"
+                   << "setblock 15 0 0 minecraft:oak_log[axis=x]\n"
+                   << "setblock 16 0 0 minecraft:oak_log[axis=x]\n"
                    << "setblock 32 32 32 minecraft:air\n";
         }
         const auto mcfunction_source = water_structure::FormatRegistry::open(
@@ -1644,12 +1677,31 @@ int main()
             mcfunction_no_clear_path, registry, mcfunction_no_clear_options);
         check(mcfunction_no_clear_written.ok(),
             "MCFunction writer supports disabling destination clearing");
+        water_structure::ConversionOptions mcfunction_chunk_options{
+            .clear_air = false,
+            .mcfunction_chunk_partition = true
+        };
+        const auto mcfunction_chunk_written = water_structure::FormatRegistry::write(
+            *mcfunction_source.value(), water_structure::StructureId::MCFunction,
+            mcfunction_chunk_path, registry, mcfunction_chunk_options);
+        check(mcfunction_chunk_written.ok(),
+            "MCFunction writer supports chunk-partitioned optimization");
         {
             std::ifstream no_clear(mcfunction_no_clear_path, std::ios::binary);
             const std::string no_clear_bytes{
                 std::istreambuf_iterator<char>(no_clear), std::istreambuf_iterator<char>() };
             check(no_clear_bytes.find("minecraft:air") == std::string::npos,
                 "MCFunction no-clear mode emits no air commands");
+        }
+        {
+            std::ifstream chunk_output(mcfunction_chunk_path, std::ios::binary);
+            const std::string chunk_bytes{
+                std::istreambuf_iterator<char>(chunk_output),
+                std::istreambuf_iterator<char>() };
+            check(chunk_bytes.find("fill ~15 ~0 ~0 ~16 ~0 ~0") == std::string::npos &&
+                chunk_bytes.find("setblock ~15 ~0 ~0") != std::string::npos &&
+                chunk_bytes.find("setblock ~16 ~0 ~0") != std::string::npos,
+                "MCFunction chunk optimization keeps commands within chunk boundaries");
         }
         {
             std::ifstream parallel(mcfunction_writer_path, std::ios::binary);
@@ -1668,14 +1720,14 @@ int main()
         check(mcfunction_size.width == 33 && mcfunction_size.height == 33 &&
             mcfunction_size.length == 33,
             "MCFunction writer preserves trailing-air dimensions");
-        check(mcfunction_round_trip.value()->count_non_air_blocks().value() == 3,
+        check(mcfunction_round_trip.value()->count_non_air_blocks().value() == 5,
             "MCFunction writer round-trip non-air count");
         const auto mcfunction_source_chunks = mcfunction_source.value()->get_chunks(
             std::array<water_structure::ChunkPos, 1>{ water_structure::ChunkPos{ 0, 0 } });
         const auto mcfunction_round_trip_chunks = mcfunction_round_trip.value()->get_chunks(
             std::array<water_structure::ChunkPos, 1>{ water_structure::ChunkPos{ 0, 0 } });
         check(mcfunction_source_chunks.ok() && mcfunction_round_trip_chunks.ok() &&
-            mcfunction_round_trip.value()->count_non_air_blocks().value() == 3,
+            mcfunction_round_trip.value()->count_non_air_blocks().value() == 5,
             "MCFunction writer round-trip Bedrock state properties");
         {
             std::ifstream written(mcfunction_writer_path, std::ios::binary);
@@ -1806,6 +1858,7 @@ int main()
         std::filesystem::remove(ibimport_single_thread_path);
         std::filesystem::remove(mcfunction_single_thread_path);
         std::filesystem::remove(mcfunction_writer_path);
+        std::filesystem::remove(mcfunction_chunk_path);
         std::filesystem::remove(mcfunction_source_path);
         std::filesystem::remove(schematic_writer_path);
         std::filesystem::remove(litematic_writer_path);
@@ -1839,6 +1892,26 @@ int main()
                 schem_direct_world.saved_chunk.sub_chunks.at(-4).layer0[256] ==
                     registry.air_runtime_id(),
             "Schem direct stream preserves palette indices and native coordinates");
+        const auto schem_multibyte_direct_path = write_schem_v1_multibyte_varint_sample();
+        const auto schem_multibyte_direct = water_structure::FormatRegistry::open_as(
+            schem_multibyte_direct_path, water_structure::StructureId::SchemV1, registry,
+            {
+                .streaming_world_import = true,
+                .direct_schem_world_stream = true
+            });
+        check(schem_multibyte_direct.ok(), "Schem direct multi-byte varint stream opens");
+        TestWorld schem_multibyte_direct_world;
+        const auto schem_multibyte_direct_written =
+            schem_multibyte_direct.value()->write_to_world(
+                schem_multibyte_direct_world, { 0, -4, 0 }, {});
+        check(schem_multibyte_direct_written.ok(),
+            "Schem direct multi-byte varint stream writes to world");
+        check(schem_multibyte_direct_world.saved_chunk.sub_chunks.at(-4).layer0[0] ==
+                registry.compatible_java_runtime_id("minecraft:stone").value() &&
+            schem_multibyte_direct_world.saved_chunk.sub_chunks.at(-4).layer0[256] ==
+                registry.air_runtime_id(),
+            "Schem bulk varint decoder preserves scalar multi-byte fallback");
+        std::filesystem::remove(schem_multibyte_direct_path);
         std::filesystem::remove(schem_direct_path);
         std::filesystem::remove(schem_v2_path);
 
@@ -2535,6 +2608,55 @@ int main()
                 const auto closed = world.value().close();
                 check(closed.ok(), "palette test world closes");
             }
+
+            // The generic world writer uses two bounded encoding workers for
+            // multi-chunk batches, but keeps one LevelDB WriteBatch commit.
+            // Exercise the parallel path with distinct chunks and verify both
+            // payloads can be read back without changing their coordinates.
+            const auto parallel_world_dir = std::filesystem::temp_directory_path() /
+                "water_structure_cpp_parallel_world";
+            std::filesystem::remove_all(parallel_world_dir, cleanup_error);
+            {
+                auto world = water_structure::BedrockWorldAdapter::open(parallel_world_dir, true);
+                check(world.ok(), "parallel world opens");
+                water_structure::ChunkData first;
+                water_structure::ChunkData second;
+                water_structure::SubChunkData first_sub;
+                water_structure::SubChunkData second_sub;
+                first_sub.layer0.fill(registry.air_runtime_id());
+                second_sub.layer0.fill(registry.air_runtime_id());
+                first_sub.layer0[0] = stone_runtime;
+                second_sub.layer0[4095] = water_runtime;
+                first.sub_chunks.emplace(-4, std::move(first_sub));
+                second.sub_chunks.emplace(-4, std::move(second_sub));
+                const std::array writes{
+                    water_structure::ChunkWrite{ { 0, 0 }, &first },
+                    water_structure::ChunkWrite{ { 1, 0 }, &second }
+                };
+                const auto saved = world.value().save_chunks(writes);
+                check(saved.ok(), "parallel world batch saves");
+                const auto closed = world.value().close();
+                check(closed.ok(), "parallel world closes");
+            }
+            {
+                auto world = water_structure::BedrockWorldAdapter::open(parallel_world_dir, false);
+                check(world.ok(), "parallel world reopens");
+                if (world) {
+                    const auto first = world.value().load_chunk({ 0, 0 });
+                    const auto second = world.value().load_chunk({ 1, 0 });
+                    check(first.ok() && second.ok(), "parallel world reads both chunks");
+                    if (first && second) {
+                        check(first.value().sub_chunks.at(-4).layer0[0] == stone_runtime,
+                            "parallel world preserves first chunk");
+                        check(second.value().sub_chunks.at(-4).layer0[4095] == water_runtime,
+                            "parallel world preserves second chunk");
+                    }
+                    const auto closed = world.value().close();
+                    check(closed.ok(), "parallel world read closes");
+                }
+            }
+            std::filesystem::remove_all(parallel_world_dir, cleanup_error);
+
             water_structure::McWorldStructure world_structure(registry);
             const auto world_read = world_structure.read(palette_world_dir);
             check(world_read.ok(), "palette test world reads");

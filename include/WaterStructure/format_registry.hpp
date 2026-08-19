@@ -38,6 +38,11 @@ struct ConversionOptions {
     // default. Set false to emit only non-air placement commands and preserve
     // existing blocks outside the emitted structure.
     bool clear_air = true;
+    // MCFunction's 3D optimizer normally merges runs across the requested
+    // batch of adjacent chunks. When enabled, each 16x16 chunk is optimized
+    // independently, so emitted block/fill commands never cross a chunk
+    // boundary. Disabled by default to preserve the historical output shape.
+    bool mcfunction_chunk_partition = false;
 };
 
 struct OpenOptions {

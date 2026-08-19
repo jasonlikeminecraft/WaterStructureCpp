@@ -3,13 +3,17 @@
 #include <WaterStructure/coordinates.hpp>
 #include <WaterStructure/world.hpp>
 
+#include "../core/bounded_thread_pool.hpp"
+
 #include <io/izlibstream.h>
 #include <io/stream_reader.h>
 #include <tag_compound.h>
 #include <tag_primitive.h>
 
 #include <algorithm>
+#include <charconv>
 #include <chrono>
+#include <cstring>
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
@@ -26,6 +30,21 @@ namespace {
 using NbtReader = nbt::io::stream_reader;
 constexpr std::size_t kIndexStride = 256;
 constexpr std::uint16_t kMissingChunkOffset = std::numeric_limits<std::uint16_t>::max();
+
+std::size_t schem_materialize_worker_count(std::size_t chunk_count)
+{
+    if (chunk_count < 2) return 1;
+    std::size_t configured = 2;
+    if (const auto* text = std::getenv("WATER_STRUCTURE_SCHEM_MATERIALIZE_THREADS");
+        text && *text) {
+        std::size_t parsed = 0;
+        const auto* end = text + std::char_traits<char>::length(text);
+        const auto [next, error] = std::from_chars(text, end, parsed);
+        if (error == std::errc{} && next == end) configured = parsed;
+    }
+    if (configured == 0) return 1;
+    return std::min<std::size_t>(std::min(configured, chunk_count), 8);
+}
 
 class EncodedReader {
 public:
@@ -101,6 +120,47 @@ public:
             if (shift >= 35) return false;
         }
     }
+    bool read_varints_u16(
+        std::span<std::uint16_t> output,
+        std::uint16_t max_value)
+    {
+        constexpr std::uint64_t kContinuationBits = 0x8080808080808080ull;
+        std::size_t output_position = 0;
+        while (output_position < output.size()) {
+            if (mPosition == mSize) {
+                mInput.read(mBuffer.data(), static_cast<std::streamsize>(mBuffer.size()));
+                mSize = static_cast<std::size_t>(mInput.gcount());
+                mPosition = 0;
+                if (mSize == 0) return false;
+            }
+            const auto available = std::min(
+                mSize - mPosition,
+                output.size() - output_position);
+            std::size_t bulk_count = 0;
+            const auto* bytes = reinterpret_cast<const std::uint8_t*>(
+                mBuffer.data() + mPosition);
+            while (bulk_count + sizeof(std::uint64_t) <= available) {
+                std::uint64_t packed = 0;
+                std::memcpy(&packed, bytes + bulk_count, sizeof(packed));
+                if ((packed & kContinuationBits) != 0) break;
+                for (std::size_t index = 0; index < sizeof(packed); ++index) {
+                    const auto value = bytes[bulk_count + index];
+                    if (value > max_value) return false;
+                    output[output_position + bulk_count + index] = value;
+                }
+                bulk_count += sizeof(packed);
+            }
+            if (bulk_count != 0) {
+                mPosition += bulk_count;
+                output_position += bulk_count;
+                continue;
+            }
+            std::uint32_t value = 0;
+            if (!read_varint_u32(value) || value > max_value) return false;
+            output[output_position++] = static_cast<std::uint16_t>(value);
+        }
+        return true;
+    }
     bool read_exact(std::span<std::uint8_t> output)
     {
         mPosition = mSize = 0;
@@ -170,6 +230,50 @@ public:
             shift += 7;
             if (shift >= 35) return false;
         }
+    }
+
+    bool read_varints_u16(
+        std::span<std::uint16_t> output,
+        std::uint16_t max_value)
+    {
+        // Schem palettes overwhelmingly use indices below 128. Decode eight
+        // such one-byte varints per loop and only fall back to the fully
+        // checked scalar decoder when a continuation bit is present. memcpy
+        // keeps the 64-bit probe aligned and valid on every supported target.
+        constexpr std::uint64_t kContinuationBits = 0x8080808080808080ull;
+        std::size_t output_position = 0;
+        while (output_position < output.size()) {
+            if (mPosition == mSize && !refill()) return false;
+
+            const auto available = std::min(
+                mSize - mPosition,
+                output.size() - output_position);
+            std::size_t bulk_count = 0;
+            const auto* bytes = reinterpret_cast<const std::uint8_t*>(
+                mBuffer.data() + mPosition);
+            while (bulk_count + sizeof(std::uint64_t) <= available) {
+                std::uint64_t packed = 0;
+                std::memcpy(&packed, bytes + bulk_count, sizeof(packed));
+                if ((packed & kContinuationBits) != 0) break;
+
+                for (std::size_t index = 0; index < sizeof(packed); ++index) {
+                    const auto value = bytes[bulk_count + index];
+                    if (value > max_value) return false;
+                    output[output_position + bulk_count + index] = value;
+                }
+                bulk_count += sizeof(packed);
+            }
+            if (bulk_count != 0) {
+                mPosition += bulk_count;
+                output_position += bulk_count;
+                continue;
+            }
+
+            std::uint32_t value = 0;
+            if (!read_varint_u32(value) || value > max_value) return false;
+            output[output_position++] = static_cast<std::uint16_t>(value);
+        }
+        return true;
     }
 
     std::uint64_t remaining() const noexcept
@@ -336,7 +440,10 @@ Result<void> consume_deferred_block_data(
     std::ifstream input(path, std::ios::binary);
     if (!input) return Result<void>::failure("无法重新打开 Schem 文件: " + path.string());
     try {
-        zlib::izlibstream decompressed(input);
+        // BlockData is a multi-gigabyte logical stream. A 1 MiB bounded zlib
+        // buffer avoids excessive 32 KiB underflow/refill calls without
+        // materializing the compressed payload.
+        zlib::izlibstream decompressed(input, 1u << 20);
         NbtReader reader(decompressed, endian::big);
         if (reader.read_type() != nbt::tag_type::Compound) {
             return Result<void>::failure("Schem 根标签不是 Compound");
@@ -449,7 +556,7 @@ Result<void> SchemStructure::read(const std::filesystem::path& path)
     std::ifstream input(path, std::ios::binary);
     if (!input) return Result<void>::failure("无法打开 Schem 文件: " + path.string());
     try {
-        zlib::izlibstream decompressed(input);
+        zlib::izlibstream decompressed(input, 1u << 20);
         NbtReader reader(decompressed, endian::big);
         if (reader.read_type() != nbt::tag_type::Compound) {
             return Result<void>::failure("Schem 根标签不是 Compound");
@@ -514,8 +621,20 @@ Result<void> SchemStructure::read(const std::filesystem::path& path)
                 const bool metadata_ready = has_palette &&
                     mOriginalSize.width > 0 && mOriginalSize.height > 0 &&
                     mOriginalSize.length > 0;
+                const bool detail_profile =
+                    std::getenv("WATER_STRUCTURE_PROFILE_DETAIL") != nullptr;
+                const auto skip_start = detail_profile
+                    ? std::chrono::steady_clock::now()
+                    : std::chrono::steady_clock::time_point{};
                 if (!metadata_ready) {
                     skip_bytes(decompressed, static_cast<std::uint32_t>(length));
+                }
+                if (detail_profile) {
+                    const auto skip_ms = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - skip_start).count();
+                    std::cerr << "schem_read_blockdata_profile bytes=" << length
+                              << " metadata_ready=" << (metadata_ready ? 1 : 0)
+                              << " skip_ms=" << skip_ms << '\n';
                 }
                 return Result<void>::success();
             }
@@ -1249,6 +1368,7 @@ Result<void> SchemStructure::write_to_world(WorldTarget& world, SubChunkPos star
     const bool profile = std::getenv("WATER_STRUCTURE_PROFILE") != nullptr;
     const bool verify = std::getenv("WATER_STRUCTURE_VERIFY") != nullptr;
     double decode_ms = 0.0;
+    double non_air_scan_ms = 0.0;
     double materialize_ms = 0.0;
     double save_ms = 0.0;
     std::uint64_t verification_checksum = 0;
@@ -1268,25 +1388,55 @@ Result<void> SchemStructure::write_to_world(WorldTarget& world, SubChunkPos star
     const auto plane_size = width * length;
     std::vector<std::uint16_t> slab(plane_size * 16);
     std::vector<std::uint8_t> slab_non_air(chunk_x_count * chunk_z_count);
+    const auto materialize_worker_count =
+        schem_materialize_worker_count(chunk_x_count);
+    detail::BoundedThreadPool materialize_pool(
+        materialize_worker_count,
+        materialize_worker_count * 2);
     for (std::size_t slab_y = 0; slab_y < height; slab_y += 16) {
         const auto layer_count = std::min<std::size_t>(16, height - slab_y);
         const auto decode_start = std::chrono::steady_clock::now();
         std::fill(slab_non_air.begin(), slab_non_air.end(), 0);
-        std::size_t slab_index = 0;
-        for (std::size_t local_y = 0; local_y < layer_count; ++local_y) {
-            for (std::size_t source_z = 0; source_z < length; ++source_z) {
-                for (std::size_t source_x = 0; source_x < width; ++source_x, ++slab_index) {
-                    std::uint32_t palette_index = 0;
-                    if (!read_encoded_index_fast(encoded, palette_index, mMaxPaletteIndex)) {
-                        return Result<void>::failure("Schem BlockData varint 读取失败或 palette 索引越界");
-                    }
-                    slab[slab_index] = static_cast<std::uint16_t>(palette_index);
-                    if (palette_non_air[palette_index]) {
-                        slab_non_air[(source_z / 16) * chunk_x_count + source_x / 16] = 1;
+        const auto slab_value_count = plane_size * layer_count;
+        if (!encoded.read_varints_u16(
+            std::span<std::uint16_t>(slab.data(), slab_value_count),
+            static_cast<std::uint16_t>(mMaxPaletteIndex))) {
+            return Result<void>::failure(
+                "Schem BlockData varint 读取失败或 palette 索引越界");
+        }
+        const auto non_air_scan_start = std::chrono::steady_clock::now();
+        // Check one chunk column at a time and stop as soon as a non-air
+        // value is found. Large builds are usually dense, so this avoids
+        // rescanning the remaining layers after the first populated block;
+        // sparse/air-only chunks retain the same exact result.
+        for (std::size_t chunk_z = 0; chunk_z < chunk_z_count; ++chunk_z) {
+            const auto source_z_begin = chunk_z * 16;
+            const auto source_z_end = std::min(length, source_z_begin + 16);
+            for (std::size_t chunk_x = 0; chunk_x < chunk_x_count; ++chunk_x) {
+                auto& populated = slab_non_air[chunk_z * chunk_x_count + chunk_x];
+                if (populated) continue;
+                const auto source_x_begin = chunk_x * 16;
+                const auto source_x_end = std::min(width, source_x_begin + 16);
+                bool found_non_air = false;
+                for (std::size_t local_y = 0;
+                     local_y < layer_count && !found_non_air; ++local_y) {
+                    for (std::size_t source_z = source_z_begin;
+                         source_z < source_z_end && !found_non_air; ++source_z) {
+                        const auto row_offset =
+                            (local_y * length + source_z) * width;
+                        for (std::size_t source_x = source_x_begin;
+                             source_x < source_x_end; ++source_x) {
+                            if (palette_non_air[slab[row_offset + source_x]]) {
+                                found_non_air = true;
+                                break;
+                            }
+                        }
                     }
                 }
+                populated = static_cast<std::uint8_t>(found_non_air);
             }
         }
+        non_air_scan_ms += elapsed_ms(non_air_scan_start);
         decode_ms += elapsed_ms(decode_start);
 
         const auto target_sub_y = start.y + static_cast<std::int32_t>(slab_y / 16);
@@ -1300,39 +1450,67 @@ Result<void> SchemStructure::write_to_world(WorldTarget& world, SubChunkPos star
             const auto source_z_count = source_z_end - source_z_begin;
             const auto materialize_start = std::chrono::steady_clock::now();
             std::vector<ChunkData> chunks(chunk_x_count);
+            std::vector<std::uint64_t> materialized_checksums(chunk_x_count, 0);
+            std::vector<std::future<Result<void>>> materialize_tasks;
+            materialize_tasks.reserve(chunk_x_count);
+            for (std::size_t chunk_x = 0; chunk_x < chunk_x_count; ++chunk_x) {
+                if (!slab_non_air[chunk_z * chunk_x_count + chunk_x]) continue;
+                materialize_tasks.push_back(materialize_pool.submit(
+                    [&, chunk_x]() -> Result<void> {
+                        const auto source_x_begin = chunk_x * 16;
+                        const auto source_x_end = std::min(width, source_x_begin + 16);
+                        SubChunkData sub_chunk;
+                        sub_chunk.layer0.fill(air_runtime_id);
+                        sub_chunk.layer1.fill(air_runtime_id);
+                        for (std::size_t local_y = 0; local_y < layer_count; ++local_y) {
+                            for (std::size_t local_z = 0; local_z < source_z_count; ++local_z) {
+                                const auto source_z = source_z_begin + local_z;
+                                const auto row_offset = (local_y * length + source_z) * width;
+                                for (std::size_t source_x = source_x_begin;
+                                     source_x < source_x_end; ++source_x) {
+                                    const auto palette_index = slab[row_offset + source_x];
+                                    if (!palette_non_air[palette_index]) continue;
+                                    const auto runtime_id = runtime_palette[palette_index];
+                                    const auto local_x = source_x - source_x_begin;
+                                    // BedrockWorldAdapter can consume the native
+                                    // x/y/z layout directly. Producing it here
+                                    // avoids a second 4096-entry transpose for
+                                    // every populated subchunk during encoding.
+                                    sub_chunk.layer0[
+                                        local_x * 256 + local_y * 16 + local_z] = runtime_id;
+                                }
+                            }
+                        }
+                        if (verify) {
+                            auto checksum = static_cast<std::uint64_t>(
+                                static_cast<std::int32_t>(slab_y / 16) + kOverworldMinY / 16);
+                            for (const auto runtime_id : sub_chunk.layer0) checksum += runtime_id;
+                            for (const auto runtime_id : sub_chunk.layer1) checksum += runtime_id;
+                            materialized_checksums[chunk_x] = checksum;
+                        }
+                        chunks[chunk_x].layout = BlockLayerLayout::Native;
+                        chunks[chunk_x].sub_chunks.emplace(target_sub_y, std::move(sub_chunk));
+                        return Result<void>::success();
+                    }));
+            }
+            for (auto& task : materialize_tasks) {
+                try {
+                    auto materialized = task.get();
+                    if (!materialized) return materialized;
+                } catch (const std::exception& error) {
+                    return Result<void>::failure(
+                        std::string("Schem chunk 实体化失败: ") + error.what());
+                }
+            }
+            if (verify) {
+                for (const auto checksum : materialized_checksums) {
+                    verification_checksum += checksum;
+                }
+            }
             std::vector<ChunkWrite> writes;
             writes.reserve(chunk_x_count);
             for (std::size_t chunk_x = 0; chunk_x < chunk_x_count; ++chunk_x) {
-                if (!slab_non_air[chunk_z * chunk_x_count + chunk_x]) continue;
-                const auto source_x_begin = chunk_x * 16;
-                const auto source_x_end = std::min(width, source_x_begin + 16);
-                SubChunkData sub_chunk;
-                sub_chunk.layer0.fill(air_runtime_id);
-                sub_chunk.layer1.fill(air_runtime_id);
-                for (std::size_t local_y = 0; local_y < layer_count; ++local_y) {
-                    for (std::size_t local_z = 0; local_z < source_z_count; ++local_z) {
-                        const auto source_z = source_z_begin + local_z;
-                        const auto row_offset = (local_y * length + source_z) * width;
-                        for (std::size_t source_x = source_x_begin; source_x < source_x_end; ++source_x) {
-                            const auto runtime_id = runtime_palette[slab[row_offset + source_x]];
-                            if (runtime_id == air_runtime_id) continue;
-                            const auto local_x = source_x - source_x_begin;
-                            // BedrockWorldAdapter can consume the native
-                            // x/y/z layout directly.  Producing it here
-                            // avoids a second 4096-entry transpose for every
-                            // populated subchunk during world encoding.
-                            sub_chunk.layer0[local_x * 256 + local_y * 16 + local_z] = runtime_id;
-                        }
-                    }
-                }
-                if (verify) {
-                    verification_checksum += static_cast<std::uint32_t>(
-                        static_cast<std::int32_t>(slab_y / 16) + kOverworldMinY / 16);
-                    for (const auto runtime_id : sub_chunk.layer0) verification_checksum += runtime_id;
-                    for (const auto runtime_id : sub_chunk.layer1) verification_checksum += runtime_id;
-                }
-                chunks[chunk_x].layout = BlockLayerLayout::Native;
-                chunks[chunk_x].sub_chunks.emplace(target_sub_y, std::move(sub_chunk));
+                if (chunks[chunk_x].sub_chunks.empty()) continue;
                 writes.push_back({
                     {
                         static_cast<std::int32_t>(chunk_x) + start.x,
@@ -1364,6 +1542,7 @@ Result<void> SchemStructure::write_to_world(WorldTarget& world, SubChunkPos star
         std::cerr << "schem_world_profile source="
                   << (mBlockDataDeferred ? "gzip_direct" : "temp_file")
                   << " decode_ms=" << decode_ms
+                  << " non_air_scan_ms=" << non_air_scan_ms
                   << " materialize_ms=" << materialize_ms
                   << " save_ms=" << save_ms
                   << '\n';

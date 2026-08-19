@@ -546,3 +546,91 @@ Flight checksum.
 Record the command, commit, CPU/memory, build flags, three repetitions, median,
 maximum, peak memory, output hash, and correctness checks for every completed
 method.
+
+## OPT-016: Generic bounded world encoding
+
+**Status:** implemented and verified by Release builds and core tests.
+
+`BedrockWorldAdapter::save_chunks()` now separates BWO subchunk encoding from
+the LevelDB commit. A reusable bounded pool (two workers by default) prepares
+independent subchunk payloads, then the calling thread submits the merged
+payload vector in one `saveSubChunkPayloadsBatch()` call. LevelDB's internal
+writer queue remains single-writer; application threads therefore do not
+contend on `DB::Write()`.
+
+The worker count can be tuned for a particular CPU with
+`WATER_STRUCTURE_WORLD_ENCODE_THREADS=1..16`; `1` disables the pool. The queue
+is bounded by the worker count and all source `ChunkData` objects remain owned by
+the caller, so this optimization does not materialize additional structure
+volume or change output ordering. The default is intentionally conservative
+because measurements on large worlds show memory-bandwidth saturation beyond
+two encoding workers.
+
+The BWO LevelDB configuration is also tuned for sustained world imports:
+`write_buffer_size=16 MiB` and `max_file_size=8 MiB`. LevelDB may retain two
+write buffers, so the maximum extra write-buffer budget versus its 4 MiB
+default is 24 MiB. This reduces writer stalls caused by repeated 4 MiB table
+flushes while preserving the same keys and payload bytes.
+
+On `Flight to the citadel .schem` (26,896 chunks / 181,476 subchunks), one
+profiled Release run measured the aggregate `save_chunks()` internals as:
+
+| configuration | BWO encode | LevelDB commit | measured save total |
+| --- | ---: | ---: | ---: |
+| old 4 MiB buffer, 2 encode workers | 2.314 s | 5.826 s | 8.140 s |
+| 16 MiB buffer, 2 encode workers | 2.273 s | 1.072 s | 3.346 s |
+
+`world_compare` then checked all 1,480,866,624 block slots: missing, extra, and
+changed counts were all zero. End-to-end Schem timings still vary with gzip and
+filesystem cache state, so the table intentionally reports the directly
+instrumented save stages rather than treating one wall-clock run as a stable
+benchmark.
+
+### Follow-up: Schem decode path
+
+The direct Schem world path now decodes eight contiguous single-byte varints at
+a time. Multi-byte values, malformed values, and values crossing a buffer edge
+still use the checked scalar decoder. On the same Flight fixture this reduced
+the measured decode stage from about 8.94 s to 5.16--5.59 s; a complete world
+comparison remained byte-content equivalent.
+
+The non-air prepass now walks one 16x16 chunk column at a time and stops after
+the first populated value. This reduced the measured prepass from about 1.32 s
+to 1.17 s on the dense fixture without changing sparse/air-only behavior.
+
+Finally, Schem's bounded zlib input/output buffers are 1 MiB instead of the
+library's 32 KiB default. This keeps memory fixed (roughly 2 MiB per active
+inflater) while reducing refill overhead. A subsequent run measured:
+
+```text
+read BlockData skip: 2.66 s
+decode + scan:       4.57 s (scan 0.99 s)
+materialize:         1.71 s
+save:                3.35 s
+```
+
+The 1 MiB run was compared over all 1,480,866,624 block slots with zero
+missing, extra, or changed values.
+
+### Follow-up: bounded Schem chunk materialization
+
+After each 16-layer slab is decoded, populated chunk columns are now
+materialized through a reusable bounded pool. Each task owns one `ChunkData`
+slot, and the caller restores the original X order before submitting the batch
+to the world writer. The default is two workers; the optional
+`WATER_STRUCTURE_SCHEM_MATERIALIZE_THREADS=1..8` setting is available for
+machines with a different CPU/I/O balance. The pool only covers the current
+slab, so peak memory remains bounded by one slab plus one output chunk row.
+
+On the Flight fixture, a warm-cache comparison measured:
+
+```text
+materialize threads=1: 2.41 s
+materialize threads=2: 1.65 s
+materialize threads=4: 1.13 s
+```
+
+Four workers increased total conversion time because they competed with gzip
+and LevelDB work; two workers is therefore the conservative default. A complete
+world comparison between the one- and two-worker outputs again reported zero
+missing, extra, or changed blocks.

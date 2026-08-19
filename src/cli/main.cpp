@@ -89,7 +89,7 @@ void print_usage(std::ostream& output = std::cout)
         "Usage:\n"
         "  water_structure_cli inspect <input> [--assets <dir>]\n"
         "  water_structure_cli formats [--writers-only]\n"
-        "  water_structure_cli convert <input> <output> [--format <name>] [--threads <n>] [--no-clear-air]\n"
+        "  water_structure_cli convert <input> <output> [--format <name>] [--threads <n>] [--no-clear-air] [--chunk-optimize]\n"
         "  water_structure_cli to-world <input> <world-directory-or-output.mcworld> [--start <x,y,z>]\n\n"
         "Compatibility syntax:\n"
         "  water_structure_cli convert <input> --format <name> --output <output>\n\n"
@@ -98,6 +98,7 @@ void print_usage(std::ostream& output = std::cout)
         "  -o, --output <path>  Output path for compatibility syntax\n"
         "  -j, --threads <n>    Writer worker count (0 = conservative automatic default)\n"
         "      --no-clear-air   MCFunction: do not clear the destination bounds first\n"
+        "      --chunk-optimize MCFunction: optimize each 16x16 chunk independently\n"
         "      --start <x,y,z>  Target subchunk position; default 0,-4,0\n"
         "      --assets <dir>   Runtime asset directory\n"
         "      --profile        Print internal conversion stage timing\n"
@@ -413,6 +414,7 @@ int convert_file(
     std::optional<StructureId> format,
     std::size_t threads,
     bool clear_air,
+    bool chunk_partition,
     const std::filesystem::path& executable,
     const CommonOptions& common)
 {
@@ -464,6 +466,7 @@ int convert_file(
     water_structure::ConversionOptions conversion_options;
     conversion_options.thread_count = threads;
     conversion_options.clear_air = clear_air;
+    conversion_options.mcfunction_chunk_partition = chunk_partition;
     conversion_options.callbacks.start = [&progress](std::size_t total) {
         progress.start(total);
         progress.begin_busy();
@@ -661,6 +664,7 @@ int interactive(const std::filesystem::path& executable)
         return kUsageError;
     }
     bool clear_air = true;
+    bool chunk_partition = false;
     if (target->id == water_structure::StructureId::MCFunction) {
         const auto clear_text = lower(prompt("执行前清空结构范围（y/n）", "y"));
         if (clear_text == "q") return 0;
@@ -669,9 +673,19 @@ int interactive(const std::filesystem::path& executable)
             std::cerr << "错误：请输入 y 或 n\n";
             return kUsageError;
         }
+        const auto chunk_text = lower(prompt(
+            "按 16x16 区块独立优化（y/n）", "n"));
+        if (chunk_text == "q") return 0;
+        if (chunk_text == "y" || chunk_text == "yes") chunk_partition = true;
+        else if (chunk_text != "n" && chunk_text != "no") {
+            std::cerr << "错误：请输入 y 或 n\n";
+            return kUsageError;
+        }
     }
     std::cout << "\n正在转换 " << detected.value().name << " -> " << target->name << "……\n";
-    const auto result = convert_file(source, output, target->id, threads, clear_air, executable, common);
+    const auto result = convert_file(
+        source, output, target->id, threads, clear_air,
+        chunk_partition, executable, common);
     if (result == 0) std::cout << "本次转换完成，可以继续处理其他文件。\n\n";
     else std::cerr << "本次转换失败，可以继续处理其他文件。\n\n";
     }
@@ -703,6 +717,7 @@ int main(int argc, char** argv)
         std::filesystem::path explicit_output;
         std::size_t threads = 0;
         bool clear_air = true;
+        bool chunk_partition = false;
         water_structure::SubChunkPos start{0, -4, 0};
         for (int i = 2; i < argc; ++i) {
             const std::string_view argument = argv[i];
@@ -728,6 +743,9 @@ int main(int argc, char** argv)
                 threads = *parsed;
             } else if (argument == "--no-clear-air") {
                 clear_air = false;
+            } else if (argument == "--chunk-optimize" ||
+                       argument == "--mcfunction-chunk-optimize") {
+                chunk_partition = true;
             } else if (argument == "--start") {
                 if (!take_option_value(argc, argv, i, value)) { std::cerr << "error: --start needs x,y,z\n"; return kUsageError; }
                 const auto parsed = parse_start(value);
@@ -758,7 +776,9 @@ int main(int argc, char** argv)
         if (command == "convert" && (positional.size() == 1 || positional.size() == 2)) {
             const auto output = positional.size() == 2 ? positional[1] : explicit_output;
             if (output.empty()) { std::cerr << "error: output path is required\n"; return kUsageError; }
-            return convert_file(positional[0], output, format, threads, clear_air, executable, common);
+            return convert_file(
+                positional[0], output, format, threads, clear_air,
+                chunk_partition, executable, common);
         }
         if (command == "to-world" && positional.size() == 2) {
             return to_world(positional[0], positional[1], start, executable, common);

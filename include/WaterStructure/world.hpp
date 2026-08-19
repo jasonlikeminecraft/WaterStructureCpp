@@ -6,9 +6,17 @@
 #include <BedrockWorldOperator/BedrockWorldOperator.hpp>
 
 #include <filesystem>
+#include <memory>
 #include <optional>
 
 namespace water_structure {
+
+namespace detail {
+class BoundedThreadPool;
+struct BoundedThreadPoolDeleter {
+    void operator()(BoundedThreadPool*) const noexcept;
+};
+}
 
 class WorldSource {
 public:
@@ -102,6 +110,12 @@ private:
     std::filesystem::path mTemporaryDirectory;
     bool mWriteBackArchive = true;
     std::optional<BedrockWorldOperator::World> mWorld;
+    // Lazily created so repeated save_chunks() calls (for example one Schem
+    // Z stripe at a time) reuse the workers instead of creating threads for
+    // every batch. The pool only performs CPU-side payload encoding; LevelDB
+    // commits remain on the caller thread.
+    mutable std::unique_ptr<detail::BoundedThreadPool, detail::BoundedThreadPoolDeleter> mEncodePool;
+    mutable std::size_t mEncodePoolWorkers = 0;
 };
 
 Result<void> convert_to_world(const IStructure& structure, WorldTarget& world, SubChunkPos start, ConversionCallbacks callbacks = {});

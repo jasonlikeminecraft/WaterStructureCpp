@@ -802,12 +802,16 @@ Result<void> write_mcfunction(
     }
 
     std::vector<ChunkPos> positions;
-    positions.reserve(kChunkBatchSize);
+    const auto batch_size = options.mcfunction_chunk_partition
+        ? std::size_t{1}
+        : static_cast<std::size_t>(kChunkBatchSize);
+    positions.reserve(batch_size);
     const auto air = registry.air_runtime_id();
     const auto task_count =
         static_cast<std::size_t>(size.chunk_z_count()) *
         static_cast<std::size_t>(
-            (size.chunk_x_count() + kChunkBatchSize - 1) / kChunkBatchSize);
+            (size.chunk_x_count() + static_cast<std::int32_t>(batch_size) - 1) /
+            static_cast<std::int32_t>(batch_size));
     const auto worker_count = selected_worker_count(options, task_count);
 
     // Palette fast path: MCWorld feeds subchunk palettes + packed indices
@@ -904,7 +908,7 @@ Result<void> write_mcfunction(
     const auto load_batch = [&](std::int32_t chunk_z, std::int32_t batch_x)
         -> Result<LoadedBatch> {
         const auto batch_end =
-            std::min(size.chunk_x_count(), batch_x + kChunkBatchSize);
+            std::min(size.chunk_x_count(), batch_x + static_cast<std::int32_t>(batch_size));
         positions.clear();
         for (auto chunk_x = batch_x; chunk_x < batch_end; ++chunk_x) {
             positions.push_back({ chunk_x, chunk_z });
@@ -947,7 +951,7 @@ Result<void> write_mcfunction(
         for (std::int32_t chunk_z = 0; chunk_z < size.chunk_z_count(); ++chunk_z) {
             for (std::int32_t batch_x = 0;
                  batch_x < size.chunk_x_count();
-                 batch_x += kChunkBatchSize) {
+                 batch_x += static_cast<std::int32_t>(batch_size)) {
                 auto batch = load_batch(chunk_z, batch_x);
                 if (!batch) return Result<void>::failure(batch.error());
                 const auto encoded = batch.value().palette
@@ -1045,7 +1049,8 @@ Result<void> write_mcfunction(
 
         std::size_t sequence = 0;
         const auto batches_per_z = static_cast<std::size_t>(
-            (size.chunk_x_count() + kChunkBatchSize - 1) / kChunkBatchSize);
+            (size.chunk_x_count() + static_cast<std::int32_t>(batch_size) - 1) /
+            static_cast<std::int32_t>(batch_size));
         const auto total_batches =
             static_cast<std::size_t>(size.chunk_z_count()) * batches_per_z;
 
@@ -1099,7 +1104,7 @@ Result<void> write_mcfunction(
                         const auto chunk_z =
                             static_cast<std::int32_t>(index / batches_per_z);
                         const auto batch_x = static_cast<std::int32_t>(
-                            (index % batches_per_z) * kChunkBatchSize);
+                            (index % batches_per_z) * batch_size);
                         auto batch = load_batch(chunk_z, batch_x);
                         {
                             std::lock_guard lock(pipeline.mutex);
@@ -1150,7 +1155,7 @@ Result<void> write_mcfunction(
                 const auto chunk_z =
                     static_cast<std::int32_t>(index / batches_per_z);
                 const auto batch_x = static_cast<std::int32_t>(
-                    (index % batches_per_z) * kChunkBatchSize);
+                    (index % batches_per_z) * batch_size);
                 batch = load_batch(chunk_z, batch_x);
             }
             if (!batch) return Result<void>::failure(batch.error());

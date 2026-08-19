@@ -144,7 +144,7 @@ extern "C" {
 
 WATER_STRUCTURE_API const char* ws_version(void)
 {
-    return "0.1.6";
+    return "0.1.7";
 }
 
 WATER_STRUCTURE_API uint32_t ws_abi_version(void)
@@ -254,6 +254,7 @@ static int ws_convert_impl(
     const char* output_path_utf8,
     uint64_t thread_count,
     int clear_air,
+    int chunk_partition,
     ws_progress_callback callback,
     void* user_data)
 {
@@ -279,6 +280,7 @@ static int ws_convert_impl(
         water_structure::ConversionOptions options;
         options.thread_count = static_cast<std::size_t>(thread_count);
         options.clear_air = clear_air != 0;
+        options.mcfunction_chunk_partition = chunk_partition != 0;
         if (callback != nullptr) {
             options.callbacks.start = [&progress](std::size_t total) {
                 progress.start(WS_PROGRESS_ENCODE, total);
@@ -315,7 +317,7 @@ WATER_STRUCTURE_API int ws_convert(
 {
     return ws_convert_impl(
         context, input_path_utf8, target_format, output_path_utf8,
-        thread_count, 1, nullptr, nullptr);
+        thread_count, 1, 0, nullptr, nullptr);
 }
 
 WATER_STRUCTURE_API int ws_convert_ex(
@@ -328,7 +330,21 @@ WATER_STRUCTURE_API int ws_convert_ex(
 {
     return ws_convert_impl(
         context, input_path_utf8, target_format, output_path_utf8,
-        thread_count, clear_air, nullptr, nullptr);
+        thread_count, clear_air, 0, nullptr, nullptr);
+}
+
+WATER_STRUCTURE_API int ws_convert_ex2(
+    ws_context* context,
+    const char* input_path_utf8,
+    const char* target_format,
+    const char* output_path_utf8,
+    uint64_t thread_count,
+    int clear_air,
+    int chunk_partition)
+{
+    return ws_convert_impl(
+        context, input_path_utf8, target_format, output_path_utf8,
+        thread_count, clear_air, chunk_partition, nullptr, nullptr);
 }
 
 WATER_STRUCTURE_API int ws_convert_with_progress(
@@ -342,7 +358,7 @@ WATER_STRUCTURE_API int ws_convert_with_progress(
 {
     return ws_convert_impl(
         context, input_path_utf8, target_format, output_path_utf8,
-        thread_count, 1, callback, user_data);
+        thread_count, 1, 0, callback, user_data);
 }
 
 WATER_STRUCTURE_API int ws_convert_with_progress_ex(
@@ -357,7 +373,23 @@ WATER_STRUCTURE_API int ws_convert_with_progress_ex(
 {
     return ws_convert_impl(
         context, input_path_utf8, target_format, output_path_utf8,
-        thread_count, clear_air, callback, user_data);
+        thread_count, clear_air, 0, callback, user_data);
+}
+
+WATER_STRUCTURE_API int ws_convert_with_progress_ex2(
+    ws_context* context,
+    const char* input_path_utf8,
+    const char* target_format,
+    const char* output_path_utf8,
+    uint64_t thread_count,
+    int clear_air,
+    int chunk_partition,
+    ws_progress_callback callback,
+    void* user_data)
+{
+    return ws_convert_impl(
+        context, input_path_utf8, target_format, output_path_utf8,
+        thread_count, clear_air, chunk_partition, callback, user_data);
 }
 
 static int ws_to_world_impl(

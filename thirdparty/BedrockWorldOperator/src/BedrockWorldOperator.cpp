@@ -1668,6 +1668,13 @@ public:
         leveldb::Options options;
         options.create_if_missing = true;
         options.block_size = 16 * 1024;
+        // World conversions are sustained bulk writes. LevelDB's 4 MiB
+        // default forces frequent immutable-table flushes and compactions,
+        // which stall the single writer. Keep the budget bounded while
+        // allowing larger sequential runs: LevelDB may retain at most two
+        // write buffers, so this adds no more than 24 MiB over the default.
+        options.write_buffer_size = 16 * 1024 * 1024;
+        options.max_file_size = 8 * 1024 * 1024;
         leveldb::DB* db = nullptr;
         auto status = leveldb::DB::Open(options, (world->mDir / "db").string(), &db);
         if (!status.ok() || !db) {

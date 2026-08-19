@@ -78,6 +78,18 @@ WATER_STRUCTURE_API int ws_convert_ex(
     uint64_t thread_count,
     int clear_air);
 
+/* Adds MCFunction chunk-partitioned optimization without changing the ABI of
+ * ws_convert_ex. chunk_partition is non-zero to keep every emitted placement
+ * command inside one 16x16 chunk. */
+WATER_STRUCTURE_API int ws_convert_ex2(
+    ws_context* context,
+    const char* input_path_utf8,
+    const char* target_format,
+    const char* output_path_utf8,
+    uint64_t thread_count,
+    int clear_air,
+    int chunk_partition);
+
 /* Optional progress-enabled variant; ws_convert remains ABI-compatible. */
 WATER_STRUCTURE_API int ws_convert_with_progress(
     ws_context* context,
@@ -95,6 +107,17 @@ WATER_STRUCTURE_API int ws_convert_with_progress_ex(
     const char* output_path_utf8,
     uint64_t thread_count,
     int clear_air,
+    ws_progress_callback callback,
+    void* user_data);
+
+WATER_STRUCTURE_API int ws_convert_with_progress_ex2(
+    ws_context* context,
+    const char* input_path_utf8,
+    const char* target_format,
+    const char* output_path_utf8,
+    uint64_t thread_count,
+    int clear_air,
+    int chunk_partition,
     ws_progress_callback callback,
     void* user_data);
 

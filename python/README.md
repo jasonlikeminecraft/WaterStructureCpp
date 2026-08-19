@@ -228,6 +228,14 @@ ctx.convert(
     "building-merge.mcfunction",
     clear_air=False,
 )
+
+# 按 16x16 区块分别执行三维合并，方块放置 fill 不会跨区块边界
+ctx.convert(
+    "building.mcworld",
+    "MCFunction",
+    "building-by-chunk.mcfunction",
+    chunk_partition=True,
+)
 ```
 
 生成的是 Bedrock 方块状态命令。`fill` 和 `setblock` 坐标使用 `~x ~y ~z`，执行
@@ -463,7 +471,8 @@ Context(assets_directory=None)
 Context.close() -> None
 Context.format(path, *, streaming_world_import=False) -> str
 Context.inspect(path, *, streaming_world_import=False) -> StructureInfo
-Context.convert(input_path, target_format, output_path, *, threads=0, progress=None) -> None
+Context.convert(input_path, target_format, output_path, *, threads=0,
+                clear_air=True, chunk_partition=False, progress=None) -> None
 Context.to_world(input_path, world_path, *, start=(0, -4, 0), progress=None) -> None
 ```
 

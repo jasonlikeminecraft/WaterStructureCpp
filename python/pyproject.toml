@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "water-structure"
-version = "0.1.6"
+version = "0.1.7"
 description = "Streaming Minecraft structure conversion powered by WaterStructureCpp"
 readme = "README.md"
 requires-python = ">=3.9"
