@@ -1,7 +1,8 @@
 import os
+import re
 
 from setuptools import setup
-from wheel.bdist_wheel import bdist_wheel as _bdist_wheel
+from setuptools.command.bdist_wheel import bdist_wheel as _bdist_wheel
 
 
 class PlatformWheel(_bdist_wheel):
@@ -13,7 +14,12 @@ class PlatformWheel(_bdist_wheel):
 
     def get_tag(self):
         _, _, platform_tag = super().get_tag()
-        platform_tag = os.environ.get("WATER_STRUCTURE_WHEEL_PLATFORM", platform_tag)
+        override = os.environ.get("WATER_STRUCTURE_WHEEL_PLATFORM")
+        if override:
+            if (not re.fullmatch(r"[A-Za-z0-9_.]+", override) or
+                    override.lower() == "any"):
+                raise RuntimeError(f"invalid native wheel platform tag: {override!r}")
+            platform_tag = override
         return "py3", "none", platform_tag
 
 

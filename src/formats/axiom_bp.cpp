@@ -186,6 +186,11 @@ Result<void> AxiomBpReader::read(const std::filesystem::path& path)
     try {
         std::ifstream input(path, std::ios::binary);
         if (!input) throw std::runtime_error("cannot open AxiomBP file: " + path.string());
+        input.seekg(0, std::ios::end);
+        const auto end = input.tellg();
+        if (end < 0) throw std::runtime_error("cannot determine AxiomBP input size");
+        const auto file_size = static_cast<std::uint64_t>(end);
+        input.seekg(0, std::ios::beg);
         const auto read_i32 = [&]() {
             const auto bytes = read_exact(input, 4, "AxiomBP header");
             const auto value = (static_cast<std::uint32_t>(bytes[0]) << 24) |
@@ -200,13 +205,25 @@ Result<void> AxiomBpReader::read(const std::filesystem::path& path)
                 throw std::runtime_error(std::string(context) + " length is invalid at header offset " +
                     std::to_string(static_cast<std::uint64_t>(input.tellg()) - 4));
             }
-            return read_exact(input, static_cast<std::size_t>(length), context);
+            const auto start = input.tellg();
+            if (start < 0 || static_cast<std::uint64_t>(start) > file_size ||
+                static_cast<std::uint64_t>(length) > file_size - static_cast<std::uint64_t>(start)) {
+                throw std::runtime_error(std::string(context) + " truncated at file offset " +
+                    std::to_string(std::max<std::streamoff>(0, start)));
+            }
+            input.seekg(static_cast<std::streamoff>(length), std::ios::cur);
+            if (!input) throw std::runtime_error(std::string(context) + " seek failed");
         };
         skip_array("AxiomBP metadata");
         skip_array("AxiomBP thumbnail");
         const auto data_length = read_i32();
-        if (data_length < 0) throw std::runtime_error("AxiomBP block data length is invalid at header offset " +
-            std::to_string(static_cast<std::uint64_t>(input.tellg()) - 4));
+        const auto data_start = input.tellg();
+        if (data_length < 0 || data_start < 0 ||
+            static_cast<std::uint64_t>(data_start) > file_size ||
+            static_cast<std::uint64_t>(data_length) > file_size - static_cast<std::uint64_t>(data_start)) {
+            throw std::runtime_error("AxiomBP block data length is invalid at header offset " +
+                std::to_string(data_start < 4 ? 0 : static_cast<std::uint64_t>(data_start) - 4));
+        }
         const auto compressed = read_exact(input, static_cast<std::size_t>(data_length), "AxiomBP block data");
         const auto decoded = inflate_gzip(compressed);
         const auto root = read_compound(decoded);
@@ -217,9 +234,6 @@ Result<void> AxiomBpReader::read(const std::filesystem::path& path)
         const auto& regions = regions_value->as<nbt::tag_list>();
         if (regions.size() == 0) throw std::runtime_error("AxiomBP has no regions");
 
-        struct Region { std::int32_t x, y, z; std::vector<std::uint32_t> palette; std::vector<std::uint64_t> data; };
-        std::vector<Region> parsed;
-        parsed.reserve(regions.size());
         std::int32_t min_x = std::numeric_limits<std::int32_t>::max();
         std::int32_t min_y = min_x, min_z = min_x;
         std::int32_t max_x = std::numeric_limits<std::int32_t>::min();
@@ -244,55 +258,69 @@ Result<void> AxiomBpReader::read(const std::filesystem::path& path)
                 throw std::runtime_error("AxiomBP region #" + std::to_string(region_index) +
                     " lacks BlockStates palette/data");
             }
-            Region result{ *x, *y, *z, {}, {} };
-            for (const auto& palette_entry : palette_value->as<nbt::tag_list>()) {
-                if (palette_entry.get_type() != nbt::tag_type::Compound) {
-                    result.palette.push_back(mRegistry.air_runtime_id());
-                } else {
-                    result.palette.push_back(palette_runtime(mRegistry,
-                        palette_entry.as<nbt::tag_compound>()));
-                }
-            }
-            const auto& longs = data_value->as<nbt::tag_long_array>();
-            result.data.reserve(longs.size());
-            for (const auto value : longs) result.data.push_back(static_cast<std::uint64_t>(value));
-            parsed.push_back(std::move(result));
             min_x = std::min(min_x, *x); min_y = std::min(min_y, *y); min_z = std::min(min_z, *z);
             max_x = std::max(max_x, *x); max_y = std::max(max_y, *y); max_z = std::max(max_z, *z);
         }
-        std::vector<std::pair<BlockPos, std::uint32_t>> blocks;
-        for (const auto& region : parsed) {
-            const auto bits = bits_for_palette(region.palette.size());
+        const auto provisional_width = (static_cast<std::int64_t>(max_x) - min_x + 1) * 16;
+        const auto provisional_height = (static_cast<std::int64_t>(max_y) - min_y + 1) * 16;
+        const auto provisional_length = (static_cast<std::int64_t>(max_z) - min_z + 1) * 16;
+        if (provisional_width <= 0 || provisional_height <= 0 || provisional_length <= 0 ||
+            provisional_width > std::numeric_limits<std::int32_t>::max() ||
+            provisional_height > std::numeric_limits<std::int32_t>::max() ||
+            provisional_length > std::numeric_limits<std::int32_t>::max()) {
+            throw std::runtime_error("AxiomBP region bounds exceed int32");
+        }
+        mStore.set_size({ static_cast<std::int32_t>(provisional_width),
+            static_cast<std::int32_t>(provisional_height),
+            static_cast<std::int32_t>(provisional_length) });
+
+        std::int32_t max_block_x = 0, max_block_y = 0, max_block_z = 0;
+        for (std::size_t region_index = 0; region_index < regions.size(); ++region_index) {
+            const auto& region = regions.at(region_index).as<nbt::tag_compound>();
+            const auto x = *int_value(find_value(region, "X"));
+            const auto y = *int_value(find_value(region, "Y"));
+            const auto z = *int_value(find_value(region, "Z"));
+            const auto& states = find_value(region, "BlockStates")->as<nbt::tag_compound>();
+            const auto& palette_values = find_value(states, "palette")->as<nbt::tag_list>();
+            const auto& packed = find_value(states, "data")->as<nbt::tag_long_array>();
+            std::vector<std::uint32_t> palette;
+            palette.reserve(palette_values.size());
+            for (const auto& palette_entry : palette_values) {
+                if (palette_entry.get_type() != nbt::tag_type::Compound) {
+                    palette.push_back(mRegistry.air_runtime_id());
+                } else {
+                    palette.push_back(palette_runtime(mRegistry,
+                        palette_entry.as<nbt::tag_compound>()));
+                }
+            }
+            const auto bits = bits_for_palette(palette.size());
             const auto per_long = 64 / bits;
             const auto mask = (std::uint64_t{ 1 } << bits) - 1;
             for (std::size_t index = 0; index < 4096; ++index) {
                 const auto long_index = index / per_long;
-                if (long_index >= region.data.size()) break;
+                if (long_index >= packed.size()) break;
                 const auto palette_index = static_cast<std::size_t>(
-                    (region.data[long_index] >> ((index % per_long) * bits)) & mask);
-                if (palette_index >= region.palette.size()) continue;
-                const auto runtime = region.palette[palette_index];
+                    (static_cast<std::uint64_t>(packed.get()[long_index]) >>
+                        ((index % per_long) * bits)) & mask);
+                if (palette_index >= palette.size()) continue;
+                const auto runtime = palette[palette_index];
                 if (runtime == mRegistry.air_runtime_id()) continue;
                 ++mNonAirBlocks;
                 const auto local_y = static_cast<std::int32_t>(index / 256);
                 const auto local_z = static_cast<std::int32_t>((index % 256) / 16);
                 const auto local_x = static_cast<std::int32_t>(index % 16);
                 const BlockPos position{
-                    (region.x - min_x) * 16 + local_x,
-                    (region.y - min_y) * 16 + local_y,
-                    (region.z - min_z) * 16 + local_z
+                    (x - min_x) * 16 + local_x,
+                    (y - min_y) * 16 + local_y,
+                    (z - min_z) * 16 + local_z
                 };
-                blocks.emplace_back(position, runtime);
+                mStore.put(position, runtime);
+                max_block_x = std::max(max_block_x, position.x + 1);
+                max_block_y = std::max(max_block_y, position.y + 1);
+                max_block_z = std::max(max_block_z, position.z + 1);
             }
         }
-        std::int32_t max_block_x = 0, max_block_y = 0, max_block_z = 0;
-        for (const auto& [position, _] : blocks) {
-            max_block_x = std::max(max_block_x, position.x + 1);
-            max_block_y = std::max(max_block_y, position.y + 1);
-            max_block_z = std::max(max_block_z, position.z + 1);
-        }
         mStore.set_size({ max_block_x, max_block_y, max_block_z });
-        for (const auto& [position, runtime] : blocks) mStore.put(position, runtime);
         return Result<void>::success();
     } catch (const std::exception& error) {
         return Result<void>::failure("parse AxiomBP failed: " + std::string(error.what()));

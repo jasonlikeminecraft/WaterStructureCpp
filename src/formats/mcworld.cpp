@@ -94,7 +94,12 @@ void McWorldStructure::set_offset(BlockPos offset) noexcept
 
 Result<void> McWorldStructure::read(const std::filesystem::path& path)
 {
-    auto opened = BedrockWorldAdapter::open(path, false);
+    auto opened = BedrockWorldAdapter::open(path, WorldOpenOptions{
+        .write_back_archive = false,
+        .allow_temporary_spool = mAllowTemporarySpool,
+        .temporary_directory = mTemporaryDirectory,
+        .temporary_file_limit_bytes = mTemporaryFileLimitBytes
+    });
     if (!opened) return Result<void>::failure(opened.error());
     auto selection = selection_from_text(path.filename().string());
     if (!selection) selection = selection_from_level_dat(opened.value().directory() / "level.dat");
@@ -398,7 +403,41 @@ Result<NbtChunkMap> McWorldStructure::get_chunk_nbt(std::span<const ChunkPos> po
 
 Result<std::size_t> McWorldStructure::count_non_air_blocks() const
 {
-    return Result<std::size_t>::success(static_cast<std::size_t>(mOriginalSize.volume()));
+    if (!mWorld) return Result<std::size_t>::failure("MCWorld 尚未打开");
+    const auto air = mRegistry.air_runtime_id();
+    std::size_t count = 0;
+    const auto chunk_x_count = mSize.chunk_x_count();
+    const auto chunk_z_count = mSize.chunk_z_count();
+    for (std::int32_t z = 0; z < chunk_z_count; ++z) {
+        for (std::int32_t x = 0; x < chunk_x_count; ++x) {
+            const ChunkPos pos{ x, z };
+            const std::array<ChunkPos, 1> request{ pos };
+            auto chunks = get_chunks(request);
+            if (!chunks) return Result<std::size_t>::failure(chunks.error());
+            const auto found = chunks.value().find(pos);
+            if (found == chunks.value().end()) continue;
+            for (const auto& [_, sub] : found->second.sub_chunks) {
+                for (const auto value : sub.layer0) {
+                    if (value != air) {
+                        if (count == std::numeric_limits<std::size_t>::max()) {
+                            return Result<std::size_t>::failure("MCWorld 非空气方块数量溢出");
+                        }
+                        ++count;
+                    }
+                }
+                for (const auto value : sub.layer1) {
+                    if (value != air) {
+                        if (count == std::numeric_limits<std::size_t>::max()) {
+                            return Result<std::size_t>::failure("MCWorld 非空气方块数量溢出");
+                        }
+                        ++count;
+                    }
+                }
+            }
+            release_cached_chunks();
+        }
+    }
+    return Result<std::size_t>::success(count);
 }
 
 Result<void> McWorldStructure::write_to_world(

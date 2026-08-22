@@ -4,12 +4,13 @@
 
 #include <nlohmann/json.hpp>
 
-#include <Windows.h>
-#include <bcrypt.h>
-
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <bit>
 #include <charconv>
+#include <chrono>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -21,6 +22,12 @@
 #include <tuple>
 #include <unordered_map>
 #include <vector>
+
+#if defined(_WIN32)
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
 
 namespace {
 
@@ -49,61 +56,36 @@ std::string hex(std::span<const std::uint8_t> bytes)
     return output.str();
 }
 
-std::string sha256(std::span<const std::uint8_t> bytes)
-{
-    BCRYPT_ALG_HANDLE algorithm = nullptr;
-    BCRYPT_HASH_HANDLE hash = nullptr;
-    DWORD object_size = 0, hash_size = 0, result_size = 0;
-    if (BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_SHA256_ALGORITHM, nullptr, 0) < 0 ||
-        BCryptGetProperty(algorithm, BCRYPT_OBJECT_LENGTH, reinterpret_cast<PUCHAR>(&object_size), sizeof(object_size), &result_size, 0) < 0 ||
-        BCryptGetProperty(algorithm, BCRYPT_HASH_LENGTH, reinterpret_cast<PUCHAR>(&hash_size), sizeof(hash_size), &result_size, 0) < 0) {
-        if (algorithm) BCryptCloseAlgorithmProvider(algorithm, 0);
-        throw std::runtime_error("初始化 SHA-256 失败");
-    }
-    std::vector<std::uint8_t> object(object_size), digest(hash_size);
-    if (BCryptCreateHash(algorithm, &hash, object.data(), object_size, nullptr, 0, 0) < 0 ||
-        (!bytes.empty() && BCryptHashData(hash, const_cast<PUCHAR>(bytes.data()), static_cast<ULONG>(bytes.size()), 0) < 0) ||
-        BCryptFinishHash(hash, digest.data(), hash_size, 0) < 0) {
-        if (hash) BCryptDestroyHash(hash);
-        BCryptCloseAlgorithmProvider(algorithm, 0);
-        throw std::runtime_error("计算 SHA-256 失败");
-    }
-    BCryptDestroyHash(hash); BCryptCloseAlgorithmProvider(algorithm, 0);
-    return hex(digest);
-}
-
 class Sha256Stream {
 public:
-    Sha256Stream()
-    {
-        DWORD result_size = 0;
-        if (BCryptOpenAlgorithmProvider(&mAlgorithm, BCRYPT_SHA256_ALGORITHM, nullptr, 0) < 0 ||
-            BCryptGetProperty(mAlgorithm, BCRYPT_OBJECT_LENGTH, reinterpret_cast<PUCHAR>(&mObjectSize),
-                sizeof(mObjectSize), &result_size, 0) < 0 ||
-            BCryptGetProperty(mAlgorithm, BCRYPT_HASH_LENGTH, reinterpret_cast<PUCHAR>(&mHashSize),
-                sizeof(mHashSize), &result_size, 0) < 0) {
-            throw std::runtime_error("初始化流式 SHA-256 失败");
-        }
-        mObject.resize(mObjectSize);
-        if (BCryptCreateHash(mAlgorithm, &mHash, mObject.data(), mObjectSize, nullptr, 0, 0) < 0) {
-            throw std::runtime_error("创建流式 SHA-256 失败");
-        }
-    }
-
+    Sha256Stream() = default;
     Sha256Stream(const Sha256Stream&) = delete;
     Sha256Stream& operator=(const Sha256Stream&) = delete;
 
-    ~Sha256Stream()
-    {
-        if (mHash) BCryptDestroyHash(mHash);
-        if (mAlgorithm) BCryptCloseAlgorithmProvider(mAlgorithm, 0);
-    }
-
     void update(std::span<const std::uint8_t> bytes)
     {
-        if (!bytes.empty() && BCryptHashData(mHash, const_cast<PUCHAR>(bytes.data()),
-            static_cast<ULONG>(bytes.size()), 0) < 0) {
-            throw std::runtime_error("更新流式 SHA-256 失败");
+        if (mFinished) throw std::runtime_error("SHA-256 已完成，不能继续写入");
+        if (bytes.size() > std::numeric_limits<std::uint64_t>::max() - mTotalBytes) {
+            throw std::runtime_error("SHA-256 输入过长");
+        }
+        mTotalBytes += static_cast<std::uint64_t>(bytes.size());
+        if (mBuffered != 0) {
+            const auto count = std::min(bytes.size(), mBuffer.size() - mBuffered);
+            std::copy_n(bytes.begin(), count, mBuffer.begin() + static_cast<std::ptrdiff_t>(mBuffered));
+            mBuffered += count;
+            bytes = bytes.subspan(count);
+            if (mBuffered == mBuffer.size()) {
+                transform(mBuffer.data());
+                mBuffered = 0;
+            }
+        }
+        while (bytes.size() >= mBuffer.size()) {
+            transform(bytes.data());
+            bytes = bytes.subspan(mBuffer.size());
+        }
+        if (!bytes.empty()) {
+            std::copy(bytes.begin(), bytes.end(), mBuffer.begin());
+            mBuffered = bytes.size();
         }
     }
 
@@ -114,22 +96,99 @@ public:
 
     std::string finish()
     {
-        std::vector<std::uint8_t> digest(mHashSize);
-        if (BCryptFinishHash(mHash, digest.data(), mHashSize, 0) < 0) {
-            throw std::runtime_error("完成流式 SHA-256 失败");
+        if (mFinished) throw std::runtime_error("SHA-256 已完成");
+        const auto bit_length = mTotalBytes * 8;
+        mBuffer[mBuffered++] = 0x80;
+        if (mBuffered > 56) {
+            std::fill(mBuffer.begin() + static_cast<std::ptrdiff_t>(mBuffered), mBuffer.end(), 0);
+            transform(mBuffer.data());
+            mBuffered = 0;
         }
-        BCryptDestroyHash(mHash);
-        mHash = nullptr;
+        std::fill(mBuffer.begin() + static_cast<std::ptrdiff_t>(mBuffered), mBuffer.begin() + 56, 0);
+        for (std::size_t i = 0; i < 8; ++i) mBuffer[63 - i] = static_cast<std::uint8_t>(bit_length >> (i * 8));
+        transform(mBuffer.data());
+        std::array<std::uint8_t, 32> digest{};
+        for (std::size_t i = 0; i < mState.size(); ++i) {
+            digest[i * 4] = static_cast<std::uint8_t>(mState[i] >> 24);
+            digest[i * 4 + 1] = static_cast<std::uint8_t>(mState[i] >> 16);
+            digest[i * 4 + 2] = static_cast<std::uint8_t>(mState[i] >> 8);
+            digest[i * 4 + 3] = static_cast<std::uint8_t>(mState[i]);
+        }
+        mFinished = true;
         return hex(digest);
     }
 
 private:
-    BCRYPT_ALG_HANDLE mAlgorithm = nullptr;
-    BCRYPT_HASH_HANDLE mHash = nullptr;
-    DWORD mObjectSize = 0;
-    DWORD mHashSize = 0;
-    std::vector<std::uint8_t> mObject;
+    static constexpr std::array<std::uint32_t, 64> kRoundConstants{
+        0x428a2f98u,0x71374491u,0xb5c0fbcfu,0xe9b5dba5u,0x3956c25bu,0x59f111f1u,0x923f82a4u,0xab1c5ed5u,
+        0xd807aa98u,0x12835b01u,0x243185beu,0x550c7dc3u,0x72be5d74u,0x80deb1feu,0x9bdc06a7u,0xc19bf174u,
+        0xe49b69c1u,0xefbe4786u,0x0fc19dc6u,0x240ca1ccu,0x2de92c6fu,0x4a7484aau,0x5cb0a9dcu,0x76f988dau,
+        0x983e5152u,0xa831c66du,0xb00327c8u,0xbf597fc7u,0xc6e00bf3u,0xd5a79147u,0x06ca6351u,0x14292967u,
+        0x27b70a85u,0x2e1b2138u,0x4d2c6dfcu,0x53380d13u,0x650a7354u,0x766a0abbu,0x81c2c92eu,0x92722c85u,
+        0xa2bfe8a1u,0xa81a664bu,0xc24b8b70u,0xc76c51a3u,0xd192e819u,0xd6990624u,0xf40e3585u,0x106aa070u,
+        0x19a4c116u,0x1e376c08u,0x2748774cu,0x34b0bcb5u,0x391c0cb3u,0x4ed8aa4au,0x5b9cca4fu,0x682e6ff3u,
+        0x748f82eeu,0x78a5636fu,0x84c87814u,0x8cc70208u,0x90befffau,0xa4506cebu,0xbef9a3f7u,0xc67178f2u
+    };
+
+    void transform(const std::uint8_t* block)
+    {
+        std::array<std::uint32_t, 64> words{};
+        for (std::size_t i = 0; i < 16; ++i) {
+            const auto p = i * 4;
+            words[i] = (static_cast<std::uint32_t>(block[p]) << 24) |
+                (static_cast<std::uint32_t>(block[p + 1]) << 16) |
+                (static_cast<std::uint32_t>(block[p + 2]) << 8) | block[p + 3];
+        }
+        for (std::size_t i = 16; i < words.size(); ++i) {
+            const auto s0 = std::rotr(words[i - 15], 7) ^ std::rotr(words[i - 15], 18) ^ (words[i - 15] >> 3);
+            const auto s1 = std::rotr(words[i - 2], 17) ^ std::rotr(words[i - 2], 19) ^ (words[i - 2] >> 10);
+            words[i] = words[i - 16] + s0 + words[i - 7] + s1;
+        }
+        auto a = mState[0], b = mState[1], c = mState[2], d = mState[3];
+        auto e = mState[4], f = mState[5], g = mState[6], h = mState[7];
+        for (std::size_t i = 0; i < words.size(); ++i) {
+            const auto sum1 = std::rotr(e, 6) ^ std::rotr(e, 11) ^ std::rotr(e, 25);
+            const auto choose = (e & f) ^ (~e & g);
+            const auto t1 = h + sum1 + choose + kRoundConstants[i] + words[i];
+            const auto sum0 = std::rotr(a, 2) ^ std::rotr(a, 13) ^ std::rotr(a, 22);
+            const auto majority = (a & b) ^ (a & c) ^ (b & c);
+            const auto t2 = sum0 + majority;
+            h = g; g = f; f = e; e = d + t1; d = c; c = b; b = a; a = t1 + t2;
+        }
+        mState[0] += a; mState[1] += b; mState[2] += c; mState[3] += d;
+        mState[4] += e; mState[5] += f; mState[6] += g; mState[7] += h;
+    }
+
+    std::array<std::uint32_t, 8> mState{0x6a09e667u,0xbb67ae85u,0x3c6ef372u,0xa54ff53au,
+        0x510e527fu,0x9b05688cu,0x1f83d9abu,0x5be0cd19u};
+    std::array<std::uint8_t, 64> mBuffer{};
+    std::uint64_t mTotalBytes = 0;
+    std::size_t mBuffered = 0;
+    bool mFinished = false;
 };
+
+std::string sha256(std::span<const std::uint8_t> bytes)
+{
+    Sha256Stream hash;
+    hash.update(bytes);
+    return hash.finish();
+}
+
+void sha256_self_test()
+{
+    const auto verify = [](std::string_view input, std::string_view expected) {
+        Sha256Stream hash;
+        for (std::size_t offset = 0; offset < input.size(); ++offset) {
+            const auto* byte = reinterpret_cast<const std::uint8_t*>(input.data() + offset);
+            hash.update(std::span<const std::uint8_t>(byte, 1));
+        }
+        if (hash.finish() != expected) throw std::runtime_error("SHA-256 self-test failed");
+    };
+    verify("", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+    verify("abc", "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    verify("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq",
+        "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1");
+}
 
 void hash_u32(Sha256Stream& hash, std::uint32_t value)
 {
@@ -217,14 +276,21 @@ std::filesystem::path find_mapping(const std::filesystem::path& executable)
     return std::filesystem::is_regular_file(local) ? local : std::filesystem::path{};
 }
 
-std::string layer_hash(
+struct LayerSummary {
+    std::string hash;
+    std::size_t non_air = 0;
+};
+
+LayerSummary summarize_layer(
     const water_structure::BlockLayer& layer,
     const water_structure::RuntimeRegistry& registry,
     std::unordered_map<std::uint32_t, std::vector<std::uint8_t>>& cache)
 {
     std::vector<std::uint8_t> bytes;
     bytes.reserve(layer.size() * 32);
+    std::size_t non_air = 0;
     for (const auto runtime_id : layer) {
+        if (runtime_id != registry.air_runtime_id()) ++non_air;
         auto found = cache.find(runtime_id);
         if (found == cache.end()) {
             const auto state = registry.state(runtime_id);
@@ -241,15 +307,115 @@ std::string layer_hash(
         }
         bytes.insert(bytes.end(), found->second.begin(), found->second.end());
     }
-    return sha256(bytes);
+    return { sha256(bytes), non_air };
+}
+
+class JsonSpool final {
+public:
+    explicit JsonSpool(std::string_view label)
+    {
+        static std::atomic<std::uint64_t> sequence{ 0 };
+        const auto id = sequence.fetch_add(1, std::memory_order_relaxed);
+        const auto timestamp = std::chrono::high_resolution_clock::now().time_since_epoch().count();
+#if defined(_WIN32)
+        const auto process_id = static_cast<std::uint64_t>(_getpid());
+#else
+        const auto process_id = static_cast<std::uint64_t>(getpid());
+#endif
+        mPath = std::filesystem::temp_directory_path() /
+            ("water_structure_cpp_manifest_" + std::string(label) + "_" +
+             std::to_string(process_id) + "_" + std::to_string(timestamp) + "_" +
+             std::to_string(id) + ".part");
+        mOutput.open(mPath, std::ios::binary | std::ios::trunc);
+        if (!mOutput) throw std::runtime_error("无法创建 manifest 临时文件: " + mPath.string());
+    }
+    JsonSpool(const JsonSpool&) = delete;
+    JsonSpool& operator=(const JsonSpool&) = delete;
+    ~JsonSpool()
+    {
+        if (mOutput.is_open()) mOutput.close();
+        std::error_code error;
+        std::filesystem::remove(mPath, error);
+    }
+
+    void append(const nlohmann::json& value)
+    {
+        if (!mFirst) mOutput.put(',');
+        mOutput << value.dump();
+        if (!mOutput) throw std::runtime_error("写入 manifest 临时文件失败");
+        mFirst = false;
+    }
+
+    void copy_to(std::ostream& output)
+    {
+        mOutput.flush();
+        mOutput.close();
+        std::ifstream input(mPath, std::ios::binary);
+        if (!input) throw std::runtime_error("读取 manifest 临时文件失败");
+        std::vector<char> buffer(1u << 20);
+        while (input) {
+            input.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+            const auto count = input.gcount();
+            if (count > 0) output.write(buffer.data(), count);
+        }
+        if (!input.eof() || !output) throw std::runtime_error("复制 manifest 临时文件失败");
+    }
+
+private:
+    std::filesystem::path mPath;
+    std::ofstream mOutput;
+    bool mFirst = true;
+};
+
+void write_manifest_stream(
+    const std::optional<std::filesystem::path>& output_path,
+    nlohmann::json manifest,
+    JsonSpool* chunks,
+    JsonSpool* entities,
+    bool include_arrays)
+{
+    manifest.erase("chunks");
+    manifest.erase("block_entities");
+    auto output = std::ofstream{};
+    std::ostream* stream = &std::cout;
+    if (output_path) {
+        output.open(*output_path, std::ios::binary | std::ios::trunc);
+        if (!output) throw std::runtime_error("无法创建 manifest: " + output_path->string());
+        stream = &output;
+    }
+    auto encoded = manifest.dump();
+    if (encoded.empty() || encoded.back() != '}') {
+        throw std::runtime_error("manifest 元数据不是 JSON object");
+    }
+    stream->write(encoded.data(), static_cast<std::streamsize>(encoded.size() - 1));
+    if (include_arrays) {
+        *stream << ",\"chunks\":[";
+        chunks->copy_to(*stream);
+        *stream << "],\"block_entities\":[";
+        entities->copy_to(*stream);
+        *stream << ']';
+    }
+    *stream << "}\n";
+    if (!*stream) throw std::runtime_error("写入 manifest 失败");
 }
 
 } // namespace
 
 int main(int argc, char** argv)
 {
+    if (argc == 2 && std::string_view(argv[1]) == "--sha256-self-test") {
+        try {
+            sha256_self_test();
+            std::cout << "SHA-256 self-test passed\n";
+            return 0;
+        } catch (const std::exception& error) {
+            std::cerr << error.what() << '\n';
+            return 2;
+        }
+    }
     if (argc < 2) {
-        std::cerr << "usage: cpp_manifest <input> [output.json [--format name] [--detail chunkX chunkZ subY layer]]\n";
+        std::cerr << "usage: cpp_manifest <input> [output.json [--format name] [--detail chunkX chunkZ subY layer]]\n"
+                     "       cpp_manifest --sha256-self-test\n";
         return 1;
     }
     try {
@@ -319,18 +485,32 @@ int main(int argc, char** argv)
             manifest["format"] = structure.name();
             manifest["size"] = { size.width, size.height, size.length };
             manifest["offset"] = { offset.x, offset.y, offset.z };
-            const auto non_air = structure.count_non_air_blocks();
-            if (!non_air) throw std::runtime_error(non_air.error());
-            manifest["non_air_blocks"] = non_air.value();
-            std::vector<water_structure::ChunkPos> positions;
-            for (std::int32_t x = 0; x < size.chunk_x_count(); ++x)
-                for (std::int32_t z = 0; z < size.chunk_z_count(); ++z) positions.push_back({ x, z });
-            auto chunks = structure.get_chunks(positions);
-            if (!chunks) throw std::runtime_error(chunks.error());
+            if (detail) {
+                const auto non_air = structure.count_non_air_blocks();
+                if (!non_air) throw std::runtime_error(non_air.error());
+                manifest["non_air_blocks"] = non_air.value();
+            }
+            JsonSpool chunk_spool("chunks");
+            JsonSpool entity_spool("entities");
             std::unordered_map<std::uint32_t, std::vector<std::uint8_t>> state_cache;
-            nlohmann::json chunk_list = nlohmann::json::array();
-            for (const auto pos : positions) {
+            std::size_t semantic_non_air = 0;
+            const auto start_x = detail ? detail->chunk_x : 0;
+            const auto end_x = detail ? detail->chunk_x + 1 : size.chunk_x_count();
+            const auto start_z = detail ? detail->chunk_z : 0;
+            const auto end_z = detail ? detail->chunk_z + 1 : size.chunk_z_count();
+            if (start_x < 0 || start_z < 0 || end_x > size.chunk_x_count() ||
+                end_z > size.chunk_z_count()) {
+                manifest["error"] = {
+                    { "category", "detail" },
+                    { "message", "detail chunk is outside structure bounds" }
+                };
+            }
+            for (std::int32_t x = start_x; !manifest.contains("error") && x < end_x; ++x) {
+                for (std::int32_t z = start_z; z < end_z; ++z) {
+                const water_structure::ChunkPos pos{ x, z };
                 nlohmann::json entry{ { "x", pos.x }, { "z", pos.z }, { "subchunks", nlohmann::json::array() } };
+                const auto chunks = structure.get_chunks(std::span<const water_structure::ChunkPos>(&pos, 1));
+                if (!chunks) throw std::runtime_error(chunks.error());
                 const auto chunk = chunks.value().find(pos);
                 if (chunk != chunks.value().end()) {
                     std::vector<std::int32_t> ys;
@@ -338,17 +518,14 @@ int main(int argc, char** argv)
                     std::sort(ys.begin(), ys.end());
                     for (const auto y : ys) {
                         const auto& sub = chunk->second.sub_chunks.at(y);
-                        const auto layer0_non_air = std::ranges::any_of(sub.layer0, [&](const auto value) {
-                            return value != registry.air_runtime_id();
-                        });
-                        const auto layer1_non_air = std::ranges::any_of(sub.layer1, [&](const auto value) {
-                            return value != registry.air_runtime_id();
-                        });
-                        if (!layer0_non_air && !layer1_non_air) continue;
+                        auto layer0 = summarize_layer(sub.layer0, registry, state_cache);
+                        auto layer1 = summarize_layer(sub.layer1, registry, state_cache);
+                        semantic_non_air += layer0.non_air + layer1.non_air;
+                        if (layer0.non_air == 0 && layer1.non_air == 0) continue;
                         entry["subchunks"].push_back({
                             { "y", y },
-                            { "layer0_sha256", layer_hash(sub.layer0, registry, state_cache) },
-                            { "layer1_sha256", layer_hash(sub.layer1, registry, state_cache) }
+                            { "layer0_sha256", std::move(layer0.hash) },
+                            { "layer1_sha256", std::move(layer1.hash) }
                         });
                         if (detail && detail->chunk_x == pos.x && detail->chunk_z == pos.z &&
                             detail->sub_y == y) {
@@ -385,14 +562,16 @@ int main(int argc, char** argv)
                         }
                     }
                 }
-                chunk_list.push_back(std::move(entry));
-            }
-            manifest["chunks"] = std::move(chunk_list);
-            auto entities = structure.get_chunk_nbt(positions);
-            if (!entities) throw std::runtime_error(entities.error());
-            nlohmann::json entity_list = nlohmann::json::array();
-            for (const auto& [_, values] : entities.value())
-                for (const auto& entity : values) {
+                chunk_spool.append(entry);
+                std::vector<nlohmann::json> local_entities;
+                if (!detail) {
+                    const auto entities = structure.get_chunk_nbt(
+                        std::span<const water_structure::ChunkPos>(&pos, 1));
+                    if (!entities) throw std::runtime_error(entities.error());
+                    const auto found_entities = entities.value().find(pos);
+                    if (found_entities != entities.value().end()) {
+                        local_entities.reserve(found_entities->second.size());
+                        for (const auto& entity : found_entities->second) {
                     auto canonical = water_structure::canonical_nbt(entity.payload);
                     if (!canonical) throw std::runtime_error(canonical.error());
                     auto fields = water_structure::canonical_nbt_fields(entity.payload);
@@ -405,13 +584,15 @@ int main(int argc, char** argv)
                             { "value_sha256", sha256(field.value) }
                         });
                     }
-                    entity_list.push_back({
+                    local_entities.push_back({
                         { "x", entity.pos.x }, { "y", entity.pos.y }, { "z", entity.pos.z },
                         { "nbt_sha256", sha256(canonical.value()) },
                         { "nbt_fields", std::move(field_list) }
                     });
+                        }
+                    }
                 }
-            std::sort(entity_list.begin(), entity_list.end(), [](const auto& a, const auto& b) {
+                std::sort(local_entities.begin(), local_entities.end(), [](const auto& a, const auto& b) {
                 return std::tuple{
                     a["x"].template get<std::int32_t>(),
                     a["y"].template get<std::int32_t>(),
@@ -423,13 +604,32 @@ int main(int argc, char** argv)
                     b["z"].template get<std::int32_t>(),
                     b["nbt_sha256"].template get<std::string>()
                 };
-            });
-            manifest["block_entities"] = std::move(entity_list);
+                });
+                for (const auto& entity : local_entities) entity_spool.append(entity);
+                }
+            }
+
+            if (!detail && !manifest.contains("error")) {
+                manifest["non_air_blocks"] = semantic_non_air;
+            }
+
+            // In detail mode the chunk spool contains one requested chunk, as
+            // in the historical manifest; entities are intentionally empty.
+            if (manifest.contains("error")) {
+                // Keep the parse/detail error object and omit partial arrays.
+                const auto failed = true;
+                write_manifest_stream(output_path, std::move(manifest),
+                    &chunk_spool, &entity_spool, false);
+                return failed ? 2 : 0;
+            }
+            const auto failed = false;
+            write_manifest_stream(output_path, std::move(manifest),
+                &chunk_spool, &entity_spool, true);
+            return failed ? 2 : 0;
         }
-        const auto text = manifest.dump(2) + "\n";
-        if (output_path) { std::ofstream output(*output_path, std::ios::binary | std::ios::trunc); output << text; if (!output) throw std::runtime_error("写入 manifest 失败"); }
-        else std::cout << text;
-        return manifest.contains("error") ? 2 : 0;
+        const auto failed = manifest.contains("error");
+        write_manifest_stream(output_path, std::move(manifest), nullptr, nullptr, false);
+        return failed ? 2 : 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 3;

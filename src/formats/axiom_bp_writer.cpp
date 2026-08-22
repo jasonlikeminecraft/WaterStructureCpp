@@ -167,14 +167,40 @@ std::string metadata_bytes(
 Result<void> write_axiom_bp(
     const IStructure& structure,
     RuntimeRegistry& registry,
-    const std::filesystem::path& output_path)
+    const std::filesystem::path& output_path,
+    const ConversionOptions& options)
 {
+    if (!options.allow_temporary_spool) {
+        return Result<void>::failure(
+            "capability error: AxiomBP writer 需要临时压缩块数据，allow_temporary_spool=false");
+    }
     const auto size = structure.size();
     if (size.width <= 0 || size.height <= 0 || size.length <= 0 ||
         size.volume() <= 0 || size.volume() > std::numeric_limits<std::int32_t>::max()) {
         return Result<void>::failure("AxiomBP 输出尺寸无效或体积超过 int32");
     }
 
+    const auto budget = options.soft_memory_budget_bytes;
+    if (budget < 64u * 1024u) {
+        return Result<void>::failure("AxiomBP writer soft_memory_budget 至少需要 64 KiB");
+    }
+    const auto chunk_count = static_cast<std::uint64_t>(size.chunk_x_count()) *
+        static_cast<std::uint64_t>(size.chunk_z_count());
+    if (options.max_in_flight_chunks != 0 &&
+        chunk_count > options.max_in_flight_chunks) {
+        return Result<void>::failure(
+            "AxiomBP writer 需要读取完整 chunk 集合，超过 max_in_flight_chunks；请增大窗口或使用流式目标");
+    }
+    const auto subchunk_count = static_cast<std::uint64_t>((size.height + 15) / 16);
+    // ChunkData stores one 4096-entry uint32 layer per subchunk.  This is a
+    // conservative admission check; the writer still uses the temporary file
+    // for compressed region payloads and never grows an unbounded output blob.
+    const auto estimated_chunk_bytes = std::max<std::uint64_t>(64u * 1024u,
+        subchunk_count * 4096u * sizeof(std::uint32_t) + 8u * 1024u);
+    if (chunk_count > 0 && estimated_chunk_bytes > budget / chunk_count) {
+        return Result<void>::failure(
+            "AxiomBP writer 需要的 chunk 窗口超过 soft_memory_budget；无法安全物化输入");
+    }
     std::vector<ChunkPos> positions;
     positions.reserve(static_cast<std::size_t>(size.chunk_x_count()) * size.chunk_z_count());
     for (int z = 0; z < size.chunk_z_count(); ++z) {

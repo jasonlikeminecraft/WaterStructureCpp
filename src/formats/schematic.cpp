@@ -11,33 +11,145 @@
 
 #include <cmath>
 #include <fstream>
-#include <array>
+#include <limits>
 #include <utility>
 
 namespace water_structure {
 
 namespace {
 
-const nbt::value* find_value(const nbt::tag_compound& compound, const char* key)
-{
-    return compound.has_key(key) ? &compound.at(key) : nullptr;
-}
+using NbtReader = nbt::io::stream_reader;
 
-nbt::value* find_value(nbt::tag_compound& compound, const char* key)
+void read_bytes(NbtReader& reader, std::int32_t count, std::int8_t* output = nullptr)
 {
-    return compound.has_key(key) ? &compound.at(key) : nullptr;
-}
-
-std::optional<std::int32_t> int_value(const nbt::value* value)
-{
-    if (!value) return std::nullopt;
-    switch (value->get_type()) {
-    case nbt::tag_type::Byte: return static_cast<std::int32_t>(value->as<nbt::tag_byte>().get());
-    case nbt::tag_type::Short: return static_cast<std::int32_t>(value->as<nbt::tag_short>().get());
-    case nbt::tag_type::Int: return value->as<nbt::tag_int>().get();
-    case nbt::tag_type::Long: return static_cast<std::int32_t>(value->as<nbt::tag_long>().get());
-    default: return std::nullopt;
+    if (count < 0) {
+        throw nbt::io::input_error("Invalid Schematic NBT payload length");
     }
+    auto& input = reader.get_istr();
+    constexpr std::streamsize buffer_size = 64 * 1024;
+    auto remaining = static_cast<std::streamsize>(count);
+    while (remaining > 0) {
+        const auto current = std::min(remaining, buffer_size);
+        if (output) {
+            input.read(reinterpret_cast<char*>(output), current);
+            output += current;
+        } else {
+            input.ignore(current);
+        }
+        if (!input) throw nbt::io::input_error("Unexpected end of Schematic NBT payload");
+        remaining -= current;
+    }
+}
+
+void skip_bytes(NbtReader& reader, std::int32_t count, std::size_t width)
+{
+    if (count < 0 || static_cast<std::uint64_t>(count) >
+            static_cast<std::uint64_t>(std::numeric_limits<std::streamsize>::max()) / width) {
+        throw nbt::io::input_error("Invalid Schematic NBT payload length");
+    }
+    auto bytes = static_cast<std::uint64_t>(count) * width;
+    while (bytes != 0) {
+        const auto current = static_cast<std::int32_t>(std::min<std::uint64_t>(
+            bytes, static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max())));
+        read_bytes(reader, current);
+        bytes -= static_cast<std::uint32_t>(current);
+    }
+}
+
+void skip_payload(NbtReader& reader, nbt::tag_type type)
+{
+    switch (type) {
+    case nbt::tag_type::Byte: skip_bytes(reader, 1, 1); break;
+    case nbt::tag_type::Short: skip_bytes(reader, 1, 2); break;
+    case nbt::tag_type::Int: skip_bytes(reader, 1, 4); break;
+    case nbt::tag_type::Long: skip_bytes(reader, 1, 8); break;
+    case nbt::tag_type::Float: skip_bytes(reader, 1, 4); break;
+    case nbt::tag_type::Double: skip_bytes(reader, 1, 8); break;
+    case nbt::tag_type::Byte_Array: {
+        std::int32_t count = 0;
+        reader.read_num(count);
+        skip_bytes(reader, count, 1);
+        break;
+    }
+    case nbt::tag_type::String:
+        (void)reader.read_string();
+        break;
+    case nbt::tag_type::List: {
+        const auto element_type = reader.read_type(true);
+        std::int32_t count = 0;
+        reader.read_num(count);
+        if (count < 0) throw nbt::io::input_error("Invalid Schematic list length");
+        for (std::int32_t index = 0; index < count; ++index) {
+            skip_payload(reader, element_type);
+        }
+        break;
+    }
+    case nbt::tag_type::Compound:
+        while (true) {
+            const auto child_type = reader.read_type(true);
+            if (child_type == nbt::tag_type::End) break;
+            (void)reader.read_string();
+            skip_payload(reader, child_type);
+        }
+        break;
+    case nbt::tag_type::Int_Array: {
+        std::int32_t count = 0;
+        reader.read_num(count);
+        skip_bytes(reader, count, 4);
+        break;
+    }
+    case nbt::tag_type::Long_Array: {
+        std::int32_t count = 0;
+        reader.read_num(count);
+        skip_bytes(reader, count, 8);
+        break;
+    }
+    default:
+        throw nbt::io::input_error("Invalid Schematic NBT payload type");
+    }
+}
+
+bool is_integer_type(nbt::tag_type type) noexcept
+{
+    return type == nbt::tag_type::Byte || type == nbt::tag_type::Short ||
+        type == nbt::tag_type::Int || type == nbt::tag_type::Long;
+}
+
+std::int32_t read_integer(NbtReader& reader, nbt::tag_type type)
+{
+    switch (type) {
+    case nbt::tag_type::Byte: {
+        std::int8_t value = 0;
+        reader.read_num(value);
+        return value;
+    }
+    case nbt::tag_type::Short: {
+        std::int16_t value = 0;
+        reader.read_num(value);
+        return value;
+    }
+    case nbt::tag_type::Int: {
+        std::int32_t value = 0;
+        reader.read_num(value);
+        return value;
+    }
+    case nbt::tag_type::Long: {
+        std::int64_t value = 0;
+        reader.read_num(value);
+        return static_cast<std::int32_t>(value);
+    }
+    default:
+        throw nbt::io::input_error("Schematic NBT value is not an integer");
+    }
+}
+
+void read_byte_array(NbtReader& reader, std::vector<std::int8_t>& output)
+{
+    std::int32_t count = 0;
+    reader.read_num(count);
+    if (count < 0) throw nbt::io::input_error("Invalid Schematic byte-array length");
+    output.resize(static_cast<std::size_t>(count));
+    read_bytes(reader, count, output.data());
 }
 
 } // namespace
@@ -60,34 +172,79 @@ Result<void> SchematicStructure::read(const std::filesystem::path& path)
     }
     try {
         zlib::izlibstream decompressed(input);
-        const auto [root_name, root] = nbt::io::read_compound(decompressed, endian::big);
-        if (root_name != "Schematic") {
+        NbtReader reader(decompressed, endian::big);
+        if (reader.read_type() != nbt::tag_type::Compound || reader.read_string() != "Schematic") {
             return Result<void>::failure("Schematic 根标签名称不是 Schematic");
         }
-        mOriginalSize = {
-            int_value(find_value(*root, "Width")).value_or(0),
-            int_value(find_value(*root, "Height")).value_or(0),
-            int_value(find_value(*root, "Length")).value_or(0)
-        };
+
+        mOriginalSize = {};
+        mBlocks.clear();
+        mData.clear();
+        bool saw_width = false;
+        bool saw_height = false;
+        bool saw_length = false;
+        bool saw_blocks = false;
+        bool saw_data = false;
+        bool has_blocks = false;
+        bool has_data = false;
+        while (true) {
+            const auto type = reader.read_type(true);
+            if (type == nbt::tag_type::End) break;
+            const auto key = reader.read_string();
+            if (key == "Width" && !std::exchange(saw_width, true)) {
+                if (is_integer_type(type)) mOriginalSize.width = read_integer(reader, type);
+                else skip_payload(reader, type);
+            } else if (key == "Height" && !std::exchange(saw_height, true)) {
+                if (is_integer_type(type)) mOriginalSize.height = read_integer(reader, type);
+                else skip_payload(reader, type);
+            } else if (key == "Length" && !std::exchange(saw_length, true)) {
+                if (is_integer_type(type)) mOriginalSize.length = read_integer(reader, type);
+                else skip_payload(reader, type);
+            } else if (key == "Blocks" && !std::exchange(saw_blocks, true)) {
+                if (type == nbt::tag_type::Byte_Array) {
+                    read_byte_array(reader, mBlocks);
+                    has_blocks = true;
+                } else {
+                    skip_payload(reader, type);
+                }
+            } else if (key == "Data" && !std::exchange(saw_data, true)) {
+                if (type == nbt::tag_type::Byte_Array) {
+                    read_byte_array(reader, mData);
+                    has_data = true;
+                } else {
+                    skip_payload(reader, type);
+                }
+            } else {
+                skip_payload(reader, type);
+            }
+        }
         if (mOriginalSize.width <= 0 || mOriginalSize.height <= 0 || mOriginalSize.length <= 0) {
             return Result<void>::failure("Schematic 尺寸无效");
         }
-        auto* blocks = find_value(*root, "Blocks");
-        auto* data = find_value(*root, "Data");
-        if (!blocks || !data || blocks->get_type() != nbt::tag_type::Byte_Array ||
-            data->get_type() != nbt::tag_type::Byte_Array) {
+        if (!has_blocks || !has_data) {
             return Result<void>::failure("Schematic 缺少 Blocks 或 Data 字节数组");
         }
-        // Move the large NBT arrays out of the temporary document instead of
-        // keeping a second copy until the root compound is destroyed.
-        mBlocks = std::move(blocks->as<nbt::tag_byte_array>().get());
-        mData = std::move(data->as<nbt::tag_byte_array>().get());
         const auto volume = static_cast<std::size_t>(mOriginalSize.volume());
         if (mBlocks.size() != volume || mData.size() != volume) {
             return Result<void>::failure("Schematic Blocks/Data 长度与尺寸不一致");
         }
         if (!mRegistry.schematic_runtime_id(0, 0)) {
             return Result<void>::failure("尚未加载 assets/block_mappings_v1.json 中的 Schematic 映射");
+        }
+        constexpr std::size_t legacy_pair_count = 256 * 256;
+        mRuntimeCache.assign(legacy_pair_count, 0);
+        mRuntimeCacheState.assign(legacy_pair_count, 0);
+        for (std::size_t index = 0; index < volume; ++index) {
+            const auto block_id = static_cast<std::uint8_t>(mBlocks[index]);
+            const auto data = static_cast<std::uint8_t>(mData[index]);
+            const auto cache_index = static_cast<std::size_t>(block_id) * 256 + data;
+            if (mRuntimeCacheState[cache_index] != 0) continue;
+            if (const auto runtime_id = mRegistry.schematic_runtime_id(block_id, data)) {
+                mRuntimeCache[cache_index] = *runtime_id;
+                mRuntimeCacheState[cache_index] = 1;
+            } else {
+                mRuntimeCacheState[cache_index] = 2;
+            }
         }
         set_offset({});
         return Result<void>::success();
@@ -115,25 +272,15 @@ Result<ChunkMap> SchematicStructure::get_chunks_impl(
         result.emplace(pos, ChunkData{});
     }
 
-    // Resolve each legacy block/data pair once per batch. The old path also
-    // scanned the complete source array for every requested chunk batch.
-    std::array<std::uint32_t, 256 * 256> runtime_cache{};
-    std::array<bool, 256 * 256> runtime_cached{};
     const auto runtime_for = [&](std::uint8_t block_id, std::uint8_t data)
         -> Result<std::uint32_t> {
         const auto cache_index = static_cast<std::size_t>(block_id) * 256 + data;
-        if (runtime_cached[cache_index]) {
-            return Result<std::uint32_t>::success(runtime_cache[cache_index]);
-        }
-        const auto runtime_id = mRegistry.schematic_runtime_id(block_id, data);
-        if (!runtime_id) {
+        if (cache_index >= mRuntimeCacheState.size() || mRuntimeCacheState[cache_index] != 1) {
             return Result<std::uint32_t>::failure(
                 "Schematic 方块映射缺失: id=" + std::to_string(block_id) +
                 ", data=" + std::to_string(data));
         }
-        runtime_cache[cache_index] = *runtime_id;
-        runtime_cached[cache_index] = true;
-        return Result<std::uint32_t>::success(*runtime_id);
+        return Result<std::uint32_t>::success(mRuntimeCache[cache_index]);
     };
 
     const auto width = mOriginalSize.width;

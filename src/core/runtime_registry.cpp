@@ -1,5 +1,7 @@
 #include <WaterStructure/runtime_registry.hpp>
 
+#include <BedrockWorldOperator/BedrockWorldOperator.hpp>
+
 #include <nlohmann/json.hpp>
 
 #include <algorithm>

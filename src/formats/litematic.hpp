@@ -37,7 +37,10 @@ private:
     BlockPos mOffset{};
     BlockPos mRegionOrigin{};
     std::vector<std::uint32_t> mPalette;
-    std::vector<std::uint64_t> mPackedStates;
+    // libnbt stores TAG_Long_Array as int64_t.  Keeping the same element type
+    // lets read() move the dense array out of the temporary NBT tree instead
+    // of allocating and copying a second full block-state buffer.
+    std::vector<std::int64_t> mPackedStates;
     std::vector<BlockEntity> mBlockEntities;
     std::uint8_t mBitsPerBlock = 2;
     std::size_t mNonAirBlocks = 0;

@@ -5,7 +5,10 @@
 #include <WaterStructure/structure.hpp>
 
 #include <filesystem>
+#include <condition_variable>
+#include <atomic>
 #include <functional>
+#include <mutex>
 #include <span>
 #include <string>
 #include <unordered_map>
@@ -16,6 +19,7 @@ namespace water_structure {
 class BdxStructure final : public IStructure {
 public:
     explicit BdxStructure(RuntimeRegistry& registry) : mRegistry(registry) {}
+    ~BdxStructure() override;
     StructureId id() const noexcept override { return StructureId::BDX; }
     std::string_view name() const noexcept override { return "BDX"; }
     Size size() const noexcept override { return mSize; }
@@ -29,6 +33,14 @@ public:
     Result<void> read_from_world(WorldSource&, BlockBox, ConversionCallbacks) override;
     const std::string& author() const noexcept { return mAuthor; }
     void set_streaming_world_import(bool enabled) noexcept { mBoundsOnly = enabled; }
+    // Configure the bounded placement spool used by random-access chunk
+    // requests.  The settings are intentionally format-local; the registry
+    // can propagate the public OpenOptions when it opens a BDX reader.
+    void set_streaming_options(
+        bool allow_temporary_spool,
+        std::filesystem::path temporary_directory,
+        std::size_t temporary_file_limit_bytes);
+    std::size_t temporary_spool_bytes() const noexcept;
 
 private:
     struct ZRunConsumerRef {
@@ -72,6 +84,33 @@ private:
     bool mBoundsOnly = false;
     std::function<void(BlockPos, std::uint32_t)> mBlockConsumer;
     ZRunConsumerRef mZRunConsumer;
+    // Placement callbacks include air.  They are kept separate from the
+    // historical non-air consumers above so world import semantics remain
+    // unchanged while the random-access spool preserves last-wins updates.
+    std::function<void(BlockPos, std::uint32_t)> mPlacementConsumer;
+    ZRunConsumerRef mPlacementZRunConsumer;
+
+    // A BDX stream has no seekable command index after Brotli decoding.  The
+    // first random-access request therefore creates a bounded, sharded spool
+    // of fixed-size placement records.  Subsequent requests read only the
+    // shards that can contain the requested chunk columns.
+    mutable std::mutex mPlacementSpoolMutex;
+    mutable std::condition_variable mPlacementSpoolCv;
+    mutable std::atomic<bool> mPlacementSpoolReady{false};
+    mutable bool mPlacementSpoolBuilding = false;
+    mutable bool mPlacementSpoolInvalidating = false;
+    mutable std::size_t mPlacementSpoolReaders = 0;
+    mutable std::string mPlacementSpoolError;
+    mutable std::filesystem::path mPlacementSpoolDirectory;
+    mutable std::vector<std::filesystem::path> mPlacementShardPaths;
+    mutable std::size_t mPlacementSpoolBytes = 0;
+    bool mAllowTemporarySpool = true;
+    std::filesystem::path mTemporaryDirectory{};
+    std::size_t mTemporaryFileLimitBytes = 0;
+
+    Result<void> ensure_placement_spool() const;
+    void invalidate_placement_spool() const noexcept;
+    void cleanup_placement_spool() const noexcept;
 };
 
 } // namespace water_structure

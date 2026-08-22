@@ -10,6 +10,8 @@
 #include <tag_string.h>
 
 #include <fstream>
+#include <algorithm>
+#include <cstdint>
 #include <sstream>
 #include <unordered_map>
 
@@ -62,11 +64,32 @@ void put_property(nbt::tag_compound& states, const BlockStateProperty& property)
 Result<void> write_mcstructure(
     const IStructure& structure,
     RuntimeRegistry& registry,
-    const std::filesystem::path& output_path)
+    const std::filesystem::path& output_path,
+    const ConversionOptions& options)
 {
     const auto size = structure.size();
     if (size.width <= 0 || size.height <= 0 || size.length <= 0 || size.volume() > INT32_MAX) {
         return Result<void>::failure("MCStructure 输出尺寸无效或体积超过 int32");
+    }
+    const auto budget = options.soft_memory_budget_bytes;
+    if (budget < 64u * 1024u) {
+        return Result<void>::failure("MCStructure writer soft_memory_budget 至少需要 64 KiB");
+    }
+    const auto chunk_count = static_cast<std::uint64_t>(size.chunk_x_count()) *
+        static_cast<std::uint64_t>(size.chunk_z_count());
+    if (options.max_in_flight_chunks != 0 &&
+        chunk_count > options.max_in_flight_chunks) {
+        return Result<void>::failure(
+            "MCStructure writer 需要读取完整 chunk 集合，超过 max_in_flight_chunks");
+    }
+    const auto estimated_subchunks = static_cast<std::uint64_t>((size.height + 15) / 16);
+    const auto estimated_chunk_bytes = std::max<std::uint64_t>(64u * 1024u,
+        estimated_subchunks * 4096u * sizeof(std::uint32_t) * 2u + 8u * 1024u);
+    // The two block-index layers are emitted directly, but get_chunks() keeps
+    // the source window resident until both layers are encoded.
+    if (chunk_count * estimated_chunk_bytes > budget) {
+        return Result<void>::failure(
+            "MCStructure writer 的 chunk 窗口超过 soft_memory_budget");
     }
     std::vector<ChunkPos> positions;
     for (int x = 0; x < size.chunk_x_count(); ++x) {

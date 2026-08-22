@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -36,10 +37,28 @@ struct Size {
     std::int32_t height = 0;
     std::int32_t length = 0;
 
-    std::int32_t chunk_x_count() const noexcept { return (width + 15) / 16; }
-    std::int32_t chunk_z_count() const noexcept { return (length + 15) / 16; }
+    // Avoid `width + 15`: dimensions originate in untrusted files and a
+    // near-INT32_MAX value would wrap before the division.  Non-positive
+    // dimensions represent an empty/invalid structure and therefore expose
+    // no chunk columns.
+    std::int32_t chunk_x_count() const noexcept {
+        if (width <= 0) return 0;
+        return width / 16 + (width % 16 != 0 ? 1 : 0);
+    }
+    std::int32_t chunk_z_count() const noexcept {
+        if (length <= 0) return 0;
+        return length / 16 + (length % 16 != 0 ? 1 : 0);
+    }
     std::int64_t volume() const noexcept {
-        return static_cast<std::int64_t>(width) * height * length;
+        if (width <= 0 || height <= 0 || length <= 0) return 0;
+        constexpr auto max_value = std::numeric_limits<std::int64_t>::max();
+        const auto w = static_cast<std::int64_t>(width);
+        const auto h = static_cast<std::int64_t>(height);
+        const auto l = static_cast<std::int64_t>(length);
+        if (w > max_value / h) return max_value;
+        const auto wh = w * h;
+        if (wh > max_value / l) return max_value;
+        return wh * l;
     }
 };
 

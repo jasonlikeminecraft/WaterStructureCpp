@@ -6,7 +6,19 @@ import (
 	"testing"
 
 	"github.com/Yeah114/WaterStructure/structure"
+	legacyblocks "github.com/Yeah114/blocks"
 )
+
+func TestRuntimeBlockStateAcceptsLegacyReaderRuntimeIDs(t *testing.T) {
+	runtimeID, found := legacyblocks.LegacyBlockToRuntimeID("minecraft:command_block", 0)
+	if !found {
+		t.Fatal("legacy command block is missing from the oracle registry")
+	}
+	name, _, found := runtimeBlockState(runtimeID)
+	if !found || name == "" {
+		t.Fatalf("legacy runtime ID %d did not resolve", runtimeID)
+	}
+}
 
 func TestCanonicalBlockStateSortsPropertiesAndPreservesTypes(t *testing.T) {
 	first := canonicalBlockState{

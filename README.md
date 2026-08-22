@@ -89,6 +89,10 @@ streaming `to_world` path. The optional `ws_convert_with_progress()` and
 without changing the original blocking functions. New functions are appended
 without changing existing structures or ownership rules.
 
+Only the opaque C ABI is binary-stable across shared-library updates. The
+native C++23 API uses STL types and may grow option/capability structures, so
+C++ consumers must rebuild against the matching headers and library version.
+
 WaterStructureCpp 是一个面向 Minecraft 建筑结构文件的 C++23 解析、转换与
 Bedrock 世界读写库。项目注册了 37 种结构格式，并提供静态库、命令行工具、
 测试和性能基准；格式兼容性仍在通过真实样本进行逐项验证。
@@ -217,15 +221,19 @@ palette 升级与文本编码仅执行一次。乌托邦 Schem 实测由最初�
 
 ## 性能与内存
 
-流式处理是所有转换器的默认行为：reader 按命令、chunk 或 subchunk 读取，writer
-按批次写出；不会因为输入地图很大而把完整方块数组长期留在内存中。下面是当前
-Release 构建在本机实测的端到端结果，数字用于比较转换器量级，不是硬件保证值。
+所有转换默认使用有界 chunk/subchunk 输出管线和背压，writer 按批次提交，不会在
+公共管线中积压完整世界。reader 的流式程度按格式区分：MCWorld、SchemV1/V2、BDX
+以及 Construction 已有原生的按 chunk/section 路径；IBImport、MCFunction、TIBI、
+BCF 等保留紧凑命令或 cuboid 索引后按请求 chunk 展开。仍使用完整 JSON/NBT DOM 的
+格式不会标记为 native streaming，必须通过 500 MiB runner 后才算大样本验收完成。
+下面是当前 Release 构建在本机实测的端到端结果，数字用于比较转换器量级，不是
+硬件保证值。
 
 | 转换方向 | 测试样本 | 输出 | 耗时 | 峰值私有内存 |
 | --- | --- | --- | ---: | ---: |
 | MCWorld → SchemV1 | 乌托邦，`2701×176×2701`，约 2.86 万 chunk 柱 | `.schem` | 约 29.3 秒 | 约 175 MiB（工作集约 348 MiB） |
 | MCWorld → MCFunction | 同上 | `.mcfunction` | 约 13 秒（palette 流水线，本机复测；generic 路径约 16 秒） | 约 154 MiB |
-| MCFunction → MCWorld | 乌托邦，1.05 GiB、约 1636 万条命令 | 世界目录 | 约 13.25 秒（优化前约 100 秒） | 私有内存约 755 MiB（工作集约 670 MiB） |
+| MCFunction → MCWorld | 乌托邦，1.05 GiB、约 1636 万条命令 | 世界目录 | 约 13.25 秒（优化前约 100 秒） | 未受限历史基准：私有内存约 755 MiB（工作集约 670 MiB） |
 | MCWorld → IBImport | chenshi，`2716×342×2245` | `.ibi` | 约 10–12 秒（palette 流水线，3 个编码线程） | 私有内存约 136 MiB（工作集约 290 MiB） |
 | Schem → IBImport | 乌托邦，`2701×176×2701` | `.ibi`（818.4 MiB） | 约 44–46 秒（共享 palette 流水线，3 个编码线程） | 私有内存/工作集约 144 MiB |
 | MCWorld → BDX | Kuudra，`188×175×185`，270.6 万非空气方块 | `.bdx` | 约 1.49 秒 | 约 152 MiB |
@@ -248,10 +256,50 @@ IBImport 的同一 chenshi 样本在纯 `setblock` 版本中耗时约 289.4 秒�
 队列保持三线程编码结果的确定顺序，端到端约 10–12 秒；相对最初版本速度约提升
 24–29 倍、文件体积减少约 93%。优化前后输出 SHA-256 一致，峰值内存基本不变。
 
-已经支持的 JSON、MessagePack、NBT、BDX、IBImport、MCFunction 等格式都走相同的
-有界 chunk/subchunk 管线；但没有大型真实样本的格式目前只有最小 fixture 的测试
-耗时，不能与上表的大地图转换时间直接比较。详细的测试命令、样本和阶段 profile
-记录在 [docs/parser_optimization.md](docs/parser_optimization.md)。
+所有已支持格式的输出都接入相同的有界 chunk/subchunk 管线；这不等于每个输入
+parser 都已做到常量内存。没有大型真实样本的格式目前只有最小 fixture 的测试耗时，
+不能与上表的大地图转换时间直接比较。详细的测试命令、样本和阶段 profile 记录在
+[docs/parser_optimization.md](docs/parser_optimization.md)。
+
+上表中的旧历史数据并不等同于 500 MiB 验收通过。大样本验收必须通过
+`tools/limited_runner` 在独立子进程中执行，默认（且允许的最大值）为 500 MiB；
+超过限制会立即以 `LIMIT_EXCEEDED` 终止并记录阶段，而不是在结束后才报警。受限
+运行的峰值、CPU、解码/编码、LevelDB 和归档阶段数据以 runner JSON 为准。未重新
+测量的历史条目会明确标注“未受限”，不会被当作新的内存保证。
+
+## 兼容性验收工具
+
+能力矩阵由 registry 自动生成，不维护第二份格式列表。以下检查会验证 37 种格式的
+1369 条文件边、36 个 reader、11 个已验证 writer，以及缺少 writer 时返回明确的
+capability error：
+
+```powershell
+.\tools\capability_edge_matrix.ps1 `
+  -CliPath .\build\windows\x64\release\water_structure_cli.exe `
+  -ReportPath .\build\reports\capability.json
+```
+
+小 fixture 的全部已验证 writer 可以在同一检查中执行，并由每个独立进程的 500 MiB
+Job Object 限制保护：
+
+```powershell
+.\tools\capability_edge_matrix.ps1 `
+  -CliPath .\build\windows\x64\release\water_structure_cli.exe `
+  -FixturePath .\tmp-cli-test.schem -AssetsPath .\assets `
+  -OutputDirectory .\build\reports\edge `
+  -LimitedRunner .\tools\limited_runner\limited_runner.exe `
+  -Execute -ProbeUnsupported
+```
+
+`test_world_export.ps1` 会将同一个 reader 分别写入目录世界和 `.mcworld`，再用分块
+`world_compare` 比较区块、子区块、方块状态和方块实体；`run_world_export_matrix.ps1`
+可对一组 fixture 批量执行。`test_writer_roundtrips.ps1` 对每个已验证 writer 执行
+`A -> B -> A` 与 `B -> A -> B`，比较时只忽略不同输入文件的 SHA-256，绝不忽略尺寸、
+offset、方块或 NBT 语义。
+
+所有 manifest 和比较工具都按 JSON token/区块流式处理。大样本不要使用
+`ConvertFrom-Json` 载入完整 manifest；使用 `tools/run_manifest_matrix.ps1` 和
+`tools/diff_manifest.ps1`，并保留 `-MemoryLimitMiB 500` 的默认上限。
 
 可用以下命令查看阶段耗时：
 

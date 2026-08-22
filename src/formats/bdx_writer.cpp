@@ -27,9 +27,13 @@ constexpr std::uint32_t kBrotliQuality = 6;
 
 class BrotliCommandWriter final {
 public:
-    explicit BrotliCommandWriter(const std::filesystem::path& path)
-        : mFileBuffer(kFileBufferSize),
-          mOutputBuffer(kCommandBufferSize),
+    explicit BrotliCommandWriter(
+        const std::filesystem::path& path,
+        std::size_t command_buffer_size = kCommandBufferSize,
+        std::size_t file_buffer_size = kFileBufferSize)
+        : mCommandBufferLimit(std::max<std::size_t>(command_buffer_size, 4096)),
+          mFileBuffer(std::max<std::size_t>(file_buffer_size, 4096)),
+          mOutputBuffer(mCommandBufferLimit),
           mEncoder(BrotliEncoderCreateInstance(nullptr, nullptr, nullptr),
               &BrotliEncoderDestroyInstance)
     {
@@ -38,7 +42,7 @@ public:
                 mEncoder.get(), BROTLI_PARAM_QUALITY, kBrotliQuality) != BROTLI_TRUE) {
             throw std::runtime_error("无法设置 BDX Brotli quality");
         }
-        mStaging.reserve(kCommandBufferSize);
+        mStaging.reserve(mCommandBufferLimit);
         mOutput.rdbuf()->pubsetbuf(
             mFileBuffer.data(), static_cast<std::streamsize>(mFileBuffer.size()));
         mOutput.open(path, std::ios::binary | std::ios::trunc);
@@ -49,15 +53,15 @@ public:
 
     void append_byte(std::uint8_t value)
     {
-        if (mStaging.size() == kCommandBufferSize) flush_staging();
+        if (mStaging.size() == mCommandBufferLimit) flush_staging();
         mStaging.push_back(value);
     }
 
     void append(std::span<const std::uint8_t> bytes)
     {
         while (!bytes.empty()) {
-            if (mStaging.size() == kCommandBufferSize) flush_staging();
-            const auto count = std::min(bytes.size(), kCommandBufferSize - mStaging.size());
+            if (mStaging.size() == mCommandBufferLimit) flush_staging();
+            const auto count = std::min(bytes.size(), mCommandBufferLimit - mStaging.size());
             mStaging.insert(mStaging.end(), bytes.begin(), bytes.begin() + count);
             bytes = bytes.subspan(count);
         }
@@ -119,6 +123,7 @@ private:
                  BrotliEncoderHasMoreOutput(mEncoder.get()) == BROTLI_TRUE);
     }
 
+    std::size_t mCommandBufferLimit = 0;
     std::vector<char> mFileBuffer;
     std::vector<std::uint8_t> mStaging;
     std::vector<std::uint8_t> mOutputBuffer;
@@ -149,7 +154,7 @@ void append_cstring(BrotliCommandWriter& output, std::string_view value)
 
 void append_move_axis(
     BrotliCommandWriter& output,
-    std::int32_t difference,
+    std::int64_t difference,
     std::uint8_t increment,
     std::uint8_t decrement,
     std::uint8_t int8_command,
@@ -157,6 +162,21 @@ void append_move_axis(
     std::uint8_t int32_command)
 {
     if (difference == 0) return;
+    // A pair of int32 coordinates can be farther apart than one signed int32
+    // delta. Emit bounded moves until the remainder is representable instead
+    // of overflowing `target - cursor` before command selection.
+    while (difference > std::numeric_limits<std::int32_t>::max()) {
+        output.append_byte(int32_command);
+        append_u32(output, static_cast<std::uint32_t>(
+            std::numeric_limits<std::int32_t>::max()));
+        difference -= std::numeric_limits<std::int32_t>::max();
+    }
+    while (difference < std::numeric_limits<std::int32_t>::min()) {
+        output.append_byte(int32_command);
+        append_u32(output, static_cast<std::uint32_t>(
+            std::numeric_limits<std::int32_t>::min()));
+        difference -= std::numeric_limits<std::int32_t>::min();
+    }
     if (difference == 1) {
         output.append_byte(increment);
     } else if (difference == -1) {
@@ -177,9 +197,12 @@ void append_move_axis(
 
 void append_move(BrotliCommandWriter& output, BlockPos& cursor, BlockPos target)
 {
-    append_move_axis(output, target.x - cursor.x, 14, 15, 28, 20, 21);
-    append_move_axis(output, target.y - cursor.y, 16, 17, 29, 22, 23);
-    append_move_axis(output, target.z - cursor.z, 18, 19, 30, 24, 25);
+    append_move_axis(output,
+        static_cast<std::int64_t>(target.x) - cursor.x, 14, 15, 28, 20, 21);
+    append_move_axis(output,
+        static_cast<std::int64_t>(target.y) - cursor.y, 16, 17, 29, 22, 23);
+    append_move_axis(output,
+        static_cast<std::int64_t>(target.z) - cursor.z, 18, 19, 30, 24, 25);
     cursor = target;
 }
 
@@ -231,20 +254,51 @@ const BlockLayer* layer_at(const ChunkMap& chunks, ChunkPos chunk, std::int32_t 
 Result<void> write_bdx(
     const IStructure& structure,
     RuntimeRegistry& registry,
-    const std::filesystem::path& output_path)
+    const std::filesystem::path& output_path,
+    const ConversionOptions& options)
 {
     try {
         const auto size = structure.size();
         if (size.width <= 0 || size.height <= 0 || size.length <= 0) {
             return Result<void>::failure("BDX writer: 结构尺寸无效");
         }
-        BrotliCommandWriter output(output_path);
+        const auto budget = options.soft_memory_budget_bytes;
+        if (budget < 64u * 1024u) {
+            return Result<void>::failure("BDX writer soft_memory_budget 至少需要 64 KiB");
+        }
+        const auto requested_batch = options.max_in_flight_chunks == 0
+            ? kChunkBatchSize
+            : std::max<std::size_t>(1, options.max_in_flight_chunks);
+        const auto subchunk_count = static_cast<std::uint64_t>(
+            (static_cast<std::int64_t>(size.height) + 15) / 16);
+        constexpr std::uint64_t kChunkOverheadBytes = 64u * 1024u;
+        constexpr std::uint64_t kSubchunkBytes =
+            2ull * 4096ull * sizeof(std::uint32_t);
+        if (subchunk_count >
+            (std::numeric_limits<std::uint64_t>::max() - kChunkOverheadBytes) /
+                kSubchunkBytes) {
+            return Result<void>::failure("BDX writer chunk memory estimate overflow");
+        }
+        const auto estimated_chunk_bytes = static_cast<std::size_t>(std::min<std::uint64_t>(
+            kChunkOverheadBytes + subchunk_count * kSubchunkBytes,
+            std::numeric_limits<std::size_t>::max()));
+        const auto budget_batch = (budget / 2) / std::max<std::size_t>(1, estimated_chunk_bytes);
+        if (budget_batch == 0) {
+            return Result<void>::failure(
+                "BDX writer 单 chunk 超过 soft_memory_budget");
+        }
+        const auto batch_size = std::min({
+            kChunkBatchSize, requested_batch, budget_batch });
+        const auto buffer_budget = std::max<std::size_t>(4096, budget / 8);
+        BrotliCommandWriter output(output_path,
+            std::min<std::size_t>(kCommandBufferSize, buffer_budget),
+            std::min<std::size_t>(kFileBufferSize, buffer_budget));
         output.append_text("BDX");
         output.append_byte(0);
         output.append_byte(0);
 
         std::vector<ChunkPos> positions;
-        positions.reserve(kChunkBatchSize);
+        positions.reserve(batch_size);
         std::unordered_map<std::uint32_t, std::pair<std::uint16_t, std::uint16_t>> palette;
         BlockPos cursor{};
         auto place = [&](std::uint32_t runtime_id, BlockPos position) -> Result<void> {
@@ -274,10 +328,10 @@ Result<void> write_bdx(
         for (std::int32_t chunk_z = 0; chunk_z < size.chunk_z_count(); ++chunk_z) {
             for (std::int32_t batch_x = 0;
                  batch_x < size.chunk_x_count();
-                 batch_x += static_cast<std::int32_t>(kChunkBatchSize)) {
+                 batch_x += static_cast<std::int32_t>(batch_size)) {
                 const auto batch_end = std::min<std::int32_t>(
                     size.chunk_x_count(),
-                    batch_x + static_cast<std::int32_t>(kChunkBatchSize));
+                    batch_x + static_cast<std::int32_t>(batch_size));
                 positions.clear();
                 for (auto chunk_x = batch_x; chunk_x < batch_end; ++chunk_x) {
                     positions.push_back({ chunk_x, chunk_z });

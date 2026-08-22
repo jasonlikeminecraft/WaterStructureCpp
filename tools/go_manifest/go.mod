@@ -5,13 +5,18 @@ go 1.25.5
 require (
 	github.com/TriM-Organization/bedrock-world-operator v1.4.0
 	github.com/Yeah114/WaterStructure v0.0.0
+	github.com/Yeah114/blocks v0.0.0-20251025181709-54ab0b294dfe
 )
+
+// The oracle module is private and has no fetchable v0.0.0 release. Build
+// with ../build_go_manifest.ps1 and an explicit -OracleRoot; that script adds
+// version-specific replacements in a temporary go.work without modifying the
+// Go/Fatalder source tree.
 
 require (
 	github.com/Happy2018new/worldupgrader v1.1.0 // indirect
 	github.com/TriM-Organization/merry-memory v0.2.0 // indirect
 	github.com/Yeah114/bdump v0.0.0-00010101000000-000000000000 // indirect
-	github.com/Yeah114/blocks v0.0.0-20251025181709-54ab0b294dfe // indirect
 	github.com/andybalholm/brotli v1.2.0 // indirect
 	github.com/bongnv/go-container v0.1.0 // indirect
 	github.com/deatil/go-cryptobin v1.1.1005 // indirect
@@ -34,7 +39,3 @@ require (
 	golang.org/x/crypto v0.39.0 // indirect
 	golang.org/x/sys v0.35.0 // indirect
 )
-
-replace github.com/Yeah114/WaterStructure => ../../../TemplateNew/Fatalder/modules/WaterStructure
-
-replace github.com/Yeah114/bdump => ../../../TemplateNew/Fatalder/modules/WaterStructure/modules/bdump

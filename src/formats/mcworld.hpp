@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <optional>
 #include <unordered_map>
+#include <utility>
 
 namespace water_structure {
 
@@ -19,6 +20,15 @@ public:
     Size size() const noexcept override { return mSize; }
     BlockPos offset() const noexcept override { return mOffset; }
     void set_offset(BlockPos offset) noexcept override;
+    void set_archive_options(
+        bool allow_temporary_spool,
+        std::filesystem::path temporary_directory,
+        std::size_t temporary_file_limit_bytes)
+    {
+        mAllowTemporarySpool = allow_temporary_spool;
+        mTemporaryDirectory = std::move(temporary_directory);
+        mTemporaryFileLimitBytes = temporary_file_limit_bytes;
+    }
 
     Result<void> read(const std::filesystem::path& path) override;
     Result<ChunkMap> get_chunks(std::span<const ChunkPos> positions) const override;
@@ -48,6 +58,9 @@ private:
     std::optional<BedrockWorldAdapter> mWorld;
     mutable std::unordered_map<ChunkPos, ChunkData, ChunkPosHash> mChunkCache;
     mutable bool mChunkCacheHasLayer1 = false;
+    bool mAllowTemporarySpool = true;
+    std::filesystem::path mTemporaryDirectory;
+    std::size_t mTemporaryFileLimitBytes = 0;
 };
 
 } // namespace water_structure

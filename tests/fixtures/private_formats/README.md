@@ -15,7 +15,7 @@ Run the Go/C++ acceptance matrix from the project root:
 tools\run_manifest_matrix.ps1 `
   -CaseFile tools\manifest_private_cases.json `
   -OutputDirectory tmp-cli\private-matrix `
-  -MemoryLimitMiB 2048 `
+  -MemoryLimitMiB 500 `
   -Force
 ```
 

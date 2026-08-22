@@ -12,6 +12,9 @@ def main() -> None:
     args = parser.parse_args()
 
     assert water_structure.abi_version() == 1
+    capabilities = water_structure.formats()
+    assert len(capabilities) == 37
+    assert all(item.name for item in capabilities)
     with water_structure.Context() as context:
         detected = context.format(args.fixture)
         info = context.inspect(args.fixture)

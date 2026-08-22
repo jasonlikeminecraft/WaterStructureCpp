@@ -7,45 +7,84 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <charconv>
 #include <cctype>
+#include <chrono>
+#include <cstdlib>
 #include <fstream>
+#include <functional>
 #include <limits>
 #include <optional>
+#include <random>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
+#include <unordered_map>
 #include <utility>
 
 namespace water_structure {
 namespace {
 
 constexpr std::size_t kHeaderSize = 15;
-constexpr std::size_t kMaxDecodedBytes = 2ull * 1024 * 1024 * 1024;
+constexpr std::size_t kAbsoluteMaxDecodedBytes = 2ull * 1024 * 1024 * 1024;
+constexpr std::size_t kInflateWindowBytes = 64u * 1024u;
+constexpr std::size_t kMinimumMemoryBudget = 512u * 1024u;
+constexpr std::size_t kReaderWorkingSetReserve = 256u * 1024u;
+constexpr std::size_t kEstimatedRuntimeCacheEntryBytes = 64;
+constexpr std::uint64_t kMaxTableEntries = 4'000'000;
+constexpr std::uint64_t kMaxCommands = 4'000'000;
+constexpr std::uint64_t kMaxMaterializedBlocksPerRequest = 16'000'000;
+constexpr std::size_t kMaxRuntimeCacheEntries = 65'536;
+constexpr std::size_t kMaxIndexEntries = 500'000;
+constexpr std::size_t kMaxStateProperties = 128;
 
-std::vector<std::uint8_t> read_file(const std::filesystem::path& path)
+std::optional<std::size_t> legacy_decoded_limit()
 {
-    std::ifstream input(path, std::ios::binary | std::ios::ate);
-    if (!input) throw std::runtime_error("cannot open TIBI file: " + path.string());
-    const auto end = input.tellg();
-    if (end <= 0 || static_cast<std::uint64_t>(end) > kMaxDecodedBytes) {
-        throw std::runtime_error("TIBI compressed size is invalid");
-    }
-    std::vector<std::uint8_t> bytes(static_cast<std::size_t>(end));
-    input.seekg(0);
-    input.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
-    if (!input) throw std::runtime_error("TIBI input is truncated at compressed offset " +
-        std::to_string(static_cast<std::size_t>(input.gcount())));
-    return bytes;
+    const auto* configured = std::getenv("WATER_STRUCTURE_TIBI_MAX_DECODED_MB");
+    if (!configured || *configured == '\0') return std::nullopt;
+    std::uint64_t megabytes = 0;
+    const auto text = std::string_view(configured);
+    const auto parsed = std::from_chars(
+        text.data(), text.data() + text.size(), megabytes);
+    if (parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size() ||
+        megabytes == 0) return std::nullopt;
+    const auto bytes = megabytes >
+            static_cast<std::uint64_t>(kAbsoluteMaxDecodedBytes / (1024 * 1024))
+        ? kAbsoluteMaxDecodedBytes
+        : static_cast<std::size_t>(megabytes * 1024 * 1024);
+    return std::max<std::size_t>(bytes, kHeaderSize + 64);
 }
 
-std::vector<std::uint8_t> inflate_raw(std::span<const std::uint8_t> input)
+struct InflateSummary {
+    std::uint64_t decoded_bytes = 0;
+    std::uint64_t compressed_bytes = 0;
+    std::array<std::uint8_t, kHeaderSize> header{};
+    std::size_t header_bytes = 0;
+};
+
+template <typename Consumer>
+InflateSummary inflate_raw_file(
+    const std::filesystem::path& path,
+    std::size_t max_decoded_bytes,
+    Consumer&& consumer)
 {
-    if (input.size() > std::numeric_limits<uInt>::max()) {
-        throw std::runtime_error("TIBI compressed payload exceeds zlib input limit");
+    std::error_code size_error;
+    const auto compressed_size = std::filesystem::file_size(path, size_error);
+    if (size_error) {
+        throw std::runtime_error("cannot stat TIBI file: " + path.string());
     }
+    if (compressed_size == 0) {
+        throw std::runtime_error("TIBI compressed size is invalid");
+    }
+    std::ifstream input(path, std::ios::binary);
+    if (!input) {
+        throw std::runtime_error("cannot open TIBI file: " + path.string());
+    }
+
     z_stream stream{};
     if (inflateInit2(&stream, -MAX_WBITS) != Z_OK) {
         throw std::runtime_error("cannot initialize TIBI raw DEFLATE decoder");
@@ -54,31 +93,305 @@ std::vector<std::uint8_t> inflate_raw(std::span<const std::uint8_t> input)
         z_stream* stream;
         ~Guard() { inflateEnd(stream); }
     } guard{ &stream };
-    stream.next_in = const_cast<Bytef*>(input.data());
-    stream.avail_in = static_cast<uInt>(input.size());
-    std::vector<std::uint8_t> output;
-    std::array<std::uint8_t, 64 * 1024> buffer{};
-    int status = Z_OK;
-    while (status != Z_STREAM_END) {
-        stream.next_out = buffer.data();
-        stream.avail_out = static_cast<uInt>(buffer.size());
-        status = inflate(&stream, Z_NO_FLUSH);
-        if (status != Z_OK && status != Z_STREAM_END) {
+
+    std::vector<std::uint8_t> input_window(kInflateWindowBytes);
+    std::vector<std::uint8_t> output_window(kInflateWindowBytes);
+    InflateSummary summary;
+    bool reached_eof = false;
+    while (true) {
+        if (stream.avail_in == 0 && !reached_eof) {
+            input.read(reinterpret_cast<char*>(input_window.data()),
+                static_cast<std::streamsize>(input_window.size()));
+            const auto read = input.gcount();
+            if (read < 0 || input.bad()) {
+                throw std::runtime_error("TIBI input read failed at compressed offset " +
+                    std::to_string(summary.compressed_bytes));
+            }
+            if (read == 0) {
+                reached_eof = true;
+            } else {
+                stream.next_in = input_window.data();
+                stream.avail_in = static_cast<uInt>(read);
+                reached_eof = static_cast<std::size_t>(read) < input_window.size();
+            }
+        }
+
+        stream.next_out = output_window.data();
+        stream.avail_out = static_cast<uInt>(output_window.size());
+        const auto input_before = stream.avail_in;
+        const auto status = inflate(&stream, Z_NO_FLUSH);
+        summary.compressed_bytes += input_before - stream.avail_in;
+        const auto produced = output_window.size() - stream.avail_out;
+        if (produced > max_decoded_bytes || summary.decoded_bytes >
+                static_cast<std::uint64_t>(max_decoded_bytes - produced)) {
+            throw std::runtime_error(
+                "TIBI decoded payload exceeds " +
+                std::to_string(max_decoded_bytes / (1024 * 1024)) + " MiB");
+        }
+
+        if (produced != 0) {
+            const auto header_remaining = kHeaderSize - summary.header_bytes;
+            const auto header_copy = std::min(produced, header_remaining);
+            if (header_copy != 0) {
+                std::copy_n(output_window.begin(), header_copy,
+                    summary.header.begin() + static_cast<std::ptrdiff_t>(summary.header_bytes));
+                summary.header_bytes += header_copy;
+            }
+            consumer(std::span<std::uint8_t>(output_window.data(), produced),
+                summary.decoded_bytes);
+            summary.decoded_bytes += produced;
+        }
+
+        if (status == Z_STREAM_END) break;
+        if (status != Z_OK) {
+            if (status == Z_BUF_ERROR && reached_eof && stream.avail_in == 0) {
+                throw std::runtime_error("TIBI raw DEFLATE is truncated at compressed offset " +
+                    std::to_string(summary.compressed_bytes));
+            }
             throw std::runtime_error("TIBI raw DEFLATE failed at compressed offset " +
-                std::to_string(stream.total_in));
+                std::to_string(summary.compressed_bytes));
         }
-        const auto produced = buffer.size() - stream.avail_out;
-        if (output.size() > kMaxDecodedBytes - produced) {
-            throw std::runtime_error("TIBI decoded payload exceeds 2 GiB");
+        if (produced == 0 && input_before == stream.avail_in) {
+            if (reached_eof && stream.avail_in == 0) {
+                throw std::runtime_error("TIBI raw DEFLATE is truncated at compressed offset " +
+                    std::to_string(summary.compressed_bytes));
+            }
+            throw std::runtime_error("TIBI raw DEFLATE made no progress at compressed offset " +
+                std::to_string(summary.compressed_bytes));
         }
-        output.insert(output.end(), buffer.begin(), buffer.begin() + static_cast<std::ptrdiff_t>(produced));
-        if (produced == 0 && stream.avail_in == 0 && status != Z_STREAM_END) {
+        if (produced == 0 && stream.avail_in == 0 && reached_eof) {
             throw std::runtime_error("TIBI raw DEFLATE is truncated at compressed offset " +
-                std::to_string(stream.total_in));
+                std::to_string(summary.compressed_bytes));
         }
     }
-    return output;
+    return summary;
 }
+
+std::filesystem::path make_spool_directory(const std::filesystem::path& requested_directory)
+{
+    std::error_code error;
+    auto directory = requested_directory;
+    if (directory.empty()) {
+        directory = std::filesystem::temp_directory_path(error);
+        if (error) {
+            throw std::runtime_error("TIBI reader cannot resolve the temporary directory");
+        }
+    } else {
+        std::filesystem::create_directories(directory, error);
+        if (error) {
+            throw std::runtime_error("TIBI reader cannot create temporary directory: " +
+                directory.string());
+        }
+    }
+    if (!std::filesystem::is_directory(directory, error) || error) {
+        throw std::runtime_error("TIBI temporary path is not a directory: " +
+            directory.string());
+    }
+
+    static std::atomic<std::uint64_t> sequence{ 0 };
+    std::uint64_t entropy = 0;
+    try {
+        std::random_device device;
+        entropy = (static_cast<std::uint64_t>(device()) << 32u) ^ device();
+    } catch (...) {
+        entropy = static_cast<std::uint64_t>(
+            std::hash<std::thread::id>{}(std::this_thread::get_id()));
+    }
+    const auto timestamp = static_cast<std::uint64_t>(
+        std::chrono::steady_clock::now().time_since_epoch().count());
+    for (std::size_t attempt = 0; attempt < 128; ++attempt) {
+        const auto id = sequence.fetch_add(1, std::memory_order_relaxed);
+        const auto candidate = directory /
+            ("water_structure_tibi_" + std::to_string(timestamp) + "_" +
+             std::to_string(entropy) + "_" + std::to_string(id));
+        if (std::filesystem::create_directory(candidate, error)) {
+            return candidate;
+        }
+        if (error) {
+            throw std::runtime_error("TIBI reader cannot create temporary spool directory");
+        }
+        error.clear();
+    }
+    throw std::runtime_error("TIBI reader cannot allocate a unique temporary spool path");
+}
+
+struct TemporarySpool {
+    std::filesystem::path directory;
+    std::filesystem::path path;
+
+    ~TemporarySpool()
+    {
+        std::error_code error;
+        if (!path.empty()) std::filesystem::remove(path, error);
+        error.clear();
+        if (!directory.empty()) std::filesystem::remove(directory, error);
+    }
+};
+
+struct PayloadSlice {
+    std::uint32_t absolute_offset = 0;
+    std::uint32_t length = 0;
+};
+
+class PayloadReader {
+public:
+    PayloadReader(const std::filesystem::path& path,
+                  std::uint64_t base_offset,
+                  std::size_t payload_size)
+        : mInput(path, std::ios::binary),
+          mBaseOffset(base_offset),
+          mPayloadSize(payload_size),
+          mBuffer(kInflateWindowBytes)
+    {
+        if (!mInput) {
+            throw std::runtime_error("cannot open TIBI temporary spool for parsing");
+        }
+        mInput.seekg(static_cast<std::streamoff>(mBaseOffset));
+        if (!mInput) {
+            throw std::runtime_error("cannot seek TIBI temporary spool to payload");
+        }
+    }
+
+    std::uint64_t varint(std::string_view context)
+    {
+        std::uint64_t result = 0;
+        unsigned shift = 0;
+        const auto start = mOffset;
+        while (true) {
+            if (mOffset >= mPayloadSize) {
+                throw std::runtime_error(std::string(context) +
+                    " has truncated varint at payload offset " + std::to_string(start));
+            }
+            const auto byte = read_byte();
+            if (shift == 63 && (byte & 0xfeu) != 0) {
+                throw std::runtime_error(std::string(context) +
+                    " varint overflows at payload offset " + std::to_string(start));
+            }
+            result |= static_cast<std::uint64_t>(byte & 0x7fu) << shift;
+            if ((byte & 0x80u) == 0) return result;
+            shift += 7;
+            if (shift > 63) {
+                throw std::runtime_error(std::string(context) +
+                    " varint overflows at payload offset " + std::to_string(start));
+            }
+        }
+    }
+
+    PayloadSlice string(std::string_view context)
+    {
+        const auto length = varint(std::string(context) + " length");
+        if (length > mPayloadSize - mOffset) {
+            throw std::runtime_error(std::string(context) +
+                " is truncated at payload offset " + std::to_string(mOffset));
+        }
+        const PayloadSlice result{
+            static_cast<std::uint32_t>(mBaseOffset + mOffset),
+            static_cast<std::uint32_t>(length)
+        };
+        skip(static_cast<std::size_t>(length));
+        return result;
+    }
+
+private:
+    std::uint8_t read_byte()
+    {
+        if (mBufferPosition == mBufferSize) refill();
+        const auto value = mBuffer[mBufferPosition++];
+        ++mOffset;
+        return value;
+    }
+
+    void refill()
+    {
+        const auto remaining = mPayloadSize - mOffset;
+        const auto requested = std::min(remaining, mBuffer.size());
+        mInput.read(reinterpret_cast<char*>(mBuffer.data()),
+            static_cast<std::streamsize>(requested));
+        if (mInput.gcount() != static_cast<std::streamsize>(requested)) {
+            throw std::runtime_error("TIBI temporary spool is truncated at payload offset " +
+                std::to_string(mOffset));
+        }
+        mBufferPosition = 0;
+        mBufferSize = requested;
+    }
+
+    void skip(std::size_t length)
+    {
+        const auto buffered = mBufferSize - mBufferPosition;
+        if (length <= buffered) {
+            mBufferPosition += length;
+            mOffset += length;
+            return;
+        }
+        mOffset += length;
+        mInput.clear();
+        mInput.seekg(static_cast<std::streamoff>(mBaseOffset + mOffset));
+        if (!mInput) {
+            throw std::runtime_error("cannot seek TIBI temporary spool at payload offset " +
+                std::to_string(mOffset));
+        }
+        mBufferPosition = 0;
+        mBufferSize = 0;
+    }
+
+    std::ifstream mInput;
+    std::uint64_t mBaseOffset = 0;
+    std::size_t mPayloadSize = 0;
+    std::size_t mOffset = 0;
+    std::vector<std::uint8_t> mBuffer;
+    std::size_t mBufferPosition = 0;
+    std::size_t mBufferSize = 0;
+};
+
+class TableReader {
+public:
+    explicit TableReader(const std::filesystem::path& path)
+        : mInput(path, std::ios::binary)
+    {
+        if (!mInput) {
+            throw std::runtime_error("cannot open TIBI temporary spool table reader");
+        }
+    }
+
+    std::pair<std::string_view, std::string_view> read_pair(
+        const PayloadSlice& block,
+        const PayloadSlice& property,
+        std::string& scratch)
+    {
+        if (static_cast<std::size_t>(property.length) >
+                std::numeric_limits<std::size_t>::max() - block.length) {
+            throw std::runtime_error("TIBI block/property table pair size overflows");
+        }
+        const auto total = static_cast<std::size_t>(block.length) + property.length;
+        if (total == 0) return { std::string_view{}, std::string_view{} };
+        scratch.resize(total);
+        read_at(block, scratch.data(), "block");
+        read_at(property, scratch.data() + block.length, "property");
+        return {
+            std::string_view(scratch.data(), block.length),
+            std::string_view(scratch.data() + block.length, property.length)
+        };
+    }
+
+private:
+    void read_at(const PayloadSlice& slice, char* destination, std::string_view name)
+    {
+        if (slice.length == 0) return;
+        mInput.clear();
+        mInput.seekg(static_cast<std::streamoff>(slice.absolute_offset));
+        if (!mInput) {
+            throw std::runtime_error("cannot seek TIBI " + std::string(name) +
+                " table entry in temporary spool");
+        }
+        mInput.read(destination, static_cast<std::streamsize>(slice.length));
+        if (mInput.gcount() != static_cast<std::streamsize>(slice.length)) {
+            throw std::runtime_error("TIBI " + std::string(name) +
+                " table entry is truncated in temporary spool");
+        }
+    }
+
+    std::ifstream mInput;
+};
 
 std::array<std::uint8_t, 16> md5(std::span<const std::uint8_t> input)
 {
@@ -174,52 +487,6 @@ std::array<std::uint8_t, 16> md5(std::span<const std::uint8_t> input)
     return result;
 }
 
-class PayloadReader {
-public:
-    explicit PayloadReader(std::span<const std::uint8_t> bytes) : mBytes(bytes) {}
-
-    std::uint64_t varint(std::string_view context)
-    {
-        std::uint64_t result = 0;
-        unsigned shift = 0;
-        const auto start = mOffset;
-        while (true) {
-            if (mOffset >= mBytes.size()) {
-                throw std::runtime_error(std::string(context) + " has truncated varint at payload offset " +
-                    std::to_string(start));
-            }
-            const auto byte = mBytes[mOffset++];
-            if (shift == 63 && (byte & 0xfeu) != 0) {
-                throw std::runtime_error(std::string(context) + " varint overflows at payload offset " +
-                    std::to_string(start));
-            }
-            result |= static_cast<std::uint64_t>(byte & 0x7fu) << shift;
-            if ((byte & 0x80u) == 0) return result;
-            shift += 7;
-            if (shift > 63) {
-                throw std::runtime_error(std::string(context) + " varint overflows at payload offset " +
-                    std::to_string(start));
-            }
-        }
-    }
-
-    std::string string(std::string_view context)
-    {
-        const auto length = varint(std::string(context) + " length");
-        if (length > mBytes.size() - mOffset) {
-            throw std::runtime_error(std::string(context) + " is truncated at payload offset " +
-                std::to_string(mOffset));
-        }
-        const auto begin = reinterpret_cast<const char*>(mBytes.data() + mOffset);
-        mOffset += static_cast<std::size_t>(length);
-        return std::string(begin, static_cast<std::size_t>(length));
-    }
-
-private:
-    std::span<const std::uint8_t> mBytes;
-    std::size_t mOffset = 0;
-};
-
 std::string trim(std::string value)
 {
     const auto first = value.find_first_not_of(" \t\r\n");
@@ -237,10 +504,27 @@ std::optional<std::vector<BlockStateProperty>> parse_states(std::string_view tex
     std::vector<BlockStateProperty> result;
     std::size_t begin = 0;
     while (begin <= text.size()) {
-        const auto comma = text.find(',', begin);
+        auto comma = std::string_view::npos;
+        bool quoted = false;
+        bool escaped = false;
+        for (auto index = begin; index < text.size(); ++index) {
+            const auto character = text[index];
+            if (quoted && escaped) {
+                escaped = false;
+            } else if (quoted && character == '\\') {
+                escaped = true;
+            } else if (character == '"') {
+                quoted = !quoted;
+            } else if (character == ',' && !quoted) {
+                comma = index;
+                break;
+            }
+        }
+        if (quoted || escaped) return std::nullopt;
         const auto part = text.substr(begin,
             comma == std::string_view::npos ? text.size() - begin : comma - begin);
         if (!part.empty()) {
+            if (result.size() >= kMaxStateProperties) return std::nullopt;
             const auto equal = part.find('=');
             if (equal == std::string_view::npos || equal == 0) return std::nullopt;
             BlockStateProperty property;
@@ -252,6 +536,7 @@ std::optional<std::vector<BlockStateProperty>> parse_states(std::string_view tex
             }
             if (property.value == "true" || property.value == "false") {
                 property.type = BlockStateValueType::Byte;
+                property.value = property.value == "true" ? "1" : "0";
             } else {
                 std::int32_t number = 0;
                 const auto parsed = std::from_chars(property.value.data(),
@@ -268,9 +553,11 @@ std::optional<std::vector<BlockStateProperty>> parse_states(std::string_view tex
     return result;
 }
 
-std::uint32_t runtime_id(RuntimeRegistry& registry, std::string block, const std::string& property)
+std::uint32_t runtime_id(RuntimeRegistry& registry,
+                         std::string_view block_view,
+                         std::string_view property_view)
 {
-    block = trim(std::move(block));
+    auto block = trim(std::string(block_view));
     if (block.empty()) return registry.air_runtime_id();
     auto name = block;
     std::string state_text;
@@ -281,7 +568,7 @@ std::uint32_t runtime_id(RuntimeRegistry& registry, std::string block, const std
             state_text = block.substr(open, close - open + 1);
         }
     }
-    std::istringstream property_stream(property);
+    std::istringstream property_stream{ std::string(property_view) };
     std::string first;
     if (property_stream >> first) {
         int legacy = 0;
@@ -331,57 +618,191 @@ void set_block(ChunkMap& chunks, BlockPos position, std::uint32_t runtime, std::
 
 } // namespace
 
+void TibiReader::set_streaming_options(
+    std::size_t soft_memory_budget_bytes,
+    bool allow_temporary_spool,
+    std::filesystem::path temporary_directory,
+    std::size_t temporary_file_limit_bytes)
+{
+    mSoftMemoryBudgetBytes = soft_memory_budget_bytes == 0
+        ? 450u * 1024u * 1024u
+        : soft_memory_budget_bytes;
+    mAllowTemporarySpool = allow_temporary_spool;
+    mTemporaryDirectory = std::move(temporary_directory);
+    mTemporaryFileLimitBytes = temporary_file_limit_bytes;
+    mStreamingOptionsConfigured = true;
+    mCommandIndex.clear();
+    mBroadCommands.clear();
+    mCommandIndexReady = false;
+}
+
 void TibiReader::set_offset(BlockPos offset) noexcept
 {
     mOffset = offset;
+    mCommandIndex.clear();
+    mBroadCommands.clear();
+    mCommandIndexReady = false;
+    const auto expanded = [](std::int32_t base, std::int32_t delta) noexcept {
+        const auto magnitude = delta < 0 ? -static_cast<std::int64_t>(delta)
+                                         : static_cast<std::int64_t>(delta);
+        const auto value = static_cast<std::int64_t>(base) + magnitude;
+        return static_cast<std::int32_t>(std::min<std::int64_t>(
+            value, std::numeric_limits<std::int32_t>::max()));
+    };
     mSize = {
-        mOriginalSize.width + std::abs(offset.x),
-        mOriginalSize.height + std::abs(offset.y),
-        mOriginalSize.length + std::abs(offset.z)
+        expanded(mOriginalSize.width, offset.x),
+        expanded(mOriginalSize.height, offset.y),
+        expanded(mOriginalSize.length, offset.z)
     };
 }
 
 Result<void> TibiReader::read(const std::filesystem::path& path)
 {
-    mCommands.clear();
+    std::vector<Command>{}.swap(mCommands);
     mOrigin = {};
     mOffset = {};
     mOriginalSize = {};
     mSize = {};
     mNonAirBlocks = 0;
+    decltype(mCommandIndex){}.swap(mCommandIndex);
+    std::vector<std::uint32_t>{}.swap(mBroadCommands);
+    mCommandIndexReady = false;
     try {
-        auto decoded = inflate_raw(read_file(path));
-        if (decoded.size() < kHeaderSize) {
+        if (!mAllowTemporarySpool) {
+            throw std::runtime_error(
+                "capability error: TIBI reader requires a seekable temporary decoded spool "
+                "because its XOR key depends on decoded length; allow_temporary_spool=false");
+        }
+        if (mSoftMemoryBudgetBytes < kMinimumMemoryBudget) {
+            throw std::runtime_error(
+                "TIBI reader soft_memory_budget must be at least 512 KiB");
+        }
+
+        auto decoded_limit = mTemporaryFileLimitBytes == 0
+            ? kAbsoluteMaxDecodedBytes
+            : mTemporaryFileLimitBytes;
+        if (!mStreamingOptionsConfigured) {
+            if (const auto legacy = legacy_decoded_limit()) decoded_limit = *legacy;
+        }
+        decoded_limit = std::min(decoded_limit, kAbsoluteMaxDecodedBytes);
+        if (decoded_limit < kHeaderSize + 1) {
+            throw std::runtime_error(
+                "TIBI temporary_file_limit is too small for the decoded header and payload");
+        }
+
+        const auto first_pass = inflate_raw_file(path, decoded_limit,
+            [](std::span<std::uint8_t>, std::uint64_t) {});
+        if (first_pass.decoded_bytes < kHeaderSize ||
+            first_pass.header_bytes != kHeaderSize) {
             throw std::runtime_error("TIBI decoded payload is shorter than 15-byte header");
         }
-        std::vector<std::uint8_t> key_material(decoded.begin(), decoded.begin() + kHeaderSize);
+        const auto payload_size_u64 = first_pass.decoded_bytes - kHeaderSize;
+        if (payload_size_u64 > std::numeric_limits<std::size_t>::max()) {
+            throw std::runtime_error("TIBI decoded payload exceeds addressable size");
+        }
+        const auto payload_size = static_cast<std::size_t>(payload_size_u64);
+
+        std::vector<std::uint8_t> key_material(
+            first_pass.header.begin(), first_pass.header.end());
         const auto suffix = std::string("TIBI_2025/5/19-Start") +
-            std::to_string(decoded.size() - kHeaderSize);
+            std::to_string(payload_size_u64);
         key_material.insert(key_material.end(), suffix.begin(), suffix.end());
         const auto key = md5(key_material);
-        for (std::size_t index = kHeaderSize; index < decoded.size(); ++index) {
-            decoded[index] ^= key[(index - kHeaderSize) % key.size()];
+
+        TemporarySpool temporary;
+        temporary.directory = make_spool_directory(mTemporaryDirectory);
+        temporary.path = temporary.directory / "decoded.bin";
+        std::ofstream spool(temporary.path, std::ios::binary | std::ios::trunc);
+        if (!spool) {
+            throw std::runtime_error("TIBI reader cannot create temporary decoded spool: " +
+                temporary.path.string());
         }
-        PayloadReader reader(std::span<const std::uint8_t>(decoded).subspan(kHeaderSize));
+        const auto second_pass = inflate_raw_file(path, decoded_limit,
+            [&](std::span<std::uint8_t> bytes, std::uint64_t decoded_offset) {
+                if (decoded_offset > first_pass.decoded_bytes || bytes.size() >
+                        first_pass.decoded_bytes - decoded_offset) {
+                    throw std::runtime_error(
+                        "TIBI input changed between raw DEFLATE passes (decoded size grew)");
+                }
+                auto begin = std::size_t{ 0 };
+                if (decoded_offset < kHeaderSize) {
+                    begin = static_cast<std::size_t>(std::min<std::uint64_t>(
+                        bytes.size(), kHeaderSize - decoded_offset));
+                }
+                for (auto index = begin; index < bytes.size(); ++index) {
+                    const auto absolute = decoded_offset + index;
+                    bytes[index] ^= key[static_cast<std::size_t>(
+                        (absolute - kHeaderSize) % key.size())];
+                }
+                spool.write(reinterpret_cast<const char*>(bytes.data()),
+                    static_cast<std::streamsize>(bytes.size()));
+                if (!spool) {
+                    throw std::runtime_error("TIBI temporary decoded spool write failed");
+                }
+            });
+        if (second_pass.decoded_bytes != first_pass.decoded_bytes ||
+            second_pass.header != first_pass.header) {
+            throw std::runtime_error(
+                "TIBI input changed between raw DEFLATE passes");
+        }
+        spool.flush();
+        if (!spool) {
+            throw std::runtime_error("TIBI temporary decoded spool flush failed");
+        }
+        spool.close();
+        if (!spool) {
+            throw std::runtime_error("TIBI temporary decoded spool close failed");
+        }
+
+        auto accounted_memory = kReaderWorkingSetReserve;
+        const auto account_vector = [&](std::uint64_t count, std::size_t element_size,
+                                        std::string_view context) {
+            if (count > std::numeric_limits<std::size_t>::max() / element_size) {
+                throw std::runtime_error(std::string(context) +
+                    " allocation size overflows");
+            }
+            const auto bytes = static_cast<std::size_t>(count) * element_size;
+            if (bytes > mSoftMemoryBudgetBytes -
+                    std::min(accounted_memory, mSoftMemoryBudgetBytes)) {
+                throw std::runtime_error(std::string(context) +
+                    " exceeds TIBI soft_memory_budget");
+            }
+            accounted_memory += bytes;
+        };
+
+        PayloadReader reader(temporary.path, kHeaderSize, payload_size);
         const auto block_count = reader.varint("TIBI block table count");
-        if (block_count > decoded.size()) throw std::runtime_error("TIBI block table count is invalid");
-        std::vector<std::string> blocks;
+        if (block_count > kMaxTableEntries ||
+            block_count > first_pass.decoded_bytes) {
+            throw std::runtime_error("TIBI block table count is invalid or exceeds limit");
+        }
+        account_vector(block_count, sizeof(PayloadSlice), "TIBI block table");
+        std::vector<PayloadSlice> blocks;
         blocks.reserve(static_cast<std::size_t>(block_count));
         for (std::uint64_t index = 0; index < block_count; ++index) {
             reader.varint("TIBI block table line #" + std::to_string(index));
             blocks.push_back(reader.string("TIBI block table entry #" + std::to_string(index)));
         }
         const auto property_count = reader.varint("TIBI property table count");
-        if (property_count > decoded.size()) throw std::runtime_error("TIBI property table count is invalid");
-        std::vector<std::string> properties;
+        if (property_count > kMaxTableEntries ||
+            property_count > first_pass.decoded_bytes) {
+            throw std::runtime_error("TIBI property table count is invalid or exceeds limit");
+        }
+        account_vector(property_count, sizeof(PayloadSlice), "TIBI property table");
+        std::vector<PayloadSlice> properties;
         properties.reserve(static_cast<std::size_t>(property_count));
         for (std::uint64_t index = 0; index < property_count; ++index) {
             reader.varint("TIBI property table line #" + std::to_string(index));
             properties.push_back(reader.string("TIBI property table entry #" + std::to_string(index)));
         }
         const auto command_count = reader.varint("TIBI command count");
-        if (command_count > decoded.size()) throw std::runtime_error("TIBI command count is invalid");
-        mCommands.reserve(static_cast<std::size_t>(command_count));
+        if (command_count > kMaxCommands ||
+            command_count > first_pass.decoded_bytes) {
+            throw std::runtime_error("TIBI command count is invalid or exceeds limit");
+        }
+        account_vector(command_count, sizeof(Command), "TIBI command table");
+        std::vector<Command> commands;
+        commands.reserve(static_cast<std::size_t>(command_count));
         auto min_x = std::numeric_limits<std::int32_t>::max();
         auto min_y = min_x;
         auto min_z = min_x;
@@ -389,6 +810,19 @@ Result<void> TibiReader::read(const std::filesystem::path& path)
         auto max_y = max_x;
         auto max_z = max_x;
         std::uint64_t non_air = 0;
+        const auto uncommitted_memory = mSoftMemoryBudgetBytes - accounted_memory;
+        const auto runtime_cache_limit = std::min(
+            kMaxRuntimeCacheEntries,
+            uncommitted_memory / (2 * kEstimatedRuntimeCacheEntryBytes));
+        accounted_memory += runtime_cache_limit * kEstimatedRuntimeCacheEntryBytes;
+        const auto maximum_table_pair_bytes =
+            (mSoftMemoryBudgetBytes - accounted_memory) / 4;
+        std::unordered_map<std::uint64_t, std::uint32_t> runtime_cache;
+        if (runtime_cache_limit != 0) {
+            runtime_cache.reserve(std::min<std::size_t>(1024, runtime_cache_limit));
+        }
+        TableReader table_reader(temporary.path);
+        std::string table_scratch;
         for (std::size_t index = 0; index < command_count; ++index) {
             Command command;
             command.type = reader.varint("TIBI command #" + std::to_string(index) + " type");
@@ -410,8 +844,28 @@ Result<void> TibiReader::read(const std::filesystem::path& path)
                 throw std::runtime_error("TIBI command #" + std::to_string(index) +
                     " references an out-of-range table index");
             }
-            command.runtime_id = runtime_id(mRegistry, blocks[static_cast<std::size_t>(block_index)],
-                properties[static_cast<std::size_t>(property_index)]);
+            const auto runtime_key = block_index << 32u | property_index;
+            if (const auto cached = runtime_cache.find(runtime_key);
+                cached != runtime_cache.end()) {
+                command.runtime_id = cached->second;
+            } else {
+                const auto& block = blocks[static_cast<std::size_t>(block_index)];
+                const auto& property = properties[static_cast<std::size_t>(property_index)];
+                if (static_cast<std::size_t>(property.length) >
+                        std::numeric_limits<std::size_t>::max() - block.length ||
+                    static_cast<std::size_t>(block.length) + property.length >
+                        maximum_table_pair_bytes) {
+                    throw std::runtime_error("TIBI command #" + std::to_string(index) +
+                        " block/property text exceeds soft_memory_budget");
+                }
+                const auto [block_text, property_text] =
+                    table_reader.read_pair(block, property, table_scratch);
+                command.runtime_id = runtime_id(
+                    mRegistry, block_text, property_text);
+                if (runtime_cache.size() < runtime_cache_limit) {
+                    runtime_cache.emplace(runtime_key, command.runtime_id);
+                }
+            }
             if (command.type == 0 || command.type == 1) {
                 min_x = std::min({ min_x, command.first.x, command.second.x });
                 min_y = std::min({ min_y, command.first.y, command.second.y });
@@ -444,7 +898,7 @@ Result<void> TibiReader::read(const std::filesystem::path& path)
                         ? std::numeric_limits<std::uint64_t>::max() : non_air + volume;
                 }
             }
-            mCommands.push_back(command);
+            commands.push_back(command);
         }
         if (min_x == std::numeric_limits<std::int32_t>::max()) {
             throw std::runtime_error("TIBI has no setblock or fill commands");
@@ -461,6 +915,7 @@ Result<void> TibiReader::read(const std::filesystem::path& path)
         mSize = mOriginalSize;
         mNonAirBlocks = non_air > std::numeric_limits<std::size_t>::max()
             ? std::numeric_limits<std::size_t>::max() : static_cast<std::size_t>(non_air);
+        mCommands = std::move(commands);
         return Result<void>::success();
     } catch (const std::exception& error) {
         return Result<void>::failure("parse TIBI failed: " + std::string(error.what()));
@@ -472,44 +927,146 @@ Result<ChunkMap> TibiReader::get_chunks(std::span<const ChunkPos> positions) con
     ChunkMap chunks;
     for (const auto position : positions) chunks.emplace(position, ChunkData{});
     const auto air = mRegistry.air_runtime_id();
-    for (const auto& command : mCommands) {
-        if (command.runtime_id == air) continue;
-        const auto local = [&](BlockPos value) {
-            return BlockPos{
-                value.x - mOrigin.x + mOffset.x,
-                value.y - mOrigin.y + mOffset.y,
-                value.z - mOrigin.z + mOffset.z
-            };
+    const auto local = [&](BlockPos value) {
+        return BlockPos{
+            value.x - mOrigin.x + mOffset.x,
+            value.y - mOrigin.y + mOffset.y,
+            value.z - mOrigin.z + mOffset.z
         };
-        if (command.type == 0) {
-            set_block(chunks, local(command.first), command.runtime_id, air);
-        } else if (command.type == 1) {
+    };
+
+    if (!mCommandIndexReady) {
+        const std::scoped_lock index_lock(mCommandIndexMutex);
+        if (!mCommandIndexReady) {
+        mCommandIndex.clear();
+        mBroadCommands.clear();
+        std::size_t index_entries = 0;
+        // An unordered_map entry plus its vector bookkeeping is substantially
+        // larger than the 32-bit command index itself.  Keep the index within
+        // a small fraction of the configured reader budget; oversized fills
+        // remain in the bounded broad-command list and are clipped to the
+        // requested chunk at materialization time.
+        const auto budget_index_entries = mSoftMemoryBudgetBytes / 64u;
+        const auto max_index_entries = std::min<std::size_t>(
+            kMaxIndexEntries, std::max<std::size_t>(1024, budget_index_entries));
+        for (std::size_t index = 0; index < mCommands.size(); ++index) {
+            const auto& command = mCommands[index];
+            if (command.type != 0 && command.type != 1) continue;
             const auto first = local(command.first);
             const auto second = local(command.second);
-            const auto fill_min_x = std::min(first.x, second.x);
-            const auto fill_max_x = std::max(first.x, second.x);
-            const auto fill_min_y = std::min(first.y, second.y);
-            const auto fill_max_y = std::max(first.y, second.y);
-            const auto fill_min_z = std::min(first.z, second.z);
-            const auto fill_max_z = std::max(first.z, second.z);
-            for (const auto& [chunk_position, _] : chunks) {
-                const auto chunk_min_x = chunk_position.x * 16;
-                const auto chunk_min_z = chunk_position.z * 16;
-                const auto min_x = std::max(fill_min_x, chunk_min_x);
-                const auto max_x = std::min(fill_max_x, chunk_min_x + 15);
-                const auto min_z = std::max(fill_min_z, chunk_min_z);
-                const auto max_z = std::min(fill_max_z, chunk_min_z + 15);
-                if (min_x > max_x || min_z > max_z) continue;
-                for (std::int64_t x = min_x; x <= max_x; ++x) {
-                    for (std::int64_t y = fill_min_y; y <= fill_max_y; ++y) {
-                        for (std::int64_t z = min_z; z <= max_z; ++z) {
-                            set_block(chunks, {
-                                static_cast<std::int32_t>(x), static_cast<std::int32_t>(y),
-                                static_cast<std::int32_t>(z)
-                            }, command.runtime_id, air);
-                        }
+            const auto chunk_x1 = floor_div64(std::min<std::int64_t>(first.x, second.x), 16);
+            const auto chunk_x2 = floor_div64(std::max<std::int64_t>(first.x, second.x), 16);
+            const auto chunk_z1 = floor_div64(std::min<std::int64_t>(first.z, second.z), 16);
+            const auto chunk_z2 = floor_div64(std::max<std::int64_t>(first.z, second.z), 16);
+            const auto span_x = chunk_x2 - chunk_x1 + 1;
+            const auto span_z = chunk_z2 - chunk_z1 + 1;
+            const auto covered = span_x <= 0 || span_z <= 0
+                ? std::numeric_limits<std::uint64_t>::max()
+                : static_cast<std::uint64_t>(span_x) >
+                    std::numeric_limits<std::uint64_t>::max() /
+                        static_cast<std::uint64_t>(span_z)
+                    ? std::numeric_limits<std::uint64_t>::max()
+                    : static_cast<std::uint64_t>(span_x) * static_cast<std::uint64_t>(span_z);
+            if (covered > 4096 || covered > max_index_entries -
+                    std::min(index_entries, max_index_entries)) {
+                mBroadCommands.push_back(static_cast<std::uint32_t>(index));
+                continue;
+            }
+            if (chunk_x1 < std::numeric_limits<std::int32_t>::min() ||
+                chunk_x2 > std::numeric_limits<std::int32_t>::max() ||
+                chunk_z1 < std::numeric_limits<std::int32_t>::min() ||
+                chunk_z2 > std::numeric_limits<std::int32_t>::max()) {
+                mBroadCommands.push_back(static_cast<std::uint32_t>(index));
+                continue;
+            }
+            index_entries += static_cast<std::size_t>(covered);
+            for (auto z = chunk_z1; z <= chunk_z2; ++z) {
+                for (auto x = chunk_x1; x <= chunk_x2; ++x) {
+                    mCommandIndex[{
+                        static_cast<std::int32_t>(x), static_cast<std::int32_t>(z)
+                    }].push_back(
+                        static_cast<std::uint32_t>(index));
+                    if (x == chunk_x2) break;
+                }
+                if (z == chunk_z2) break;
+            }
+        }
+            mCommandIndexReady = true;
+        }
+    }
+
+    std::uint64_t materialized = 0;
+    for (const auto& [chunk_position, _] : chunks) {
+        const auto process = [&](std::uint32_t command_index) -> Result<void> {
+            const auto& command = mCommands[command_index];
+            if (command.runtime_id == air) return Result<void>::success();
+            if (command.type == 0) {
+                set_block(chunks, local(command.first), command.runtime_id, air);
+                if (++materialized > kMaxMaterializedBlocksPerRequest) {
+                    return Result<void>::failure(
+                        "TIBI 请求展开量超过限制");
+                }
+                return Result<void>::success();
+            }
+            if (command.type != 1) return Result<void>::success();
+
+            const auto first = local(command.first);
+            const auto second = local(command.second);
+            const auto fill_min_x = std::min<std::int64_t>(first.x, second.x);
+            const auto fill_max_x = std::max<std::int64_t>(first.x, second.x);
+            const auto fill_min_y = std::min<std::int64_t>(first.y, second.y);
+            const auto fill_max_y = std::max<std::int64_t>(first.y, second.y);
+            const auto fill_min_z = std::min<std::int64_t>(first.z, second.z);
+            const auto fill_max_z = std::max<std::int64_t>(first.z, second.z);
+            const auto chunk_min_x = static_cast<std::int64_t>(chunk_position.x) * 16;
+            const auto chunk_min_z = static_cast<std::int64_t>(chunk_position.z) * 16;
+            const auto min_x = std::max(fill_min_x, chunk_min_x);
+            const auto max_x = std::min(fill_max_x, chunk_min_x + 15);
+            const auto min_z = std::max(fill_min_z, chunk_min_z);
+            const auto max_z = std::min(fill_max_z, chunk_min_z + 15);
+            if (min_x > max_x || min_z > max_z) {
+                return Result<void>::success();
+            }
+            const auto width = static_cast<std::uint64_t>(max_x - min_x + 1);
+            const auto depth = static_cast<std::uint64_t>(max_z - min_z + 1);
+            const auto height = static_cast<std::uint64_t>(
+                static_cast<std::int64_t>(fill_max_y) - fill_min_y + 1);
+            const auto volume = width * depth * height;
+            if (volume > kMaxMaterializedBlocksPerRequest - materialized) {
+                return Result<void>::failure("TIBI fill 请求展开量超过限制");
+            }
+            materialized += volume;
+            for (std::int64_t x = min_x; x <= max_x; ++x) {
+                for (std::int64_t y = fill_min_y; y <= fill_max_y; ++y) {
+                    for (std::int64_t z = min_z; z <= max_z; ++z) {
+                        set_block(chunks, {
+                            static_cast<std::int32_t>(x),
+                            static_cast<std::int32_t>(y),
+                            static_cast<std::int32_t>(z)
+                        }, command.runtime_id, air);
                     }
                 }
+            }
+            return Result<void>::success();
+        };
+
+        const auto indexed = mCommandIndex.find(chunk_position);
+        const auto* local_commands = indexed == mCommandIndex.end()
+            ? nullptr : &indexed->second;
+        std::size_t local_index = 0;
+        std::size_t broad_index = 0;
+        while ((local_commands && local_index < local_commands->size()) ||
+               broad_index < mBroadCommands.size()) {
+            std::uint32_t command_index = 0;
+            if (broad_index == mBroadCommands.size() ||
+                (local_commands && local_index < local_commands->size() &&
+                 (*local_commands)[local_index] < mBroadCommands[broad_index])) {
+                command_index = (*local_commands)[local_index++];
+            } else {
+                command_index = mBroadCommands[broad_index++];
+            }
+            if (const auto result = process(command_index); !result) {
+                return Result<ChunkMap>::failure(result.error());
             }
         }
     }

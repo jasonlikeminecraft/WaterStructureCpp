@@ -3,8 +3,6 @@
 #include "result.hpp"
 #include "types.hpp"
 
-#include <BedrockWorldOperator/BedrockWorldOperator.hpp>
-
 #include <filesystem>
 #include <functional>
 #include <mutex>

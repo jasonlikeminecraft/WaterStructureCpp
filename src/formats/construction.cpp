@@ -17,6 +17,7 @@
 #include <memory>
 #include <optional>
 #include <sstream>
+#include <streambuf>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -28,19 +29,9 @@ namespace {
 
 constexpr std::string_view kMagic = "constrct";
 constexpr std::size_t kStreamChunk = 64 * 1024;
-constexpr std::size_t kMaxDecodedBytes = 2ull * 1024 * 1024 * 1024;
 constexpr std::size_t kIndexEntrySize = 23;
 
-struct SectionIndex {
-    std::int32_t start_x = 0;
-    std::int32_t start_y = 0;
-    std::int32_t start_z = 0;
-    std::uint8_t shape_x = 0;
-    std::uint8_t shape_y = 0;
-    std::uint8_t shape_z = 0;
-    std::int32_t position = 0;
-    std::int32_t length = 0;
-};
+using SectionIndex = ConstructionReaderState::SectionIndex;
 
 const nbt::value* find_value(const nbt::tag_compound& compound, std::string_view key)
 {
@@ -86,6 +77,11 @@ std::int32_t read_le_i32(const std::uint8_t* bytes)
 std::vector<std::uint8_t> read_exact(
     std::ifstream& input, std::uint64_t offset, std::size_t length, std::string_view context)
 {
+    if (offset > static_cast<std::uint64_t>(std::numeric_limits<std::streamoff>::max()) ||
+        length > static_cast<std::size_t>(std::numeric_limits<std::streamsize>::max())) {
+        throw std::runtime_error(std::string(context) + " range exceeds stream limits at file offset " +
+            std::to_string(offset));
+    }
     input.clear();
     input.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
     if (!input) throw std::runtime_error(std::string(context) + " seek offset " + std::to_string(offset) + " failed");
@@ -98,67 +94,217 @@ std::vector<std::uint8_t> read_exact(
     return bytes;
 }
 
-std::vector<std::uint8_t> inflate_payload(
-    std::span<const std::uint8_t> input, std::string_view context)
+// Presents one validated file range as a forward-only stream.  Payloads are
+// read in fixed-size windows, so a large compressed section never needs a
+// same-sized input allocation.
+class FileRangeStreamBuf final : public std::streambuf {
+public:
+    FileRangeStreamBuf(std::ifstream& input, std::uint64_t offset,
+        std::uint64_t length, std::string_view context)
+        : mInput(input), mRemaining(length), mOffset(offset), mContext(context)
+    {
+        if (offset > static_cast<std::uint64_t>(std::numeric_limits<std::streamoff>::max())) {
+            throw std::runtime_error(mContext + " range exceeds stream limits at file offset " +
+                std::to_string(offset));
+        }
+        mInput.clear();
+        mInput.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+        if (!mInput) {
+            throw std::runtime_error(mContext + " seek offset " + std::to_string(offset) + " failed");
+        }
+    }
+
+protected:
+    int_type underflow() override
+    {
+        if (gptr() != nullptr && gptr() < egptr()) {
+            return traits_type::to_int_type(*gptr());
+        }
+        if (mRemaining == 0) return traits_type::eof();
+        const auto requested = static_cast<std::streamsize>(std::min<std::uint64_t>(
+            mRemaining, static_cast<std::uint64_t>(mBuffer.size())));
+        mInput.read(mBuffer.data(), requested);
+        const auto count = mInput.gcount();
+        if (count <= 0) {
+            throw std::runtime_error(mContext + " truncated at file offset " +
+                std::to_string(mOffset));
+        }
+        const auto consumed = static_cast<std::uint64_t>(count);
+        mRemaining -= consumed;
+        mOffset += consumed;
+        setg(mBuffer.data(), mBuffer.data(), mBuffer.data() + count);
+        return traits_type::to_int_type(*gptr());
+    }
+
+private:
+    std::ifstream& mInput;
+    std::uint64_t mRemaining = 0;
+    std::uint64_t mOffset = 0;
+    std::string mContext;
+    std::array<char, kStreamChunk> mBuffer{};
+};
+
+// Incrementally inflates gzip/zlib bytes from another streambuf.  libnbt reads
+// this stream directly, eliminating both the compressed-payload vector and the
+// fully decoded byte vector used by the previous implementation.
+class InflateStreamBuf final : public std::streambuf {
+public:
+    InflateStreamBuf(std::istream& source, int window_bits, std::string_view context)
+        : mSource(source), mContext(context)
+    {
+        if (inflateInit2(&mStream, window_bits) != Z_OK) {
+            throw std::runtime_error(mContext + " inflate initialization failed");
+        }
+        mInitialized = true;
+    }
+
+    ~InflateStreamBuf() override
+    {
+        if (mInitialized) inflateEnd(&mStream);
+    }
+
+    InflateStreamBuf(const InflateStreamBuf&) = delete;
+    InflateStreamBuf& operator=(const InflateStreamBuf&) = delete;
+
+protected:
+    int_type underflow() override
+    {
+        if (gptr() != nullptr && gptr() < egptr()) {
+            return traits_type::to_int_type(*gptr());
+        }
+        if (mFinished) return traits_type::eof();
+
+        while (true) {
+            if (mStream.avail_in == 0 && !mSourceFinished) refill_input();
+
+            mStream.next_out = reinterpret_cast<Bytef*>(mOutput.data());
+            mStream.avail_out = static_cast<uInt>(mOutput.size());
+            const auto before_in = mStream.avail_in;
+            const auto status = inflate(&mStream, Z_NO_FLUSH);
+            const auto produced = mOutput.size() - mStream.avail_out;
+            if (mDecodedBytes > std::numeric_limits<std::uint64_t>::max() - produced) {
+                throw std::runtime_error(mContext + " decoded byte count overflow");
+            }
+            mDecodedBytes += produced;
+
+            if (status == Z_STREAM_END) mFinished = true;
+            else if (status == Z_BUF_ERROR && mSourceFinished && mStream.avail_in == 0) {
+                throw std::runtime_error(mContext + " compressed payload is truncated at offset " +
+                    std::to_string(mStream.total_in));
+            } else if (status != Z_OK) {
+                throw_inflate_error(status);
+            }
+
+            if (produced != 0) {
+                setg(mOutput.data(), mOutput.data(),
+                    mOutput.data() + static_cast<std::ptrdiff_t>(produced));
+                return traits_type::to_int_type(*gptr());
+            }
+            if (mFinished) return traits_type::eof();
+            if (mSourceFinished && mStream.avail_in == 0) {
+                throw std::runtime_error(mContext + " compressed payload is truncated at offset " +
+                    std::to_string(mStream.total_in));
+            }
+            if (before_in == mStream.avail_in) {
+                throw std::runtime_error(mContext + " inflate made no progress at compressed offset " +
+                    std::to_string(mStream.total_in));
+            }
+        }
+    }
+
+private:
+    void refill_input()
+    {
+        mSource.read(reinterpret_cast<char*>(mInput.data()),
+            static_cast<std::streamsize>(mInput.size()));
+        const auto count = mSource.gcount();
+        if (count <= 0) {
+            mSourceFinished = true;
+            return;
+        }
+        mStream.next_in = mInput.data();
+        mStream.avail_in = static_cast<uInt>(count);
+    }
+
+    [[noreturn]] void throw_inflate_error(int status) const
+    {
+        throw std::runtime_error(mContext + " inflate failed at compressed offset " +
+            std::to_string(mStream.total_in) + ": " +
+            (mStream.msg == nullptr ? std::to_string(status) : mStream.msg));
+    }
+
+    std::istream& mSource;
+    std::string mContext;
+    z_stream mStream{};
+    bool mInitialized = false;
+    bool mSourceFinished = false;
+    bool mFinished = false;
+    std::uint64_t mDecodedBytes = 0;
+    std::array<Bytef, kStreamChunk> mInput{};
+    std::array<char, kStreamChunk> mOutput{};
+};
+
+void drain_stream(std::istream& input)
 {
-    if (input.size() < 2) return { input.begin(), input.end() };
-    const auto gzip = input[0] == 0x1f && input[1] == 0x8b;
-    const auto zlib_stream = input[0] == 0x78;
-    if (!gzip && !zlib_stream) return { input.begin(), input.end() };
-
-    z_stream stream{};
-    if (inflateInit2(&stream, gzip ? MAX_WBITS + 16 : MAX_WBITS) != Z_OK) {
-        throw std::runtime_error(std::string(context) + " inflate initialization failed");
+    std::array<char, kStreamChunk> discard{};
+    while (input.read(discard.data(), static_cast<std::streamsize>(discard.size())) ||
+        input.gcount() != 0) {
     }
-    struct Guard {
-        z_stream* stream;
-        ~Guard() { inflateEnd(stream); }
-    } guard{ &stream };
-
-    std::vector<std::uint8_t> output;
-    std::vector<std::uint8_t> buffer(kStreamChunk);
-    std::size_t consumed = 0;
-    int status = Z_OK;
-    while (status != Z_STREAM_END) {
-        if (stream.avail_in == 0 && consumed < input.size()) {
-            const auto count = std::min<std::size_t>(
-                input.size() - consumed, std::numeric_limits<uInt>::max());
-            stream.next_in = const_cast<Bytef*>(input.data() + consumed);
-            stream.avail_in = static_cast<uInt>(count);
-            consumed += count;
-        }
-        stream.next_out = buffer.data();
-        stream.avail_out = static_cast<uInt>(buffer.size());
-        status = inflate(&stream, Z_NO_FLUSH);
-        if (status != Z_OK && status != Z_STREAM_END) {
-            throw std::runtime_error(std::string(context) + " inflate failed at compressed offset " +
-                std::to_string(stream.total_in) + ": " +
-                (stream.msg == nullptr ? std::to_string(status) : stream.msg));
-        }
-        const auto produced = buffer.size() - stream.avail_out;
-        if (output.size() > kMaxDecodedBytes - produced) {
-            throw std::runtime_error(std::string(context) + " decoded payload exceeds 2 GiB");
-        }
-        output.insert(output.end(), buffer.begin(), buffer.begin() + static_cast<std::ptrdiff_t>(produced));
-        if (produced == 0 && stream.avail_in == 0 && consumed == input.size() && status != Z_STREAM_END) {
-            throw std::runtime_error(std::string(context) + " compressed payload is truncated at offset " +
-                std::to_string(stream.total_in));
-        }
-    }
-    return output;
 }
 
-std::unique_ptr<nbt::tag_compound> read_big_endian_compound(
-    std::span<const std::uint8_t> bytes, std::string_view context)
+std::unique_ptr<nbt::tag_compound> parse_big_endian_compound(
+    std::istream& input, std::string_view context)
 {
-    const std::string storage(reinterpret_cast<const char*>(bytes.data()), bytes.size());
-    std::istringstream input(storage, std::ios::binary);
     try {
         auto [_, root] = nbt::io::read_compound(input, endian::big);
         return std::move(root);
     } catch (const std::exception& error) {
         throw std::runtime_error(std::string(context) + " NBT parse failed: " + error.what());
     }
+}
+
+std::unique_ptr<nbt::tag_compound> read_big_endian_compound(
+    std::ifstream& file, std::uint64_t offset, std::uint64_t length,
+    std::string_view context)
+{
+    const auto prefix_length = static_cast<std::size_t>(std::min<std::uint64_t>(length, 2));
+    const auto prefix = read_exact(file, offset, prefix_length, context);
+    const auto gzip = prefix.size() == 2 && prefix[0] == 0x1f && prefix[1] == 0x8b;
+    const auto zlib_stream = prefix.size() == 2 && prefix[0] == 0x78;
+
+    FileRangeStreamBuf range_buffer(file, offset, length, context);
+    std::istream range_input(&range_buffer);
+    range_input.exceptions(std::ios::badbit);
+    if (!gzip && !zlib_stream) {
+        auto root = parse_big_endian_compound(range_input, context);
+        drain_stream(range_input);
+        return root;
+    }
+
+    InflateStreamBuf inflate_buffer(range_input,
+        gzip ? MAX_WBITS + 16 : MAX_WBITS, context);
+    std::istream inflated_input(&inflate_buffer);
+    inflated_input.exceptions(std::ios::badbit);
+    auto root = parse_big_endian_compound(inflated_input, context);
+    // Parsing the root may finish before zlib has consumed its trailer.  Drain
+    // the stream so CRC/truncation errors remain observable without retaining
+    // the decoded bytes.
+    drain_stream(inflated_input);
+    return root;
+}
+
+std::uint64_t checked_product3(std::uint64_t first, std::uint64_t second,
+    std::uint64_t third, std::string_view context)
+{
+    constexpr auto maximum = std::numeric_limits<std::uint64_t>::max();
+    if (first != 0 && second > maximum / first) {
+        throw std::runtime_error(std::string(context) + " volume overflow");
+    }
+    const auto product = first * second;
+    if (product != 0 && third > maximum / product) {
+        throw std::runtime_error(std::string(context) + " volume overflow");
+    }
+    return product * third;
 }
 
 std::vector<SectionIndex> parse_index(const nbt::tag_byte_array& raw)
@@ -290,27 +436,43 @@ std::uint32_t palette_runtime_id(RuntimeRegistry& registry, const nbt::tag_compo
     return registry.register_state({ "minecraft:unknown", {}, 0 });
 }
 
-std::vector<std::int32_t> section_blocks(const nbt::tag_compound& section)
+struct SectionBlocks {
+    const nbt::tag_byte_array* bytes = nullptr;
+    const nbt::tag_int_array* ints = nullptr;
+    const nbt::tag_long_array* longs = nullptr;
+
+    std::size_t size() const noexcept
+    {
+        if (bytes) return bytes->size();
+        if (ints) return ints->size();
+        if (longs) return longs->size();
+        return 0;
+    }
+
+    std::int32_t operator[](std::size_t index) const
+    {
+        if (bytes) return static_cast<std::uint8_t>(bytes->get()[index]);
+        if (ints) return ints->get()[index];
+        if (longs) return static_cast<std::int32_t>(longs->get()[index]);
+        throw std::out_of_range("Construction blocks view is empty");
+    }
+};
+
+SectionBlocks section_blocks(const nbt::tag_compound& section)
 {
     const auto array_type = int_value(find_value(section, "blocks_array_type"));
     const auto* blocks = find_value(section, "blocks");
     if (!array_type || !blocks) return {};
-    std::vector<std::int32_t> result;
     if (*array_type == 7 && blocks->get_type() == nbt::tag_type::Byte_Array) {
-        const auto& values = blocks->as<nbt::tag_byte_array>();
-        result.reserve(values.size());
-        for (const auto value : values) result.push_back(static_cast<std::uint8_t>(value));
+        return { &blocks->as<nbt::tag_byte_array>(), nullptr, nullptr };
     } else if (*array_type == 11 && blocks->get_type() == nbt::tag_type::Int_Array) {
-        result.assign(blocks->as<nbt::tag_int_array>().begin(), blocks->as<nbt::tag_int_array>().end());
+        return { nullptr, &blocks->as<nbt::tag_int_array>(), nullptr };
     } else if (*array_type == 12 && blocks->get_type() == nbt::tag_type::Long_Array) {
-        const auto& values = blocks->as<nbt::tag_long_array>();
-        result.reserve(values.size());
-        for (const auto value : values) result.push_back(static_cast<std::int32_t>(value));
+        return { nullptr, nullptr, &blocks->as<nbt::tag_long_array>() };
     } else {
         throw std::runtime_error("Construction blocks type does not match blocks_array_type " +
             std::to_string(*array_type));
     }
-    return result;
 }
 
 std::array<std::int32_t, 3> section_shape(const nbt::tag_compound& section)
@@ -333,6 +495,7 @@ std::array<std::int32_t, 3> section_shape(const nbt::tag_compound& section)
 Result<void> ConstructionReader::read(const std::filesystem::path& path)
 {
     mStore.clear();
+    mState = {};
     mNonAirBlocks = 0;
     try {
         std::ifstream input(path, std::ios::binary);
@@ -363,10 +526,8 @@ Result<void> ConstructionReader::read(const std::filesystem::path& path)
             throw std::runtime_error("invalid metadata pointer " + std::to_string(metadata_start) +
                 " at file offset " + std::to_string(file_size - 12));
         }
-        const auto compressed_metadata = read_exact(input, metadata_start,
-            static_cast<std::size_t>(metadata_end - metadata_start), "Construction metadata");
-        const auto metadata_bytes = inflate_payload(compressed_metadata, "Construction metadata");
-        const auto metadata = read_big_endian_compound(metadata_bytes, "Construction metadata");
+        auto metadata = read_big_endian_compound(input, metadata_start,
+            metadata_end - metadata_start, "Construction metadata");
 
         const auto* index_value = find_value(*metadata, "section_index_table");
         const auto* palette_value = find_value(*metadata, "block_palette");
@@ -377,7 +538,7 @@ Result<void> ConstructionReader::read(const std::filesystem::path& path)
             palette_value->as<nbt::tag_list>().size() == 0) {
             throw std::runtime_error("Construction metadata block_palette is missing or empty");
         }
-        const auto sections = parse_index(index_value->as<nbt::tag_byte_array>());
+        auto sections = parse_index(index_value->as<nbt::tag_byte_array>());
 
         std::int32_t min_x = std::numeric_limits<std::int32_t>::max();
         std::int32_t min_y = std::numeric_limits<std::int32_t>::max();
@@ -421,8 +582,23 @@ Result<void> ConstructionReader::read(const std::filesystem::path& path)
         if (max_x <= min_x || max_y <= min_y || max_z <= min_z) {
             throw std::runtime_error("Construction bounds are invalid");
         }
-        const Size size{ max_x - min_x, max_y - min_y, max_z - min_z };
-        if (size.volume() <= 0) throw std::runtime_error("Construction size volume is invalid");
+        const auto width64 = static_cast<std::int64_t>(max_x) - min_x;
+        const auto height64 = static_cast<std::int64_t>(max_y) - min_y;
+        const auto length64 = static_cast<std::int64_t>(max_z) - min_z;
+        if (width64 <= 0 || height64 <= 0 || length64 <= 0 ||
+            width64 > std::numeric_limits<std::int32_t>::max() ||
+            height64 > std::numeric_limits<std::int32_t>::max() ||
+            length64 > std::numeric_limits<std::int32_t>::max()) {
+            throw std::runtime_error("Construction size exceeds int32 range");
+        }
+        const auto volume64 = checked_product3(static_cast<std::uint64_t>(width64),
+            static_cast<std::uint64_t>(height64), static_cast<std::uint64_t>(length64),
+            "Construction size");
+        if (volume64 > std::numeric_limits<std::size_t>::max()) {
+            throw std::runtime_error("Construction size volume exceeds addressable range");
+        }
+        const Size size{ static_cast<std::int32_t>(width64),
+            static_cast<std::int32_t>(height64), static_cast<std::int32_t>(length64) };
         mStore.set_size(size);
 
         std::vector<std::uint32_t> palette;
@@ -435,35 +611,45 @@ Result<void> ConstructionReader::read(const std::filesystem::path& path)
         }
         const auto unknown = mRegistry.find("minecraft:unknown").value_or(
             mRegistry.register_state({ "minecraft:unknown", {}, 0 }));
+        // The section index and runtime palette are now self-contained.  Drop
+        // the metadata DOM before opening section payloads so the two NBT trees
+        // do not contribute to peak memory at the same time.
+        metadata.reset();
 
         for (std::size_t section_index = 0; section_index < sections.size(); ++section_index) {
             const auto& entry = sections[section_index];
             if (entry.length <= 0 || entry.shape_x == 0 || entry.shape_y == 0 || entry.shape_z == 0) continue;
-            const auto section_end = static_cast<std::uint64_t>(entry.position) +
-                static_cast<std::uint64_t>(entry.length);
-            if (entry.position < 0 || section_end > file_size) {
+            if (entry.position < 0) {
                 throw std::runtime_error("Construction section #" + std::to_string(section_index) +
                     " has invalid range at file offset " + std::to_string(entry.position));
             }
-            const auto compressed = read_exact(input, static_cast<std::uint64_t>(entry.position),
-                static_cast<std::size_t>(entry.length), "Construction section #" + std::to_string(section_index));
-            const auto bytes = inflate_payload(compressed, "Construction section #" + std::to_string(section_index));
-            const auto section = read_big_endian_compound(bytes, "Construction section #" + std::to_string(section_index));
+            const auto section_start = static_cast<std::uint64_t>(entry.position);
+            const auto section_length = static_cast<std::uint64_t>(entry.length);
+            if (section_start > file_size || section_length > file_size - section_start) {
+                throw std::runtime_error("Construction section #" + std::to_string(section_index) +
+                    " has invalid range at file offset " + std::to_string(entry.position));
+            }
+            const auto section_context = "Construction section #" + std::to_string(section_index);
+            const auto section = read_big_endian_compound(input,
+                section_start, section_length, section_context);
             const auto blocks = section_blocks(*section);
             const auto parsed_shape = section_shape(*section);
             if (parsed_shape[0] > 0 && parsed_shape[1] > 0 && parsed_shape[2] > 0) {
-                const auto expected = static_cast<std::uint64_t>(parsed_shape[0]) * parsed_shape[1] * parsed_shape[2];
+                const auto expected = checked_product3(
+                    static_cast<std::uint64_t>(parsed_shape[0]),
+                    static_cast<std::uint64_t>(parsed_shape[1]),
+                    static_cast<std::uint64_t>(parsed_shape[2]), section_context);
                 if (expected != blocks.size()) {
                     throw std::runtime_error("Construction section #" + std::to_string(section_index) +
                         " block count mismatch");
                 }
             }
             const auto indexed_volume = static_cast<std::size_t>(entry.shape_x) * entry.shape_y * entry.shape_z;
-            if (!blocks.empty() && blocks.size() < indexed_volume) {
+            if (blocks.size() != 0 && blocks.size() < indexed_volume) {
                 throw std::runtime_error("Construction section #" + std::to_string(section_index) +
                     " blocks are truncated at index " + std::to_string(blocks.size()));
             }
-            if (!blocks.empty()) {
+            if (blocks.size() != 0) {
                 for (std::int32_t x = 0; x < entry.shape_x; ++x) {
                     for (std::int32_t y = 0; y < entry.shape_y; ++y) {
                         for (std::int32_t z = 0; z < entry.shape_z; ++z) {
@@ -475,8 +661,6 @@ Result<void> ConstructionReader::read(const std::filesystem::path& path)
                                 ? palette[static_cast<std::size_t>(palette_index)] : unknown;
                             if (runtime == mRegistry.air_runtime_id()) continue;
                             ++mNonAirBlocks;
-                            mStore.put({ entry.start_x - min_x + x, entry.start_y - min_y + y,
-                                entry.start_z - min_z + z }, runtime);
                         }
                     }
                 }
@@ -508,10 +692,220 @@ Result<void> ConstructionReader::read(const std::filesystem::path& path)
                 mStore.put_entity({ *x - min_x, *y - min_y, *z - min_z }, serialize_compound(*normalized));
             }
         }
+        mState.source_path = path;
+        mState.original_size = size;
+        mState.minimum = { min_x, min_y, min_z };
+        mState.sections = std::move(sections);
+        mState.palette = std::move(palette);
+        mState.unknown_runtime = unknown;
         return Result<void>::success();
     } catch (const std::exception& error) {
         return Result<void>::failure("parse Construction failed: " + std::string(error.what()));
     }
+}
+
+Result<ChunkMap> ConstructionReader::materialize_chunks(
+    std::span<const ChunkPos> positions, bool include_layer1) const
+{
+    try {
+        if (mState.source_path.empty()) {
+            throw std::runtime_error("Construction source has not been read");
+        }
+
+        ChunkMap result;
+        result.reserve(positions.size());
+        for (const auto position : positions) result.emplace(position, ChunkData{});
+        if (result.empty()) return Result<ChunkMap>::success(std::move(result));
+
+        std::ifstream input(mState.source_path, std::ios::binary);
+        if (!input) {
+            throw std::runtime_error("cannot reopen Construction file: " +
+                mState.source_path.string());
+        }
+        input.seekg(0, std::ios::end);
+        const auto end = input.tellg();
+        if (end < 0) throw std::runtime_error("cannot determine Construction file size");
+        const auto file_size = static_cast<std::uint64_t>(end);
+        const auto source_size = mState.original_size;
+        const auto structure_offset = mStore.offset();
+        const auto air = mRegistry.air_runtime_id();
+
+        // Preserve the Go/baseline placement order: section-index order is
+        // authoritative, later non-air placements overwrite earlier ones,
+        // and air entries do not clear an already materialized block.
+        for (std::size_t section_index = 0;
+            section_index < mState.sections.size(); ++section_index) {
+            const auto& entry = mState.sections[section_index];
+            if (entry.length <= 0 || entry.shape_x == 0 ||
+                entry.shape_y == 0 || entry.shape_z == 0) {
+                continue;
+            }
+
+            const auto local_min_x = static_cast<std::int64_t>(entry.start_x) -
+                mState.minimum.x;
+            const auto local_min_z = static_cast<std::int64_t>(entry.start_z) -
+                mState.minimum.z;
+            const auto local_max_x = local_min_x + entry.shape_x - 1;
+            const auto local_max_z = local_min_z + entry.shape_z - 1;
+            const auto clipped_min_x = std::max<std::int64_t>(0, local_min_x);
+            const auto clipped_min_z = std::max<std::int64_t>(0, local_min_z);
+            const auto clipped_max_x = std::min<std::int64_t>(
+                static_cast<std::int64_t>(source_size.width) - 1, local_max_x);
+            const auto clipped_max_z = std::min<std::int64_t>(
+                static_cast<std::int64_t>(source_size.length) - 1, local_max_z);
+            if (clipped_min_x > clipped_max_x || clipped_min_z > clipped_max_z) continue;
+
+            const auto min_chunk_x = floor_div64(
+                clipped_min_x + structure_offset.x, 16);
+            const auto max_chunk_x = floor_div64(
+                clipped_max_x + structure_offset.x, 16);
+            const auto min_chunk_z = floor_div64(
+                clipped_min_z + structure_offset.z, 16);
+            const auto max_chunk_z = floor_div64(
+                clipped_max_z + structure_offset.z, 16);
+            const auto requested = std::ranges::any_of(positions, [&](ChunkPos position) {
+                return static_cast<std::int64_t>(position.x) >= min_chunk_x &&
+                    static_cast<std::int64_t>(position.x) <= max_chunk_x &&
+                    static_cast<std::int64_t>(position.z) >= min_chunk_z &&
+                    static_cast<std::int64_t>(position.z) <= max_chunk_z;
+            });
+            if (!requested) continue;
+
+            if (entry.position < 0) {
+                throw std::runtime_error("Construction section #" +
+                    std::to_string(section_index) + " has negative file offset");
+            }
+            const auto section_start = static_cast<std::uint64_t>(entry.position);
+            const auto section_length = static_cast<std::uint64_t>(entry.length);
+            if (section_start > file_size || section_length > file_size - section_start) {
+                throw std::runtime_error("Construction section #" +
+                    std::to_string(section_index) + " has invalid range at file offset " +
+                    std::to_string(entry.position));
+            }
+            const auto context = "Construction section #" + std::to_string(section_index);
+            const auto section = read_big_endian_compound(
+                input, section_start, section_length, context);
+            const auto blocks = section_blocks(*section);
+            const auto parsed_shape = section_shape(*section);
+            if (parsed_shape[0] > 0 && parsed_shape[1] > 0 && parsed_shape[2] > 0) {
+                const auto expected = checked_product3(
+                    static_cast<std::uint64_t>(parsed_shape[0]),
+                    static_cast<std::uint64_t>(parsed_shape[1]),
+                    static_cast<std::uint64_t>(parsed_shape[2]), context);
+                if (expected != blocks.size()) {
+                    throw std::runtime_error(context + " block count mismatch");
+                }
+            }
+            const auto indexed_volume = static_cast<std::size_t>(entry.shape_x) *
+                entry.shape_y * entry.shape_z;
+            if (blocks.size() != 0 && blocks.size() < indexed_volume) {
+                throw std::runtime_error(context + " blocks are truncated at index " +
+                    std::to_string(blocks.size()));
+            }
+            if (blocks.size() == 0) continue;
+
+            for (std::int32_t x = 0; x < entry.shape_x; ++x) {
+                const auto local_x = local_min_x + x;
+                if (local_x < 0 || local_x >= source_size.width) continue;
+                const auto world_x = local_x + structure_offset.x;
+                if (world_x < std::numeric_limits<std::int32_t>::min() ||
+                    world_x > std::numeric_limits<std::int32_t>::max()) {
+                    throw std::runtime_error(context + " X coordinate exceeds int32 range");
+                }
+                const auto chunk_x = floor_div64(world_x, 16);
+                const auto layer_x = floor_mod64(world_x, 16);
+                for (std::int32_t z = 0; z < entry.shape_z; ++z) {
+                    const auto local_z = local_min_z + z;
+                    if (local_z < 0 || local_z >= source_size.length) continue;
+                    const auto world_z = local_z + structure_offset.z;
+                    if (world_z < std::numeric_limits<std::int32_t>::min() ||
+                        world_z > std::numeric_limits<std::int32_t>::max()) {
+                        throw std::runtime_error(context + " Z coordinate exceeds int32 range");
+                    }
+                    const auto chunk_z = floor_div64(world_z, 16);
+                    if (chunk_x < std::numeric_limits<std::int32_t>::min() ||
+                        chunk_x > std::numeric_limits<std::int32_t>::max() ||
+                        chunk_z < std::numeric_limits<std::int32_t>::min() ||
+                        chunk_z > std::numeric_limits<std::int32_t>::max()) {
+                        throw std::runtime_error(context + " chunk coordinate exceeds int32 range");
+                    }
+                    const ChunkPos chunk_position{
+                        static_cast<std::int32_t>(chunk_x),
+                        static_cast<std::int32_t>(chunk_z)
+                    };
+                    const auto output = result.find(chunk_position);
+                    if (output == result.end()) continue;
+                    const auto layer_z = floor_mod64(world_z, 16);
+
+                    for (std::int32_t y = 0; y < entry.shape_y; ++y) {
+                        const auto local_y = static_cast<std::int64_t>(entry.start_y) -
+                            mState.minimum.y + y;
+                        if (local_y < 0 || local_y >= source_size.height) continue;
+                        const auto index = static_cast<std::size_t>(
+                            (x * entry.shape_y + y) * entry.shape_z + z);
+                        const auto palette_index = blocks[index];
+                        const auto runtime = palette_index >= 0 &&
+                            static_cast<std::size_t>(palette_index) < mState.palette.size()
+                            ? mState.palette[static_cast<std::size_t>(palette_index)]
+                            : mState.unknown_runtime;
+                        if (runtime == air) continue;
+
+                        const auto world_y = local_y + structure_offset.y;
+                        if (world_y < std::numeric_limits<std::int32_t>::min() ||
+                            world_y > std::numeric_limits<std::int32_t>::max()) {
+                            throw std::runtime_error(context + " Y coordinate exceeds int32 range");
+                        }
+                        const auto sub_y64 = floor_div64(world_y - 64, 16);
+                        if (sub_y64 < std::numeric_limits<std::int32_t>::min() ||
+                            sub_y64 > std::numeric_limits<std::int32_t>::max()) {
+                            throw std::runtime_error(context + " subchunk Y exceeds int32 range");
+                        }
+                        const auto layer_y = floor_mod64(world_y - 64, 16);
+                        auto [subchunk, inserted] = output->second.sub_chunks.try_emplace(
+                            static_cast<std::int32_t>(sub_y64));
+                        if (inserted) {
+                            subchunk->second.layer0.fill(air);
+                            if (include_layer1) subchunk->second.layer1.fill(air);
+                        }
+                        const auto layer_index = static_cast<std::size_t>(
+                            (layer_y * 16 + layer_z) * 16 + layer_x);
+                        subchunk->second.layer0[layer_index] = runtime;
+                    }
+                }
+            }
+        }
+        return Result<ChunkMap>::success(std::move(result));
+    } catch (const std::exception& error) {
+        return Result<ChunkMap>::failure(
+            "materialize Construction chunks failed: " + std::string(error.what()));
+    }
+}
+
+Result<ChunkMap> ConstructionReader::get_chunks(
+    std::span<const ChunkPos> positions) const
+{
+    return materialize_chunks(positions, true);
+}
+
+Result<ChunkMap> ConstructionReader::get_chunks_layer0(
+    std::span<const ChunkPos> positions) const
+{
+    return materialize_chunks(positions, false);
+}
+
+Result<void> ConstructionReader::visit_chunks(
+    std::span<const ChunkPos> positions, const ChunkVisitor& visitor) const
+{
+    if (!visitor) return Result<void>::failure("Construction chunk visitor is empty");
+    auto chunks = materialize_chunks(positions, true);
+    if (!chunks) return Result<void>::failure(chunks.error());
+    for (const auto position : positions) {
+        const auto found = chunks.value().find(position);
+        if (found == chunks.value().end()) continue;
+        auto visited = visitor(position, found->second);
+        if (!visited) return visited;
+    }
+    return Result<void>::success();
 }
 
 Result<void> ConstructionReader::write_to_world(

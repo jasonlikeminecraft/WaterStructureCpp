@@ -89,6 +89,7 @@ void print_usage(std::ostream& output = std::cout)
         "Usage:\n"
         "  water_structure_cli inspect <input> [--assets <dir>]\n"
         "  water_structure_cli formats [--writers-only]\n"
+        "  water_structure_cli matrix [--all]\n"
         "  water_structure_cli convert <input> <output> [--format <name>] [--threads <n>] [--no-clear-air] [--chunk-optimize]\n"
         "  water_structure_cli to-world <input> <world-directory-or-output.mcworld> [--start <x,y,z>]\n\n"
         "Compatibility syntax:\n"
@@ -102,6 +103,8 @@ void print_usage(std::ostream& output = std::cout)
         "      --start <x,y,z>  Target subchunk position; default 0,-4,0\n"
         "      --assets <dir>   Runtime asset directory\n"
         "      --profile        Print internal conversion stage timing\n"
+        "      --memory-budget-mib <n>  Soft streaming budget (default 450)\n"
+        "      --max-in-flight <n>    Maximum queued chunks (0 = automatic)\n"
         "  -q, --quiet          Disable progress output\n"
         "  -h, --help           Show this help\n";
 }
@@ -167,6 +170,8 @@ struct CommonOptions {
     std::filesystem::path assets;
     bool profile = false;
     bool quiet = false;
+    std::size_t memory_budget_mib = 450;
+    std::size_t max_in_flight = 0;
 };
 
 bool take_option_value(int argc, char** argv, int& index, std::string_view& value)
@@ -350,18 +355,60 @@ int list_formats(bool writers_only)
 {
     std::cout << std::left << std::setw(18) << "Format"
               << std::setw(9) << "Reader" << std::setw(9) << "Writer"
-              << std::setw(14) << "To world" << "Extensions\n";
+              << std::setw(12) << "To world" << std::setw(14) << "From world"
+              << "Extensions\n";
     for (const auto& format : water_structure::FormatRegistry::formats()) {
         if (writers_only && !format.writer_implemented) continue;
         std::cout << std::left << std::setw(18) << format.name
                   << std::setw(9) << (format.reader_implemented ? "yes" : "pending")
                   << std::setw(9) << (format.writer_implemented ? "yes" : "pending")
-                  << std::setw(14) << (format.world_import_implemented ? "yes" : "pending");
+                  << std::setw(12) << (format.can_write_world() ? "yes" : "pending")
+                  << std::setw(14) << (format.can_read_world() ? "yes" : "pending");
         for (std::size_t i = 0; i < format.extensions.size(); ++i) {
             if (i) std::cout << ',';
             std::cout << format.extensions[i];
         }
         std::cout << '\n';
+    }
+    return 0;
+}
+
+int list_conversion_matrix(bool include_unsupported)
+{
+    std::cout << "source,target,direction,supported,streaming,lossy,reason\n";
+    const auto emit = [&](const water_structure::ConversionCapability& value) {
+        if (!include_unsupported && !value.supported) return;
+        std::string_view direction = "file-to-file";
+        if (value.direction == water_structure::ConversionDirection::StructureToWorld) {
+            direction = "structure-to-world";
+        } else if (value.direction == water_structure::ConversionDirection::WorldToStructure) {
+            direction = "world-to-structure";
+        }
+        std::cout << water_structure::to_string(value.source) << ','
+                  << water_structure::to_string(value.target) << ','
+                  << direction << ','
+                  << (value.supported ? "yes" : "no") << ','
+                  << (value.streaming ? "yes" : "no") << ','
+                  << (value.lossy ? "yes" : "no") << ','
+                  << value.reason << '\n';
+    };
+    const auto& formats = water_structure::FormatRegistry::formats();
+    for (const auto& source : formats) {
+        for (const auto& target : formats) {
+            const auto capability = water_structure::FormatRegistry::capability(
+                source.id, target.id, water_structure::ConversionDirection::FileToFile);
+            if (capability) emit(capability.value());
+        }
+        const auto to_world = water_structure::FormatRegistry::capability(
+            source.id, water_structure::StructureId::MCWorld,
+            water_structure::ConversionDirection::StructureToWorld);
+        if (to_world) emit(to_world.value());
+    }
+    for (const auto& target : formats) {
+        const auto from_world = water_structure::FormatRegistry::capability(
+            water_structure::StructureId::MCWorld, target.id,
+            water_structure::ConversionDirection::WorldToStructure);
+        if (from_world) emit(from_world.value());
     }
     return 0;
 }
@@ -383,8 +430,10 @@ int inspect_file(
               << "path: " << utf8(input) << '\n'
               << "reader: " << (format.reader_implemented ? "yes" : "pending") << '\n'
               << "writer: " << (format.writer_implemented ? "yes" : "pending") << '\n'
-              << "world import: " << (format.world_import_implemented ? "yes" : "pending") << '\n'
-              << "world export: " << (format.world_export_implemented ? "yes" : "pending") << '\n';
+              << "structure -> world: " << (format.can_write_world() ? "yes" : "pending") << '\n'
+              << "world -> structure: " << (format.can_read_world() ? "yes" : "pending") << '\n'
+              << "streaming reader: " << (format.streaming_reader_implemented ? "yes" : "pending") << '\n'
+              << "streaming writer: " << (format.streaming_writer_implemented ? "yes" : "pending") << '\n';
     if (!format.reader_implemented) return 0;
     auto opened = water_structure::FormatRegistry::open(input, registry);
     if (!opened) { std::cerr << "error: " << opened.error() << '\n'; return kInputError; }
@@ -464,9 +513,14 @@ int convert_file(
     progress.end_busy();
     progress.stage("写入");
     water_structure::ConversionOptions conversion_options;
+    conversion_options.worker_count = threads;
     conversion_options.thread_count = threads;
     conversion_options.clear_air = clear_air;
     conversion_options.mcfunction_chunk_partition = chunk_partition;
+    conversion_options.soft_memory_budget_bytes = common.memory_budget_mib * 1024u * 1024u;
+    conversion_options.max_in_flight_chunks = common.max_in_flight;
+    conversion_options.max_in_flight_tasks = common.max_in_flight;
+    conversion_options.collect_statistics = common.profile;
     conversion_options.callbacks.start = [&progress](std::size_t total) {
         progress.start(total);
         progress.begin_busy();
@@ -474,6 +528,15 @@ int convert_file(
     conversion_options.callbacks.progress = [&progress]() {
         progress.advance();
     };
+    if (common.profile) {
+        conversion_options.callbacks.statistics = [](const water_structure::ConversionStats& stats) {
+            std::cout << "\nprofile: source=" << water_structure::to_string(stats.source_format)
+                      << " target=" << water_structure::to_string(stats.target_format)
+                      << " elapsed_ms=" << stats.elapsed_ms
+                      << " chunks=" << stats.completed_chunks << '/' << stats.source_chunks
+                      << " non_air=" << stats.non_air_blocks << '\n';
+        };
+    }
     auto written = water_structure::FormatRegistry::write(
         *opened.value(), *format, output, registry, conversion_options);
     progress.end_busy();
@@ -497,6 +560,7 @@ int to_world(
     const std::filesystem::path& input,
     const std::filesystem::path& output,
     water_structure::SubChunkPos start,
+    std::size_t threads,
     const std::filesystem::path& executable,
     const CommonOptions& common)
 {
@@ -508,7 +572,12 @@ int to_world(
     auto opened = water_structure::FormatRegistry::open(
         input, registry, {
             .streaming_world_import = true,
-            .direct_schem_world_stream = true
+            .direct_schem_world_stream = true,
+            .worker_count = threads,
+            .max_in_flight_chunks = common.max_in_flight,
+            .soft_memory_budget_bytes = common.memory_budget_mib * 1024u * 1024u,
+            .allow_temporary_spool = true,
+            .collect_statistics = common.profile
         });
     if (!opened) { std::cerr << "error: " << opened.error() << '\n'; return kInputError; }
     auto world = water_structure::BedrockWorldAdapter::open(output);
@@ -518,9 +587,41 @@ int to_world(
     const auto begin = Clock::now();
     auto converted = opened.value()->write_to_world(
         world.value(), start,
-        {[&progress](std::size_t total) { progress.start(total); },
-         [&progress]() { progress.advance(); }});
-    if (!converted) { std::cerr << "\nerror: " << converted.error() << '\n'; return kConversionError; }
+        water_structure::ConversionCallbacks{
+            .start = [&progress](std::size_t total) { progress.start(total); },
+            .progress = [&progress]() { progress.advance(); },
+            .statistics = common.profile
+                ? std::function<void(const water_structure::ConversionStats&)>{
+                    [](const water_structure::ConversionStats& stats) {
+                        std::cout << "\nprofile: parse_ms=" << stats.parse_decompress_ms
+                                  << " mapping_ms=" << stats.palette_runtime_mapping_ms
+                                  << " materialize_ms=" << stats.chunk_materialization_ms
+                                  << " nbt_ms=" << stats.nbt_entity_decode_ms
+                                  << " encode_ms=" << stats.encode_compress_ms
+                                  << " leveldb_ms=" << stats.leveldb_write_ms
+                                  << " close_ms=" << stats.leveldb_close_ms
+                                  << " unpack_ms=" << stats.mcworld_unpack_ms
+                                  << " pack_ms=" << stats.mcworld_pack_ms
+                                  << " payload_bytes=" << stats.compressed_output_bytes
+                                  << " batches=" << stats.leveldb_batches
+                                  << " chunks=" << stats.completed_chunks << '/' << stats.source_chunks
+                                  << " total_ms=" << stats.elapsed_ms << '\n';
+                    }}
+                : std::function<void(const water_structure::ConversionStats&)>{},
+            .worker_count = threads,
+            .max_in_flight_chunks = common.max_in_flight,
+            .soft_memory_budget_bytes = common.memory_budget_mib * 1024u * 1024u,
+            .allow_temporary_spool = true,
+            .collect_statistics = common.profile,
+            .profiling = common.profile
+        });
+    if (!converted) {
+        const auto discarded = world.value().discard();
+        std::cerr << "\nerror: " << converted.error();
+        if (!discarded) std::cerr << "; discard failed: " << discarded.error();
+        std::cerr << '\n';
+        return kConversionError;
+    }
     auto closed = world.value().close();
     if (!closed) { std::cerr << "\nerror: " << closed.error() << '\n'; return kConversionError; }
     progress.finish();
@@ -649,7 +750,7 @@ int interactive(const std::filesystem::path& executable)
             return kUsageError;
         }
         std::cout << "\n正在写入世界……\n";
-        const auto result = to_world(source, output, start, executable, common);
+        const auto result = to_world(source, output, start, 0, executable, common);
         if (result == 0) std::cout << "本次转换完成，可以继续处理其他文件。\n\n";
         else std::cerr << "本次转换失败，可以继续处理其他文件。\n\n";
         continue;
@@ -710,6 +811,14 @@ int main(int argc, char** argv)
             }
             return list_formats(writers_only);
         }
+        if (command == "matrix") {
+            bool include_unsupported = false;
+            for (int i = 2; i < argc; ++i) {
+                if (std::string_view(argv[i]) == "--all") include_unsupported = true;
+                else { std::cerr << "error: unknown option: " << argv[i] << '\n'; return kUsageError; }
+            }
+            return list_conversion_matrix(include_unsupported);
+        }
 
         CommonOptions common;
         std::vector<std::filesystem::path> positional;
@@ -741,6 +850,22 @@ int main(int argc, char** argv)
                 const auto parsed = parse_size(value);
                 if (!parsed) { std::cerr << "error: invalid thread count: " << value << '\n'; return kUsageError; }
                 threads = *parsed;
+            } else if (argument == "--memory-budget-mib") {
+                if (!take_option_value(argc, argv, i, value)) { std::cerr << "error: --memory-budget-mib needs a value\n"; return kUsageError; }
+                const auto parsed = parse_size(value);
+                if (!parsed || *parsed < 64 || *parsed > 8192) {
+                    std::cerr << "error: memory budget must be between 64 and 8192 MiB\n";
+                    return kUsageError;
+                }
+                common.memory_budget_mib = *parsed;
+            } else if (argument == "--max-in-flight") {
+                if (!take_option_value(argc, argv, i, value)) { std::cerr << "error: --max-in-flight needs a value\n"; return kUsageError; }
+                const auto parsed = parse_size(value);
+                if (!parsed || *parsed > 4096) {
+                    std::cerr << "error: invalid max-in-flight value\n";
+                    return kUsageError;
+                }
+                common.max_in_flight = *parsed;
             } else if (argument == "--no-clear-air") {
                 clear_air = false;
             } else if (argument == "--chunk-optimize" ||
@@ -781,7 +906,7 @@ int main(int argc, char** argv)
                 chunk_partition, executable, common);
         }
         if (command == "to-world" && positional.size() == 2) {
-            return to_world(positional[0], positional[1], start, executable, common);
+            return to_world(positional[0], positional[1], start, threads, executable, common);
         }
         print_usage(std::cerr);
         return kUsageError;

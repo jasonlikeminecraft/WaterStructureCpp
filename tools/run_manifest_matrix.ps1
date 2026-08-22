@@ -4,7 +4,11 @@ param(
     [string]$OracleFixtureDirectory,
     [string]$GoManifestTool,
     [string]$CppManifestTool,
-    [int]$MemoryLimitMiB = 1024,
+    [string]$LimitedRunner,
+    # Every manifest process is subject to the same hard acceptance budget.
+    # Larger values are intentionally rejected instead of silently falling
+    # back to an unbounded polling run.
+    [int]$MemoryLimitMiB = 500,
     [switch]$RetryFailed,
     [switch]$Force
 )
@@ -17,6 +21,15 @@ if ([string]::IsNullOrWhiteSpace($GoManifestTool)) {
 if ([string]::IsNullOrWhiteSpace($CppManifestTool)) {
     $CppManifestTool = Join-Path $projectRoot 'build\windows\x64\release\cpp_manifest.exe'
 }
+$runnerCandidates = @(
+    (Join-Path $PSScriptRoot 'limited_runner\limited_runner.exe'),
+    (Join-Path $PSScriptRoot 'limited_runner\limited_runner')
+)
+if ([string]::IsNullOrWhiteSpace($LimitedRunner)) {
+    $LimitedRunner = $runnerCandidates | Where-Object {
+        Test-Path -LiteralPath $_ -PathType Leaf
+    } | Select-Object -First 1
+}
 $diffTool = Join-Path $PSScriptRoot 'diff_manifest.ps1'
 
 foreach ($tool in $GoManifestTool, $CppManifestTool, $diffTool) {
@@ -24,8 +37,13 @@ foreach ($tool in $GoManifestTool, $CppManifestTool, $diffTool) {
         throw "tool not found: $tool"
     }
 }
-if ($MemoryLimitMiB -lt 128) {
-    throw 'MemoryLimitMiB must be at least 128'
+if ([string]::IsNullOrWhiteSpace($LimitedRunner) -or
+    -not (Test-Path -LiteralPath $LimitedRunner -PathType Leaf)) {
+    throw 'limited_runner is required: build tools/limited_runner first or pass -LimitedRunner'
+}
+$LimitedRunner = (Resolve-Path -LiteralPath $LimitedRunner).Path
+if ($MemoryLimitMiB -lt 64 -or $MemoryLimitMiB -gt 500) {
+    throw 'MemoryLimitMiB must be between 64 and 500'
 }
 
 $casePath = (Resolve-Path -LiteralPath $CaseFile).Path
@@ -63,63 +81,42 @@ function Resolve-CaseInput {
     return Join-Path $caseDirectory $InputPath
 }
 
-function Quote-ProcessArgument {
-    param([string]$Value)
-    return '"' + $Value.Replace('\', '\').Replace('"', '\"') + '"'
-}
-
 function Invoke-MonitoredProcess {
     param(
         [string]$Executable,
         [string[]]$Arguments,
         [string]$StandardErrorPath,
-        [int]$LimitMiB
+        [int]$LimitMiB,
+        [string[]]$Environment = @()
     )
-    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
-    $startInfo.FileName = $Executable
-    $startInfo.Arguments = (($Arguments | ForEach-Object { Quote-ProcessArgument $_ }) -join ' ')
-    $startInfo.UseShellExecute = $false
-    $startInfo.CreateNoWindow = $true
-    $startInfo.RedirectStandardError = $true
-	$startInfo.EnvironmentVariables['WATERSTRUCTURE_MANIFEST_MEMORY_MIB'] = [string]$LimitMiB
-    $process = [System.Diagnostics.Process]::new()
-    $process.StartInfo = $startInfo
-    if (-not $process.Start()) {
-        throw "failed to start $Executable"
+    $reportPath = "$StandardErrorPath.limited.json"
+    $runnerArgs = @('-limit-mib', [string]$LimitMiB, '-output', $reportPath)
+    foreach ($entry in $Environment) { $runnerArgs += @('-env', $entry) }
+    $runnerArgs += @('--', $Executable)
+    $runnerArgs += $Arguments
+    & $LimitedRunner @runnerArgs | Out-Null
+    $runnerExit = $LASTEXITCODE
+    if (-not (Test-Path -LiteralPath $reportPath -PathType Leaf)) {
+        throw "limited runner did not produce a report (exit code $runnerExit)"
     }
-    $peakWorkingSet = 0L
-    $peakPrivateMemory = 0L
-    $exceeded = $false
-    while (-not $process.HasExited) {
-        $process.Refresh()
-        $peakWorkingSet = [Math]::Max($peakWorkingSet, $process.WorkingSet64)
-        $peakPrivateMemory = [Math]::Max($peakPrivateMemory, $process.PrivateMemorySize64)
-        if ([Math]::Max($process.WorkingSet64, $process.PrivateMemorySize64) -gt $LimitMiB * 1MB) {
-            $exceeded = $true
-            try {
-                $process.Kill($true)
-            } catch {
-                # Windows PowerShell 5.1 has no Kill(bool) overload. taskkill is
-                # restricted to the exact PID and recursively terminates its children.
-                & "$env:SystemRoot\System32\taskkill.exe" /PID $process.Id /T /F 2>$null | Out-Null
-                if (-not $process.HasExited) {
-                    $process.Kill()
-                }
-            }
-            break
-        }
-        Start-Sleep -Milliseconds 100
-    }
-    $process.WaitForExit()
-    $stderr = $process.StandardError.ReadToEnd()
-    [System.IO.File]::WriteAllText($StandardErrorPath, $stderr, [System.Text.UTF8Encoding]::new($false))
-    if ($exceeded) {
-        throw "$([System.IO.Path]::GetFileName($Executable)) exceeded ${LimitMiB} MiB and was terminated"
+    $runnerReport = Get-Content -Raw -Encoding UTF8 -LiteralPath $reportPath | ConvertFrom-Json
+    $runnerRun = @($runnerReport.runs)[0]
+    if ($null -eq $runnerRun) { throw "limited runner report has no runs (exit code $runnerExit)" }
+    if ($runnerRun.stderr_path -and (Test-Path -LiteralPath $runnerRun.stderr_path -PathType Leaf)) {
+        Copy-Item -LiteralPath $runnerRun.stderr_path -Destination $StandardErrorPath -Force
+    } else {
+        [System.IO.File]::WriteAllText($StandardErrorPath, '', [System.Text.UTF8Encoding]::new($false))
     }
     return [pscustomobject]@{
-        ExitCode = $process.ExitCode
-        PeakWorkingSetMiB = [Math]::Round($peakWorkingSet / 1MB, 2)
-        PeakPrivateMemoryMiB = [Math]::Round($peakPrivateMemory / 1MB, 2)
+        ExitCode = [int]$runnerRun.exit_code
+        PeakWorkingSetMiB = [Math]::Round(([double]$runnerRun.memory.peak_rss_bytes / 1MB), 2)
+        PeakPrivateMemoryMiB = [Math]::Round(([double]$runnerRun.memory.peak_private_bytes / 1MB), 2)
+        DurationMs = [double]$runnerRun.duration_ms
+        Termination = [string]$runnerRun.termination
+        MemoryExceeded = [bool]$runnerRun.memory_limit_exceeded
+        CpuUtilization = [double]$runnerRun.cpu_utilization_percent
+        RunnerExitCode = $runnerExit
+        Backend = [string]$runnerRun.backend
     }
 }
 
@@ -139,6 +136,7 @@ foreach ($case in $cases) {
     if ([string]::IsNullOrWhiteSpace($name) -or $name -notmatch '^[A-Za-z0-9_.-]+$') {
         throw "invalid case name: $name"
     }
+    $retryingFailed = $false
     if (-not $Force -and $status.Contains($name)) {
         if ($status[$name].result -eq 'passed') {
             Write-Output "SKIP $name passed"
@@ -150,6 +148,7 @@ foreach ($case in $cases) {
             $failed++
             continue
         }
+        $retryingFailed = $status[$name].result -eq 'failed' -and $RetryFailed
     }
     $inputPath = Resolve-CaseInput ([string]$case.input)
     if (-not (Test-Path -LiteralPath $inputPath)) {
@@ -171,10 +170,12 @@ foreach ($case in $cases) {
         $cppArguments += @('--format', [string]$case.format)
     }
 
-    if (-not $Force -and (Test-Path -LiteralPath $goOutput -PathType Leaf) -and
+    if (-not $Force -and -not $retryingFailed -and
+        (Test-Path -LiteralPath $goOutput -PathType Leaf) -and
         (Test-Path -LiteralPath $cppOutput -PathType Leaf)) {
         try {
-            & $diffTool -GoManifest $goOutput -CppManifest $cppOutput |
+            & $diffTool -GoManifest $goOutput -CppManifest $cppOutput `
+                -LimitedRunner $LimitedRunner -MemoryLimitMiB $MemoryLimitMiB |
                 Out-File -LiteralPath (Join-Path $outputRoot "$name.diff.txt") -Encoding utf8
             $status[$name] = [ordered]@{
                 result = 'passed'
@@ -205,16 +206,26 @@ foreach ($case in $cases) {
 
     try {
         Write-Output "RUN  $name Go"
-        $goResult = Invoke-MonitoredProcess $GoManifestTool $goArguments $goError $MemoryLimitMiB
+        $goResult = Invoke-MonitoredProcess $GoManifestTool $goArguments $goError $MemoryLimitMiB @(
+            "WATERSTRUCTURE_MANIFEST_MEMORY_MIB=$MemoryLimitMiB",
+            "GOMEMLIMIT=$([Math]::Max(64, $MemoryLimitMiB - 32))MiB"
+        )
+        if ($goResult.MemoryExceeded) {
+            throw "go_manifest exceeded ${MemoryLimitMiB} MiB ($($goResult.Backend))"
+        }
         if ($goResult.ExitCode -notin 0, 2) {
             throw "go_manifest exit code $($goResult.ExitCode)"
         }
         Write-Output "RUN  $name C++"
         $cppResult = Invoke-MonitoredProcess $CppManifestTool $cppArguments $cppError $MemoryLimitMiB
+        if ($cppResult.MemoryExceeded) {
+            throw "cpp_manifest exceeded ${MemoryLimitMiB} MiB ($($cppResult.Backend))"
+        }
         if ($cppResult.ExitCode -notin 0, 2) {
             throw "cpp_manifest exit code $($cppResult.ExitCode)"
         }
-        & $diffTool -GoManifest $goOutput -CppManifest $cppOutput |
+        & $diffTool -GoManifest $goOutput -CppManifest $cppOutput `
+            -LimitedRunner $LimitedRunner -MemoryLimitMiB $MemoryLimitMiB |
             Out-File -LiteralPath (Join-Path $outputRoot "$name.diff.txt") -Encoding utf8
         $status[$name] = [ordered]@{
             result = 'passed'
@@ -224,6 +235,10 @@ foreach ($case in $cases) {
             go_peak_private_memory_mib = $goResult.PeakPrivateMemoryMiB
             cpp_peak_working_set_mib = $cppResult.PeakWorkingSetMiB
             cpp_peak_private_memory_mib = $cppResult.PeakPrivateMemoryMiB
+            go_duration_ms = $goResult.DurationMs
+            cpp_duration_ms = $cppResult.DurationMs
+            go_termination = $goResult.Termination
+            cpp_termination = $cppResult.Termination
             completed_at = [DateTimeOffset]::Now.ToString('o')
         }
         $passed++
@@ -246,3 +261,4 @@ Write-Output "SUMMARY passed=$passed failed=$failed total=$($cases.Count)"
 if ($failed -ne 0) {
     exit 1
 }
+exit 0

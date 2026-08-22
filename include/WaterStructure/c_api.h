@@ -26,6 +26,14 @@ typedef struct ws_reader ws_reader;
 #define WS_PROGRESS_WRITE 3
 #define WS_PROGRESS_FINALIZE 4
 
+#define WS_CAP_FILE_READER          (1u << 0)
+#define WS_CAP_FILE_WRITER          (1u << 1)
+#define WS_CAP_STRUCTURE_TO_WORLD   (1u << 2)
+#define WS_CAP_WORLD_TO_STRUCTURE   (1u << 3)
+#define WS_CAP_STREAMING_READER     (1u << 4)
+#define WS_CAP_STREAMING_WRITER     (1u << 5)
+#define WS_CAP_LOSSY_ROUND_TRIP     (1u << 6)
+
 typedef void (*ws_progress_callback)(
     void* user_data,
     uint8_t stage,
@@ -46,6 +54,9 @@ typedef struct ws_structure_info {
 /* The returned pointer remains valid until the next call on the same context. */
 WATER_STRUCTURE_API const char* ws_version(void);
 WATER_STRUCTURE_API uint32_t ws_abi_version(void);
+WATER_STRUCTURE_API uint32_t ws_format_count(void);
+WATER_STRUCTURE_API const char* ws_format_name(uint8_t format_id);
+WATER_STRUCTURE_API uint32_t ws_format_capabilities(uint8_t format_id);
 WATER_STRUCTURE_API ws_context* ws_context_create(const char* assets_directory_utf8);
 WATER_STRUCTURE_API void ws_context_destroy(ws_context* context);
 WATER_STRUCTURE_API const char* ws_last_error(const ws_context* context);
@@ -90,6 +101,22 @@ WATER_STRUCTURE_API int ws_convert_ex2(
     int clear_air,
     int chunk_partition);
 
+/* Streaming-budget extension. A zero soft_memory_budget_bytes selects the
+ * library default (currently 450 MiB); zero queue limits select bounded
+ * hardware-derived defaults. This adds a symbol without changing prior ABI. */
+WATER_STRUCTURE_API int ws_convert_ex3(
+    ws_context* context,
+    const char* input_path_utf8,
+    const char* target_format,
+    const char* output_path_utf8,
+    uint64_t thread_count,
+    int clear_air,
+    int chunk_partition,
+    uint64_t soft_memory_budget_bytes,
+    uint64_t max_in_flight_tasks,
+    uint64_t max_in_flight_chunks,
+    int allow_temporary_spool);
+
 /* Optional progress-enabled variant; ws_convert remains ABI-compatible. */
 WATER_STRUCTURE_API int ws_convert_with_progress(
     ws_context* context,
@@ -121,6 +148,21 @@ WATER_STRUCTURE_API int ws_convert_with_progress_ex2(
     ws_progress_callback callback,
     void* user_data);
 
+WATER_STRUCTURE_API int ws_convert_with_progress_ex3(
+    ws_context* context,
+    const char* input_path_utf8,
+    const char* target_format,
+    const char* output_path_utf8,
+    uint64_t thread_count,
+    int clear_air,
+    int chunk_partition,
+    uint64_t soft_memory_budget_bytes,
+    uint64_t max_in_flight_tasks,
+    uint64_t max_in_flight_chunks,
+    int allow_temporary_spool,
+    ws_progress_callback callback,
+    void* user_data);
+
 WATER_STRUCTURE_API int ws_to_world(
     ws_context* context,
     const char* input_path_utf8,
@@ -136,6 +178,34 @@ WATER_STRUCTURE_API int ws_to_world_with_progress(
     int32_t start_x,
     int32_t start_y,
     int32_t start_z,
+    ws_progress_callback callback,
+    void* user_data);
+
+/* Versioned world conversion entry point. Existing ws_to_world symbols keep
+ * their ABI and use the conservative defaults. */
+WATER_STRUCTURE_API int ws_to_world_ex3(
+    ws_context* context,
+    const char* input_path_utf8,
+    const char* world_path_utf8,
+    int32_t start_x,
+    int32_t start_y,
+    int32_t start_z,
+    uint64_t worker_count,
+    uint64_t soft_memory_budget_bytes,
+    uint64_t max_in_flight_chunks,
+    int allow_temporary_spool);
+
+WATER_STRUCTURE_API int ws_to_world_with_progress_ex3(
+    ws_context* context,
+    const char* input_path_utf8,
+    const char* world_path_utf8,
+    int32_t start_x,
+    int32_t start_y,
+    int32_t start_z,
+    uint64_t worker_count,
+    uint64_t soft_memory_budget_bytes,
+    uint64_t max_in_flight_chunks,
+    int allow_temporary_spool,
     ws_progress_callback callback,
     void* user_data);
 

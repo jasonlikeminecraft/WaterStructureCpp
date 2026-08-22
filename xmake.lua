@@ -1,5 +1,5 @@
 set_project("WaterStructureCpp")
-set_version("0.1.0")
+set_version("0.1.7")
 set_languages("cxx23")
 set_encodings("utf-8")
 add_defines("LEVELDB_COMPILE_LIBRARY")
@@ -156,7 +156,9 @@ target("water_structure_bench")
     add_files("benchmarks/*.cpp")
     add_includedirs("include")
     add_deps("water_structure")
-    add_syslinks("psapi")
+    if is_plat("windows") then
+        add_syslinks("psapi")
+    end
 
 target("cpp_manifest")
     set_kind("binary")
@@ -166,7 +168,6 @@ target("cpp_manifest")
     add_includedirs("include")
     add_deps("water_structure")
     add_packages("nlohmann_json")
-    add_syslinks("bcrypt")
 
 target("world_compare")
     set_kind("binary")

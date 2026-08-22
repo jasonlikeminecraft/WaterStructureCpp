@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <charconv>
+#include <cstdlib>
 #include <filesystem>
 #include <iostream>
 #include <optional>
@@ -25,6 +26,40 @@ std::int32_t integer(std::string_view text)
     if (result.ec != std::errc{} || result.ptr != text.data() + text.size())
         throw std::runtime_error("invalid integer: " + std::string(text));
     return value;
+}
+
+std::filesystem::path locate_assets(
+    const std::filesystem::path& executable,
+    const std::filesystem::path& configured)
+{
+    std::vector<std::filesystem::path> candidates;
+    if (!configured.empty()) candidates.push_back(configured);
+    if (const auto* environment = std::getenv("WATER_STRUCTURE_ASSETS");
+        environment && *environment) {
+        candidates.emplace_back(environment);
+    }
+    candidates.push_back(std::filesystem::current_path() / "assets");
+
+    // Installed helpers normally live below a build or package directory.
+    // Walk a bounded number of parents so the comparator works with both
+    // in-tree and out-of-tree xmake/CMake builds without assuming a fixed
+    // build layout.
+    auto parent = std::filesystem::absolute(executable).parent_path();
+    for (int depth = 0; depth < 10 && !parent.empty(); ++depth) {
+        candidates.push_back(parent / "assets");
+        parent = parent.parent_path();
+    }
+
+    for (auto candidate : candidates) {
+        if (candidate.filename() == "block_mappings_v1.json")
+            candidate = candidate.parent_path();
+        std::error_code error;
+        if (std::filesystem::is_regular_file(
+                candidate / "block_mappings_v1.json", error)) {
+            return candidate;
+        }
+    }
+    return {};
 }
 
 std::string state_text(const RuntimeRegistry& registry, std::uint32_t id)
@@ -185,9 +220,9 @@ void compare_layer(
 
 int main(int argc, char** argv)
 {
-    if (argc != 9) {
+    if (argc != 9 && argc != 11) {
         std::cerr << "usage: world_compare <source.mcworld|dir> <target.dir> "
-                     "minX minY minZ maxX maxY maxZ\n";
+                     "minX minY minZ maxX maxY maxZ [--assets <dir>]\n";
         return 2;
     }
     try {
@@ -198,13 +233,21 @@ int main(int argc, char** argv)
         if (bounds.min.x > bounds.max.x || bounds.min.y > bounds.max.y || bounds.min.z > bounds.max.z)
             throw std::runtime_error("invalid bounds");
 
-        RuntimeRegistry registry;
-        const auto mapping = std::filesystem::path(argv[0]).parent_path().parent_path().parent_path() /
-            "assets" / "block_mappings_v1.json";
-        if (std::filesystem::is_regular_file(mapping)) {
-            const auto loaded = registry.load_block_mappings(mapping);
-            if (!loaded) throw std::runtime_error(loaded.error());
+        std::filesystem::path configured_assets;
+        if (argc == 11) {
+            if (std::string_view(argv[9]) != "--assets" || std::string_view(argv[10]).empty())
+                throw std::runtime_error("expected --assets <dir>");
+            configured_assets = argv[10];
         }
+        RuntimeRegistry registry;
+        const auto assets = locate_assets(argv[0], configured_assets);
+        if (assets.empty()) {
+            throw std::runtime_error(
+                "cannot locate assets/block_mappings_v1.json; pass --assets <dir> "
+                "or set WATER_STRUCTURE_ASSETS");
+        }
+        const auto loaded = registry.load_block_mappings(assets / "block_mappings_v1.json");
+        if (!loaded) throw std::runtime_error(loaded.error());
         registry.install_as_bwo_resolver();
         auto source_opened = BedrockWorldAdapter::open(argv[1], false);
         if (!source_opened) throw std::runtime_error("source: " + source_opened.error());

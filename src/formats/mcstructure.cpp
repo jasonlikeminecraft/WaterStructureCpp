@@ -16,6 +16,7 @@
 #include <fstream>
 #include <limits>
 #include <sstream>
+#include <utility>
 
 namespace water_structure {
 
@@ -272,7 +273,13 @@ Result<void> McStructure::read(const std::filesystem::path& path)
         bool has_size = false;
         bool has_structure = false;
         bool has_indices = false;
-        std::unique_ptr<nbt::tag> palette_holder;
+        bool has_palette = false;
+        bool has_default_palette = false;
+        bool has_block_palette = false;
+        const auto known_unknown = mRegistry.find("minecraft:unknown");
+        mUnknownRuntimeId = known_unknown ? *known_unknown :
+            mRegistry.register_state(BlockState{ "minecraft:unknown", {}, 0 });
+
         auto read_size = [&]() -> Result<void> {
             const auto element_type = reader.read_type(true);
             std::int32_t count = 0;
@@ -321,6 +328,154 @@ Result<void> McStructure::read(const std::filesystem::path& path)
             has_indices = true;
             return Result<void>::success();
         };
+        auto append_palette_entry = [&](const nbt::tag_compound& block) {
+            const auto* name = find_value(block, "name");
+            const auto block_name = name ? string_value(*name).value_or("minecraft:unknown") :
+                "minecraft:unknown";
+            BlockState state{ block_name, {}, 0 };
+            if (const auto* states = find_value(block, "states");
+                states && states->get_type() == nbt::tag_type::Compound) {
+                for (const auto& [property_name, property_value] : states->as<nbt::tag_compound>()) {
+                    if (auto property = state_property(property_name, property_value)) {
+                        state.states.push_back(std::move(*property));
+                    }
+                }
+            }
+            if (const auto* version = find_value(block, "version")) {
+                state.version = int_value(*version).value_or(0);
+            }
+            if (state.name == "minecraft:air" && state.states.empty()) {
+                mPalette.push_back(mRegistry.air_runtime_id());
+                return;
+            }
+            // Go's StateToRuntimeID resolves against the current palette and
+            // falls back to the block's default state for old properties.
+            mPalette.push_back(mRegistry.find(state.name, state.states)
+                .or_else([&] { return mRegistry.find(state.name); })
+                .value_or(mUnknownRuntimeId));
+        };
+        auto read_block_palette = [&]() -> Result<void> {
+            const auto element_type = reader.read_type(true);
+            std::int32_t count = 0;
+            reader.read_num(count);
+            if (count < 0) {
+                return Result<void>::failure("MCStructure block_palette 数量无效");
+            }
+            mPalette.clear();
+            mPalette.reserve(static_cast<std::size_t>(count));
+            for (std::int32_t index = 0; index < count; ++index) {
+                if (element_type != nbt::tag_type::Compound) {
+                    skip_payload(reader, element_type);
+                    mPalette.push_back(mUnknownRuntimeId);
+                    continue;
+                }
+                // Materialize only one palette entry.  This keeps typed NBT
+                // conversion semantics without retaining the complete palette
+                // compound (and block-position data) in memory.
+                const auto entry = reader.read_payload(element_type);
+                append_palette_entry(entry->as<nbt::tag_compound>());
+            }
+            has_block_palette = true;
+            return Result<void>::success();
+        };
+        auto read_position_data = [&]() -> Result<void> {
+            // tag_compound is a sorted map.  Different textual keys may still
+            // parse to the same numeric block index (for example "1" and
+            // "01"); retain the lexicographically first entity just as the
+            // former full-DOM iteration did.
+            std::unordered_map<std::int32_t, std::string> entity_source_keys;
+            while (true) {
+                const auto type = reader.read_type(true);
+                if (type == nbt::tag_type::End) break;
+                const auto index_text = reader.read_string();
+                if (type != nbt::tag_type::Compound) {
+                    skip_payload(reader, type);
+                    continue;
+                }
+                std::int32_t index = 0;
+                const auto parsed = std::from_chars(
+                    index_text.data(), index_text.data() + index_text.size(), index);
+                const bool valid_index = parsed.ec == std::errc{} &&
+                    parsed.ptr == index_text.data() + index_text.size();
+                std::optional<NbtPayload> entity_payload;
+                while (true) {
+                    const auto child_type = reader.read_type(true);
+                    if (child_type == nbt::tag_type::End) break;
+                    const auto child_key = reader.read_string();
+                    if (valid_index && child_key == "block_entity_data" &&
+                        child_type == nbt::tag_type::Compound) {
+                        const auto entity = reader.read_payload(child_type);
+                        entity_payload = serialize_compound(entity->as<nbt::tag_compound>());
+                    } else {
+                        skip_payload(reader, child_type);
+                    }
+                }
+                if (entity_payload) {
+                    const auto source = entity_source_keys.find(index);
+                    if (source == entity_source_keys.end()) {
+                        entity_source_keys.emplace(index, index_text);
+                        mBlockEntities.emplace(index, std::move(*entity_payload));
+                    } else if (index_text < source->second) {
+                        source->second = index_text;
+                        mBlockEntities[index] = std::move(*entity_payload);
+                    }
+                }
+            }
+            return Result<void>::success();
+        };
+        auto read_default_palette = [&]() -> Result<void> {
+            has_default_palette = true;
+            bool saw_block_palette = false;
+            bool saw_position_data = false;
+            while (true) {
+                const auto type = reader.read_type(true);
+                if (type == nbt::tag_type::End) break;
+                const auto key = reader.read_string();
+                if (key == "block_palette" && !std::exchange(saw_block_palette, true)) {
+                    if (type == nbt::tag_type::List) {
+                        auto result = read_block_palette();
+                        if (!result) return result;
+                    } else {
+                        skip_payload(reader, type);
+                    }
+                } else if (key == "block_position_data" &&
+                    !std::exchange(saw_position_data, true)) {
+                    if (type == nbt::tag_type::Compound) {
+                        auto result = read_position_data();
+                        if (!result) return result;
+                    } else {
+                        skip_payload(reader, type);
+                    }
+                } else {
+                    skip_payload(reader, type);
+                }
+            }
+            return Result<void>::success();
+        };
+        auto read_palette = [&]() -> Result<void> {
+            has_palette = true;
+            has_default_palette = false;
+            has_block_palette = false;
+            mPalette.clear();
+            mBlockEntities.clear();
+            bool saw_default = false;
+            while (true) {
+                const auto type = reader.read_type(true);
+                if (type == nbt::tag_type::End) break;
+                const auto key = reader.read_string();
+                if (key == "default" && !std::exchange(saw_default, true)) {
+                    if (type == nbt::tag_type::Compound) {
+                        auto result = read_default_palette();
+                        if (!result) return result;
+                    } else {
+                        skip_payload(reader, type);
+                    }
+                } else {
+                    skip_payload(reader, type);
+                }
+            }
+            return Result<void>::success();
+        };
         auto read_structure = [&]() -> Result<void> {
             while (true) {
                 const auto type = reader.read_type(true);
@@ -330,7 +485,8 @@ Result<void> McStructure::read(const std::filesystem::path& path)
                     auto result = read_indices();
                     if (!result) return result;
                 } else if (key == "palette" && type == nbt::tag_type::Compound) {
-                    palette_holder = reader.read_payload(type);
+                    auto result = read_palette();
+                    if (!result) return result;
                 } else {
                     skip_payload(reader, type);
                 }
@@ -353,7 +509,7 @@ Result<void> McStructure::read(const std::filesystem::path& path)
                 skip_payload(reader, type);
             }
         }
-        if (!has_size || !has_structure || !has_indices || !palette_holder) {
+        if (!has_size || !has_structure || !has_indices || !has_palette) {
             return Result<void>::failure("MCStructure 缺少 size、structure、block_indices 或 palette");
         }
         const auto volume = static_cast<std::size_t>(mOriginalSize.volume());
@@ -361,71 +517,11 @@ Result<void> McStructure::read(const std::filesystem::path& path)
             return Result<void>::failure("MCStructure block_indices 长度与 size 不一致");
         }
 
-        const auto& palette_root = palette_holder->as<nbt::tag_compound>();
-        const auto* default_value = find_value(palette_root, "default");
-        if (!default_value || default_value->get_type() != nbt::tag_type::Compound) {
+        if (!has_default_palette) {
             return Result<void>::failure("MCStructure 缺少默认 palette");
         }
-        const auto& palette = default_value->as<nbt::tag_compound>();
-        const auto* blocks_value = find_value(palette, "block_palette");
-        if (!blocks_value || blocks_value->get_type() != nbt::tag_type::List) {
+        if (!has_block_palette) {
             return Result<void>::failure("MCStructure 缺少 block_palette");
-        }
-
-        const auto& blocks = blocks_value->as<nbt::tag_list>();
-        mPalette.clear();
-        mPalette.reserve(blocks.size());
-        const auto known_unknown = mRegistry.find("minecraft:unknown");
-        mUnknownRuntimeId = known_unknown ? *known_unknown :
-            mRegistry.register_state(BlockState{ "minecraft:unknown", {}, 0 });
-        for (const auto& value : blocks) {
-            if (value.get_type() != nbt::tag_type::Compound) {
-                mPalette.push_back(mUnknownRuntimeId);
-                continue;
-            }
-            const auto& block = value.as<nbt::tag_compound>();
-            const auto* name = find_value(block, "name");
-            const auto block_name = name ? string_value(*name).value_or("minecraft:unknown") : "minecraft:unknown";
-            BlockState state{ block_name, {}, 0 };
-            if (const auto* states = find_value(block, "states");
-                states && states->get_type() == nbt::tag_type::Compound) {
-                for (const auto& [property_name, property_value] : states->as<nbt::tag_compound>()) {
-                    if (auto property = state_property(property_name, property_value)) {
-                        state.states.push_back(std::move(*property));
-                    }
-                }
-            }
-            if (const auto* version = find_value(block, "version")) {
-                state.version = int_value(*version).value_or(0);
-            }
-            if (state.name == "minecraft:air" && state.states.empty()) {
-                mPalette.push_back(mRegistry.air_runtime_id());
-            } else {
-                // Go's StateToRuntimeID resolves against the current palette and falls
-                // back to the block's default state when old properties are unknown.
-                const auto runtime_id = mRegistry.find(state.name, state.states)
-                    .or_else([&] { return mRegistry.find(state.name); })
-                    .value_or(mUnknownRuntimeId);
-                mPalette.push_back(runtime_id);
-            }
-        }
-
-        mBlockEntities.clear();
-        if (const auto* position_data = find_value(palette, "block_position_data");
-            position_data && position_data->get_type() == nbt::tag_type::Compound) {
-            for (const auto& [index_text, position_value] : position_data->as<nbt::tag_compound>()) {
-                std::int32_t index = 0;
-                const auto parsed = std::from_chars(index_text.data(), index_text.data() + index_text.size(), index);
-                if (parsed.ec != std::errc{} || parsed.ptr != index_text.data() + index_text.size() ||
-                    position_value.get_type() != nbt::tag_type::Compound) {
-                    continue;
-                }
-                const auto* entity = find_value(position_value.as<nbt::tag_compound>(), "block_entity_data");
-                if (!entity || entity->get_type() != nbt::tag_type::Compound) {
-                    continue;
-                }
-                mBlockEntities.emplace(index, serialize_compound(entity->as<nbt::tag_compound>()));
-            }
         }
 
         mNonAirBlocks = 0;

@@ -40,14 +40,26 @@ struct TaskOutput {
 
 class TaskCommandBuffer final {
 public:
-    explicit TaskCommandBuffer(std::filesystem::path spill_path)
-        : mSpillPath(std::move(spill_path)), mStaging(kStreamBufferSize)
+    explicit TaskCommandBuffer(
+        std::filesystem::path spill_path,
+        std::size_t memory_limit,
+        std::size_t staging_size,
+        bool allow_spill,
+        std::size_t spill_limit = 0)
+        : mSpillPath(std::move(spill_path)),
+          mStaging(std::max<std::size_t>(staging_size, 4096)),
+          mMemoryLimit(std::max<std::size_t>(memory_limit, 4096)),
+          mAllowSpill(allow_spill),
+          mSpillLimit(spill_limit)
     {
-        mMemory.reserve(kStreamBufferSize);
+        mMemory.reserve(std::min(mMemoryLimit, mStaging.size()));
     }
 
-    explicit TaskCommandBuffer(std::ostream& direct_output)
-        : mDirectOutput(&direct_output), mStaging(kStreamBufferSize)
+    explicit TaskCommandBuffer(
+        std::ostream& direct_output,
+        std::size_t staging_size)
+        : mDirectOutput(&direct_output),
+          mStaging(std::max<std::size_t>(staging_size, 4096))
     {
     }
 
@@ -92,7 +104,12 @@ public:
     Result<TaskOutput> finish()
     {
         if (!flush_staging()) {
-            return Result<TaskOutput>::failure("MCFunction writer 写入任务缓冲失败");
+            return Result<TaskOutput>::failure(mFailure.empty()
+                ? "MCFunction writer 写入任务缓冲失败" : mFailure);
+        }
+        if (mFailed) {
+            return Result<TaskOutput>::failure(mFailure.empty()
+                ? "MCFunction writer 写入任务缓冲失败" : mFailure);
         }
         if (mDirectOutput != nullptr) {
             if (!*mDirectOutput) {
@@ -126,14 +143,32 @@ private:
     bool open_spill()
     {
         if (mSpill.is_open()) return true;
-        mSpillBuffer.resize(kStreamBufferSize);
+        if (!mAllowSpill) {
+            mFailure =
+                "capability error: MCFunction writer 命令缓冲超过 soft_memory_budget，"
+                "且 allow_temporary_spool=false";
+            return false;
+        }
+        if (mSpillPath.empty()) {
+            mFailure = "MCFunction writer 无法创建受控临时 spool 路径";
+            return false;
+        }
+        mSpillBuffer.resize(mStaging.size());
         mSpill.rdbuf()->pubsetbuf(mSpillBuffer.data(),
                                   static_cast<std::streamsize>(mSpillBuffer.size()));
         mSpill.open(mSpillPath, std::ios::binary | std::ios::trunc);
         if (!mSpill) return false;
+        if (mSpillLimit != 0 && mMemory.size() > mSpillLimit) {
+            mFailure = "MCFunction writer 临时 spool 超过 temporary_file_limit_bytes";
+            mSpill.close();
+            std::error_code remove_error;
+            std::filesystem::remove(mSpillPath, remove_error);
+            return false;
+        }
         if (!mMemory.empty()) {
             mSpill.write(mMemory.data(), static_cast<std::streamsize>(mMemory.size()));
             if (!mSpill) return false;
+            mSpillBytes = mMemory.size();
             std::string{}.swap(mMemory);
         }
         return true;
@@ -145,13 +180,21 @@ private:
             mDirectOutput->write(data, static_cast<std::streamsize>(size));
             return static_cast<bool>(*mDirectOutput);
         }
-        if (!mSpill.is_open() && mMemory.size() + size <= kTaskMemoryLimit) {
+        if (!mSpill.is_open() && size <= mMemoryLimit -
+            std::min(mMemoryLimit, mMemory.size())) {
             mMemory.append(data, size);
             return true;
         }
         if (!open_spill()) return false;
+        if (mSpillLimit != 0 && size > mSpillLimit -
+            std::min(mSpillLimit, mSpillBytes)) {
+            mFailure = "MCFunction writer 临时 spool 超过 temporary_file_limit_bytes";
+            return false;
+        }
         mSpill.write(data, static_cast<std::streamsize>(size));
-        return static_cast<bool>(mSpill);
+        if (!mSpill) return false;
+        mSpillBytes += size;
+        return true;
     }
 
     std::ostream* mDirectOutput = nullptr;
@@ -161,6 +204,11 @@ private:
     std::vector<char> mSpillBuffer;
     std::string mMemory;
     std::ofstream mSpill;
+    std::size_t mMemoryLimit = kTaskMemoryLimit;
+    bool mAllowSpill = true;
+    std::size_t mSpillLimit = 0;
+    std::size_t mSpillBytes = 0;
+    std::string mFailure;
     bool mFailed = false;
 };
 
@@ -439,16 +487,27 @@ struct TempDirectoryCleanup {
 
     ~TempDirectoryCleanup()
     {
+        if (path.empty()) return;
         std::error_code error;
         std::filesystem::remove_all(path, error);
     }
 };
 
 Result<std::filesystem::path> create_temp_directory(
-    const std::filesystem::path& output_path)
+    const std::filesystem::path& output_path,
+    const std::filesystem::path& requested_base = {})
 {
     std::error_code error;
-    auto base = output_path.parent_path();
+    auto base = requested_base;
+    if (!base.empty()) {
+        std::filesystem::create_directories(base, error);
+        if (error || !std::filesystem::is_directory(base, error)) {
+            return Result<std::filesystem::path>::failure(
+                "MCFunction writer 临时目录不可用: " +
+                (error ? error.message() : base.string()));
+        }
+    }
+    if (base.empty()) base = output_path.parent_path();
     if (base.empty() || !std::filesystem::is_directory(base, error)) {
         error.clear();
         base = std::filesystem::temp_directory_path(error);
@@ -480,7 +539,7 @@ std::size_t selected_worker_count(
     const ConversionOptions& options,
     std::size_t task_count)
 {
-    auto workers = options.thread_count;
+    auto workers = options.resolved_worker_count();
     if (workers == 0) {
         // Automatic selection: parallel encoding past 2 threads is
         // memory-bandwidth limited (utopia measurements: 1/2/3/4/8 threads =
@@ -776,9 +835,31 @@ Result<void> write_mcfunction(
     if (size.width <= 0 || size.height <= 0 || size.length <= 0) {
         return Result<void>::failure("MCFunction writer: 结构尺寸无效");
     }
-    auto output_buffer = std::make_unique<char[]>(1024 * 1024);
+    const auto budget = options.soft_memory_budget_bytes;
+    if (budget < 64u * 1024u) {
+        return Result<void>::failure("MCFunction writer soft_memory_budget 至少需要 64 KiB");
+    }
+    const auto estimated_subchunks = static_cast<std::uint64_t>((size.height + 15) / 16);
+    const auto estimated_chunk_bytes = std::max<std::uint64_t>(64u * 1024u,
+        estimated_subchunks * 4096u * sizeof(std::uint32_t) + 8u * 1024u);
+    const auto budget_chunk_capacity = static_cast<std::size_t>(
+        budget / std::max<std::uint64_t>(1, estimated_chunk_bytes));
+    if (budget_chunk_capacity == 0) {
+        return Result<void>::failure(
+            "MCFunction writer 单 chunk 物化窗口超过 soft_memory_budget");
+    }
+    const auto requested_window = options.max_in_flight_chunks == 0
+        ? budget_chunk_capacity
+        : std::min(options.max_in_flight_chunks, budget_chunk_capacity);
+    if (requested_window == 0) {
+        return Result<void>::failure("MCFunction writer max_in_flight_chunks 不能为零");
+    }
+    const auto output_buffer_size = std::max<std::size_t>(4096,
+        std::min<std::size_t>(1024u * 1024u, budget / 16));
+    auto output_buffer = std::make_unique<char[]>(output_buffer_size);
     std::ofstream output;
-    output.rdbuf()->pubsetbuf(output_buffer.get(), 1024 * 1024);
+    output.rdbuf()->pubsetbuf(output_buffer.get(),
+        static_cast<std::streamsize>(output_buffer_size));
     output.open(output_path, std::ios::binary | std::ios::trunc);
     if (!output) {
         return Result<void>::failure("无法创建 MCFunction 文件: " + output_path.string());
@@ -802,9 +883,11 @@ Result<void> write_mcfunction(
     }
 
     std::vector<ChunkPos> positions;
-    const auto batch_size = options.mcfunction_chunk_partition
+    auto batch_size = options.mcfunction_chunk_partition
         ? std::size_t{1}
         : static_cast<std::size_t>(kChunkBatchSize);
+    batch_size = std::min(batch_size, requested_window);
+    if (batch_size == 0) batch_size = 1;
     positions.reserve(batch_size);
     const auto air = registry.air_runtime_id();
     const auto task_count =
@@ -812,7 +895,32 @@ Result<void> write_mcfunction(
         static_cast<std::size_t>(
             (size.chunk_x_count() + static_cast<std::int32_t>(batch_size) - 1) /
             static_cast<std::int32_t>(batch_size));
-    const auto worker_count = selected_worker_count(options, task_count);
+    auto worker_count = selected_worker_count(options, task_count);
+    worker_count = std::min(worker_count,
+        std::max<std::size_t>(1, requested_window / batch_size));
+    const auto requested_tasks = options.max_in_flight_tasks == 0
+        ? worker_count * 2
+        : options.max_in_flight_tasks;
+    const auto max_in_flight = std::max<std::size_t>(1,
+        std::min(requested_tasks, std::max<std::size_t>(1, requested_window / batch_size)));
+    const auto prefetch_batches = std::max<std::size_t>(1,
+        std::min<std::size_t>(3,
+            std::max<std::size_t>(1, requested_window / batch_size / 2)));
+    const auto task_memory_limit = std::max<std::size_t>(4096,
+        budget / (max_in_flight + worker_count + prefetch_batches + 2));
+    const auto task_staging_size = std::max<std::size_t>(4096,
+        std::min<std::size_t>(kStreamBufferSize, task_memory_limit / 2));
+    // A configured temporary-file limit is global to this conversion. Split
+    // it across concurrently retained tasks so parallel workers cannot each
+    // consume the full allowance before the ordered drain catches up.
+    const auto task_spill_limit = options.temporary_file_limit_bytes == 0
+        ? std::size_t{0}
+        : options.temporary_file_limit_bytes /
+            std::max<std::size_t>(1, max_in_flight);
+    if (options.temporary_file_limit_bytes != 0 && task_spill_limit < 4096) {
+        return Result<void>::failure(
+            "MCFunction writer temporary_file_limit_bytes 太小");
+    }
 
     // Palette fast path: MCWorld feeds subchunk palettes + packed indices
     // directly, so each distinct state is formatted once instead of resolving
@@ -947,7 +1055,7 @@ Result<void> write_mcfunction(
 
     if (worker_count == 1) {
         WorkerContext context;
-        TaskCommandBuffer command_output(output);
+        TaskCommandBuffer command_output(output, task_staging_size);
         for (std::int32_t chunk_z = 0; chunk_z < size.chunk_z_count(); ++chunk_z) {
             for (std::int32_t batch_x = 0;
                  batch_x < size.chunk_x_count();
@@ -968,13 +1076,15 @@ Result<void> write_mcfunction(
             return Result<void>::failure(finished.error());
         }
     } else {
-        auto temp_directory_result = create_temp_directory(output_path);
-        if (!temp_directory_result) {
-            return Result<void>::failure(temp_directory_result.error());
+        TempDirectoryCleanup temp_directory;
+        if (options.allow_temporary_spool) {
+            auto temp_directory_result = create_temp_directory(
+                output_path, options.temporary_directory);
+            if (!temp_directory_result) {
+                return Result<void>::failure(temp_directory_result.error());
+            }
+            temp_directory.path = std::move(temp_directory_result).value();
         }
-        TempDirectoryCleanup temp_directory{
-            std::move(temp_directory_result).value()
-        };
 
         std::vector<std::unique_ptr<WorkerContext>> worker_contexts;
         worker_contexts.reserve(worker_count);
@@ -982,12 +1092,6 @@ Result<void> write_mcfunction(
             worker_contexts.push_back(std::make_unique<WorkerContext>());
         }
         detail::BoundedThreadPool pool(worker_count, worker_count);
-        const auto max_in_flight = std::max<std::size_t>(
-            1,
-            options.max_in_flight_tasks == 0
-                ? worker_count * 2
-                : options.max_in_flight_tasks);
-
         struct PendingTask {
             std::size_t sequence = 0;
             std::future<Result<TaskOutput>> future;
@@ -1084,8 +1188,6 @@ Result<void> write_mcfunction(
                 thread.join();
             }
         } pipeline;
-        constexpr std::size_t kPrefetchDepth = 3;
-
         auto first = load_batch(0, 0);
         if (!first) return Result<void>::failure(first.error());
         const bool pipeline_enabled = first.value().palette != nullptr;
@@ -1096,7 +1198,7 @@ Result<void> write_mcfunction(
                         {
                             std::unique_lock lock(pipeline.mutex);
                             pipeline.cv.wait(lock, [&] {
-                                return pipeline.loaded.size() < kPrefetchDepth ||
+                                return pipeline.loaded.size() < prefetch_batches ||
                                     pipeline.cancel;
                             });
                             if (pipeline.cancel) return;
@@ -1160,7 +1262,7 @@ Result<void> write_mcfunction(
             }
             if (!batch) return Result<void>::failure(batch.error());
             const auto spill_path =
-                temp_directory.path /
+                (temp_directory.path.empty() ? output_path.parent_path() : temp_directory.path) /
                 ("task_" + std::to_string(sequence) + ".tmp");
             const auto task_sequence = sequence++;
             pending.push_back({
@@ -1172,9 +1274,15 @@ Result<void> write_mcfunction(
                      &worker_contexts,
                      air,
                      size,
-                     task_sequence](std::size_t worker_index) mutable
+                     task_sequence,
+                     task_memory_limit,
+                     task_staging_size,
+                     task_spill_limit,
+                     allow_temporary_spool = options.allow_temporary_spool](std::size_t worker_index) mutable
                         -> Result<TaskOutput> {
-                        TaskCommandBuffer task_output(spill_path);
+                        TaskCommandBuffer task_output(
+                            spill_path, task_memory_limit, task_staging_size,
+                            allow_temporary_spool, task_spill_limit);
                         const auto encoded = loaded.palette
                             ? encode_batch_palette(
                                 *loaded.palette, 0, size, loaded.bounds,

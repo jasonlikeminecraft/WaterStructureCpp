@@ -80,6 +80,55 @@ using ChunkPaletteVisitor =
 struct ConversionCallbacks {
     std::function<void(std::size_t)> start;
     std::function<void()> progress;
+    // Optional end-of-conversion snapshot.  It is intentionally one callback
+    // rather than per-block telemetry so enabling statistics does not add
+    // synchronization to the hot path.
+    std::function<void(const struct ConversionStats&)> statistics;
+    // World conversion knobs are carried alongside callbacks so existing
+    // format-specific write_to_world override signatures remain source
+    // compatible when applications and the library are rebuilt together.
+    std::size_t worker_count = 0;
+    std::size_t max_in_flight_chunks = 0;
+    std::size_t soft_memory_budget_bytes = 450u * 1024u * 1024u;
+    bool allow_temporary_spool = true;
+    bool collect_statistics = false;
+    std::filesystem::path temporary_directory{};
+    std::size_t temporary_file_limit_bytes = 0;
+    bool profiling = false;
+};
+
+struct ConversionStats {
+    StructureId source_format = StructureId::Unknown;
+    StructureId target_format = StructureId::Unknown;
+    std::uint64_t detect_ms = 0;
+    std::uint64_t parse_decompress_ms = 0;
+    std::uint64_t palette_runtime_mapping_ms = 0;
+    std::uint64_t chunk_materialization_ms = 0;
+    std::uint64_t nbt_entity_decode_ms = 0;
+    std::uint64_t encode_compress_ms = 0;
+    std::uint64_t leveldb_write_ms = 0;
+    std::uint64_t leveldb_close_ms = 0;
+    std::uint64_t mcworld_unpack_ms = 0;
+    std::uint64_t mcworld_pack_ms = 0;
+    std::uint64_t elapsed_ms = 0;
+    std::uint64_t compressed_input_bytes = 0;
+    std::uint64_t compressed_output_bytes = 0;
+    std::uint64_t leveldb_batches = 0;
+    std::uint64_t peak_memory_bytes = 0;
+    std::uint64_t decoded_blocks = 0;
+    std::uint64_t encoded_blocks = 0;
+    std::uint64_t command_count = 0;
+    std::uint64_t chunk_window_peak = 0;
+    std::uint64_t temporary_spool_bytes = 0;
+    std::size_t source_chunks = 0;
+    std::size_t completed_chunks = 0;
+    std::size_t non_air_blocks = 0;
+    std::size_t error_offset = 0;
+    ChunkPos error_chunk{};
+    bool has_error_chunk = false;
+    bool success = false;
+    std::string error_stage;
+    std::string error_location;
 };
 
 class WorldSource;

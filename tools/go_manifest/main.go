@@ -20,6 +20,7 @@ import (
 	"github.com/TriM-Organization/bedrock-world-operator/block"
 	"github.com/Yeah114/WaterStructure/define"
 	"github.com/Yeah114/WaterStructure/structure"
+	legacyblocks "github.com/Yeah114/blocks"
 )
 
 type subManifest struct {
@@ -61,6 +62,120 @@ type manifest struct {
 	BlockEntities      []entityManifest `json:"block_entities,omitempty"`
 	Detail             any              `json:"detail,omitempty"`
 	Error              any              `json:"error,omitempty"`
+}
+
+// jsonSpool keeps the potentially unbounded chunk/entity arrays on disk.  A
+// manifest is a diagnostic artifact, so retaining every entry in a Go slice
+// is needlessly expensive (large worlds previously reached multi-gigabyte
+// heaps).  Each entry is encoded once and copied into the final JSON stream.
+type jsonSpool struct {
+	file  *os.File
+	path  string
+	first bool
+	count uint64
+}
+
+func newJSONSpool(prefix string) (*jsonSpool, error) {
+	file, err := os.CreateTemp("", "water-structure-"+prefix+"-*.jsonpart")
+	if err != nil {
+		return nil, err
+	}
+	return &jsonSpool{file: file, path: file.Name(), first: true}, nil
+}
+
+func (s *jsonSpool) append(value any) error {
+	if !s.first {
+		if _, err := s.file.WriteString(","); err != nil {
+			return err
+		}
+	}
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	if _, err = s.file.Write(encoded); err != nil {
+		return err
+	}
+	s.first = false
+	s.count++
+	return nil
+}
+
+func (s *jsonSpool) close() error {
+	if s == nil || s.file == nil {
+		return nil
+	}
+	err := s.file.Close()
+	s.file = nil
+	return err
+}
+
+func (s *jsonSpool) cleanup() {
+	if s == nil {
+		return
+	}
+	_ = s.close()
+	_ = os.Remove(s.path)
+}
+
+func copySpool(output io.Writer, s *jsonSpool) error {
+	if s == nil {
+		return nil
+	}
+	if err := s.close(); err != nil {
+		return err
+	}
+	input, err := os.Open(s.path)
+	if err != nil {
+		return err
+	}
+	defer input.Close()
+	_, err = io.Copy(output, input)
+	return err
+}
+
+func writeManifest(path string, result manifest, chunks, entities *jsonSpool, includeArrays bool) error {
+	result.Chunks = nil
+	result.BlockEntities = nil
+	encoded, err := json.Marshal(result)
+	if err != nil {
+		return err
+	}
+	if len(encoded) == 0 || encoded[len(encoded)-1] != '}' {
+		return fmt.Errorf("manifest metadata did not encode as an object")
+	}
+	output := os.Stdout
+	var file *os.File
+	if path != "" {
+		file, err = os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+		if err != nil {
+			return err
+		}
+		defer file.Close()
+		output = file
+	}
+	if _, err = output.Write(encoded[:len(encoded)-1]); err != nil {
+		return err
+	}
+	if includeArrays {
+		if _, err = io.WriteString(output, `,"chunks":[`); err != nil {
+			return err
+		}
+		if err = copySpool(output, chunks); err != nil {
+			return err
+		}
+		if _, err = io.WriteString(output, `],"block_entities":[`); err != nil {
+			return err
+		}
+		if err = copySpool(output, entities); err != nil {
+			return err
+		}
+		if _, err = io.WriteString(output, "]"); err != nil {
+			return err
+		}
+	}
+	_, err = io.WriteString(output, "}\n")
+	return err
 }
 
 type blockProperty struct {
@@ -481,7 +596,7 @@ func loadVersions() (map[string]int32, error) {
 }
 
 func canonicalRuntimeBlock(runtimeID uint32, versions map[string]int32) ([]byte, error) {
-	name, values, found := block.RuntimeIDToState(runtimeID)
+	name, values, found := runtimeBlockState(runtimeID)
 	if !found {
 		return nil, fmt.Errorf("runtime ID %d has no block state", runtimeID)
 	}
@@ -502,24 +617,41 @@ func canonicalRuntimeBlock(runtimeID uint32, versions map[string]int32) ([]byte,
 	return canonicalBlockBytes(canonicalBlockState{Name: name, Version: version, Properties: properties})
 }
 
+// Fatalder normally converts the legacy `github.com/Yeah114/blocks` runtime
+// IDs to bedrock-world-operator IDs before materialising chunks. A few older
+// command-block paths expose the legacy ID directly, however. The manifest is
+// a semantic oracle, so resolve both registered ID spaces without changing the
+// Fatalder source tree. Bedrock IDs take precedence if an integer happens to
+// exist in both registries.
+func runtimeBlockState(runtimeID uint32) (string, map[string]any, bool) {
+	if name, values, found := block.RuntimeIDToState(runtimeID); found {
+		return name, values, true
+	}
+	name, values, found := legacyblocks.RuntimeIDToState(runtimeID)
+	if found && !strings.Contains(name, ":") {
+		name = "minecraft:" + name
+	}
+	return name, values, found
+}
+
 func layerDigest(c interface {
 	Block(uint8, int16, uint8, uint8) uint32
-}, subY int, layer uint8, versions map[string]int32, cache map[uint32][]byte) (string, bool, error) {
+}, subY int, layer uint8, versions map[string]int32, cache map[uint32][]byte) (string, int, error) {
 	data := make([]byte, 0, 4096*32)
-	nonAir := false
+	nonAir := 0
 	for y := 0; y < 16; y++ {
 		for z := 0; z < 16; z++ {
 			for x := 0; x < 16; x++ {
 				value := c.Block(uint8(x), int16(subY*16+y), uint8(z), layer)
 				if value != block.AirRuntimeID {
-					nonAir = true
+					nonAir++
 				}
 				encoded, ok := cache[value]
 				if !ok {
 					var err error
 					encoded, err = canonicalRuntimeBlock(value, versions)
 					if err != nil {
-						return "", false, err
+						return "", 0, err
 					}
 					cache[value] = encoded
 				}
@@ -847,6 +979,38 @@ func openStructureReader(file *os.File, forcedFormat string) (structure.Structur
 		reader = &structure.TIBI{}
 	case "Schematic":
 		reader = &structure.Schematic{}
+	case "SchemV1":
+		reader = &structure.SchemV1{}
+	case "SchemV2":
+		reader = &structure.SchemV2{}
+	case "Litematic":
+		reader = &structure.Litematic{}
+	case "MCStructure":
+		reader = &structure.MCStructure{}
+	case "MCWorld":
+		reader = &structure.MCWorld{}
+	case "BDX":
+		reader = &structure.BDX{}
+	case "MCFunction":
+		reader = &structure.MCFunction{}
+	case "KBDX":
+		reader = &structure.KBDX{}
+	case "IBImport":
+		reader = &structure.IBImport{}
+	case "MianYangV1":
+		reader = &structure.MianYangV1{}
+	case "MianYangV2":
+		reader = &structure.MianYangV2{}
+	case "MianYangV3":
+		reader = &structure.MianYangV3{}
+	case "MianYangV4":
+		reader = &structure.MianYangV4{}
+	case "RunAway":
+		reader = &structure.RunAway{}
+	case "QingXuV1":
+		reader = &structure.QingXuV1{}
+	case "TimeBuilderV1":
+		reader = &structure.TimeBuilderV1{}
 	default:
 		return nil, fmt.Errorf("unsupported forced format %q", forcedFormat)
 	}
@@ -967,7 +1131,7 @@ func blockDetail(c interface {
 					}
 					cache[runtimeID] = encoded
 				}
-				name, values, found := block.RuntimeIDToState(runtimeID)
+				name, values, found := runtimeBlockState(runtimeID)
 				if !found {
 					return nil, fmt.Errorf("runtime ID %d has no block state", runtimeID)
 				}
@@ -1045,6 +1209,8 @@ func main() {
 	defer cleanupInput()
 	defer file.Close()
 	reader, err := openStructureReader(file, forcedFormat)
+	var chunkSpool, entitySpool *jsonSpool
+	includeArrays := false
 	if err != nil {
 		result.Error = map[string]any{"category": "parse", "message": err.Error()}
 	} else {
@@ -1054,18 +1220,26 @@ func main() {
 		result.Format = reader.Name()
 		result.Size = []int{size.Width, size.Height, size.Length}
 		result.Offset = []int32{offset[0], offset[1], offset[2]}
-		if detail == nil {
+		if detail != nil {
 			result.NonAir, err = reader.CountNonAirBlocks()
 		}
 		if err != nil {
 			result.Error = map[string]any{"category": "count", "message": err.Error()}
 		} else {
-			// Keep only one decoded chunk (and one NBT map) alive at a time. Some
-			// readers materialize every requested chunk, so passing the complete
-			// position list can multiply peak memory by the structure size.
+			// Keep only one decoded chunk (and one NBT map) alive at a time.  The
+			// arrays themselves are spooled to disk; retaining them in result.Chunks
+			// or result.BlockEntities was the source of multi-GB manifest runs.
 			stateCache := make(map[uint32][]byte)
-			result.Chunks = make([]chunkManifest, 0)
-			result.BlockEntities = []entityManifest{}
+			chunkSpool, err = newJSONSpool("chunks")
+			if err != nil {
+				result.Error = map[string]any{"category": "spool", "message": err.Error()}
+			} else {
+				entitySpool, err = newJSONSpool("entities")
+				if err != nil {
+					result.Error = map[string]any{"category": "spool", "message": err.Error()}
+				}
+			}
+			includeArrays = result.Error == nil
 			startX, endX := 0, size.GetChunkXCount()
 			startZ, endZ := 0, size.GetChunkZCount()
 			if detail != nil {
@@ -1075,53 +1249,69 @@ func main() {
 					result.Error = map[string]any{"category": "detail", "message": "detail chunk is outside structure bounds"}
 				}
 			}
+			processedChunks := 0
+			semanticNonAir := 0
+			const manifestChunkBatch = 8
 		chunkLoop:
 			for x := startX; result.Error == nil && x < endX; x++ {
-				for z := startZ; z < endZ; z++ {
-					pos := define.ChunkPos{int32(x), int32(z)}
-					entry := chunkManifest{X: pos.X(), Z: pos.Z(), Subchunks: []subManifest{}}
-					chunks, chunkErr := reader.GetChunks([]define.ChunkPos{pos})
+				for batchZ := startZ; batchZ < endZ; batchZ += manifestChunkBatch {
+					batchEndZ := min(batchZ+manifestChunkBatch, endZ)
+					positions := make([]define.ChunkPos, 0, batchEndZ-batchZ)
+					for z := batchZ; z < batchEndZ; z++ {
+						positions = append(positions, define.ChunkPos{int32(x), int32(z)})
+					}
+					chunks, chunkErr := reader.GetChunks(positions)
 					if chunkErr != nil {
 						result.Error = map[string]any{"category": "chunks", "message": chunkErr.Error()}
 						break chunkLoop
 					}
-					current := chunks[pos]
-					if current != nil {
-						if detail != nil && detail.chunkX == pos.X() && detail.chunkZ == pos.Z() {
-							cells, detailErr := blockDetail(current, *detail, versions, stateCache)
-							if detailErr != nil {
-								result.Error = map[string]any{"category": "detail", "message": detailErr.Error()}
-								break chunkLoop
-							}
-							result.Detail = cells
-						}
-						if detail == nil {
-							for subY := -4; subY <= 19; subY++ {
-								hash0, nonAir0, hashErr := layerDigest(current, subY, 0, versions, stateCache)
-								if hashErr != nil {
-									result.Error = map[string]any{"category": "canonical_block", "message": hashErr.Error()}
-									break chunkLoop
-								}
-								hash1, nonAir1, hashErr := layerDigest(current, subY, 1, versions, stateCache)
-								if hashErr != nil {
-									result.Error = map[string]any{"category": "canonical_block", "message": hashErr.Error()}
-									break chunkLoop
-								}
-								if nonAir0 || nonAir1 {
-									entry.Subchunks = append(entry.Subchunks, subManifest{Y: subY, Layer0: hash0, Layer1: hash1})
-								}
-							}
-						}
-					}
-					result.Chunks = append(result.Chunks, entry)
-
-					if result.Error == nil && detail == nil {
-						entities, entityErr := reader.GetChunksNBT([]define.ChunkPos{pos})
-						if entityErr != nil {
-							result.Error = map[string]any{"category": "nbt", "message": entityErr.Error()}
+					var entities map[define.ChunkPos]map[define.BlockPos]map[string]any
+					if detail == nil {
+						entities, chunkErr = reader.GetChunksNBT(positions)
+						if chunkErr != nil {
+							result.Error = map[string]any{"category": "nbt", "message": chunkErr.Error()}
 							break chunkLoop
 						}
-						for _, values := range entities {
+					}
+					for _, pos := range positions {
+						entry := chunkManifest{X: pos.X(), Z: pos.Z(), Subchunks: []subManifest{}}
+						current := chunks[pos]
+						if current != nil {
+							if detail != nil && detail.chunkX == pos.X() && detail.chunkZ == pos.Z() {
+								cells, detailErr := blockDetail(current, *detail, versions, stateCache)
+								if detailErr != nil {
+									result.Error = map[string]any{"category": "detail", "message": detailErr.Error()}
+									break chunkLoop
+								}
+								result.Detail = cells
+							}
+							if detail == nil {
+								for subY := -4; subY <= 19; subY++ {
+									hash0, nonAir0, hashErr := layerDigest(current, subY, 0, versions, stateCache)
+									if hashErr != nil {
+										result.Error = map[string]any{"category": "canonical_block", "message": hashErr.Error()}
+										break chunkLoop
+									}
+									hash1, nonAir1, hashErr := layerDigest(current, subY, 1, versions, stateCache)
+									if hashErr != nil {
+										result.Error = map[string]any{"category": "canonical_block", "message": hashErr.Error()}
+										break chunkLoop
+									}
+									semanticNonAir += nonAir0 + nonAir1
+									if nonAir0 != 0 || nonAir1 != 0 {
+										entry.Subchunks = append(entry.Subchunks, subManifest{Y: subY, Layer0: hash0, Layer1: hash1})
+									}
+								}
+							}
+						}
+						if err := chunkSpool.append(entry); err != nil {
+							result.Error = map[string]any{"category": "spool", "message": err.Error()}
+							break chunkLoop
+						}
+
+						if result.Error == nil && detail == nil {
+							values := entities[pos]
+							localEntities := make([]entityManifest, 0, len(values))
 							for entityPos, value := range values {
 								canonical, canonicalErr := canonicalNBT(value)
 								if canonicalErr != nil {
@@ -1133,44 +1323,58 @@ func main() {
 									result.Error = map[string]any{"category": "canonical_nbt_fields", "message": fieldsErr.Error()}
 									break chunkLoop
 								}
-								result.BlockEntities = append(result.BlockEntities, entityManifest{
+								localEntities = append(localEntities, entityManifest{
 									X: entityPos[0], Y: entityPos[1], Z: entityPos[2], Hash: digest(canonical), Fields: fields,
 								})
 							}
+							sort.Slice(localEntities, func(i, j int) bool {
+								a, b := localEntities[i], localEntities[j]
+								if a.X != b.X {
+									return a.X < b.X
+								}
+								if a.Y != b.Y {
+									return a.Y < b.Y
+								}
+								if a.Z != b.Z {
+									return a.Z < b.Z
+								}
+								return a.Hash < b.Hash
+							})
+							for _, entity := range localEntities {
+								if err := entitySpool.append(entity); err != nil {
+									result.Error = map[string]any{"category": "spool", "message": err.Error()}
+									break chunkLoop
+								}
+							}
+						}
+
+						processedChunks++
+						if processedChunks%64 == 0 {
+							runtime.GC()
 						}
 					}
-
-					// Drop the per-chunk maps before asking the reader for the next one.
+					// Drop the bounded batch before asking the reader for the next one.
 					chunks = nil
-					runtime.GC()
+					entities = nil
 				}
 			}
-			if result.Error == nil {
-				sort.Slice(result.BlockEntities, func(i, j int) bool {
-					a, b := result.BlockEntities[i], result.BlockEntities[j]
-					if a.X != b.X {
-						return a.X < b.X
-					}
-					if a.Y != b.Y {
-						return a.Y < b.Y
-					}
-					if a.Z != b.Z {
-						return a.Z < b.Z
-					}
-					return a.Hash < b.Hash
-				})
+			if result.Error == nil && detail == nil {
+				result.NonAir = semanticNonAir
+			}
+			if result.Error != nil {
+				includeArrays = false
 			}
 		}
 	}
-	encoded, _ := json.MarshalIndent(result, "", "  ")
-	encoded = append(encoded, '\n')
-	if outputPath != "" {
-		if err := os.WriteFile(outputPath, encoded, 0o644); err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(3)
-		}
-	} else {
-		_, _ = os.Stdout.Write(encoded)
+	if chunkSpool != nil {
+		defer chunkSpool.cleanup()
+	}
+	if entitySpool != nil {
+		defer entitySpool.cleanup()
+	}
+	if err := writeManifest(outputPath, result, chunkSpool, entitySpool, includeArrays); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(3)
 	}
 	if result.Error != nil {
 		os.Exit(2)

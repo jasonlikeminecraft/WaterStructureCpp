@@ -18,6 +18,7 @@
 #include <cctype>
 #include <cmath>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstring>
 #include <deque>
@@ -33,6 +34,7 @@
 #include <sstream>
 #include <streambuf>
 #include <string_view>
+#include <thread>
 #include <unordered_set>
 
 namespace water_structure {
@@ -42,6 +44,111 @@ constexpr std::size_t kBrotliBufferSize = 1024 * 1024;
 constexpr std::size_t kMinimumDecodedLimit = 64ull * 1024 * 1024;
 constexpr std::size_t kMaximumDecodedLimit = 64ull * 1024 * 1024 * 1024;
 constexpr std::size_t kMaximumExpansionRatio = 4096;
+constexpr std::size_t kMaximumConstants =
+    static_cast<std::size_t>(std::numeric_limits<std::uint16_t>::max()) + 1;
+constexpr std::size_t kMaximumConstantBytes = 64 * 1024 * 1024;
+constexpr std::size_t kMaximumConstantStringBytes = 4 * 1024 * 1024;
+constexpr std::size_t kMaximumMaterializedBlocks = 8'000'000;
+constexpr std::size_t kMaximumBlockEntities = 1'000'000;
+constexpr std::size_t kMaximumStateProperties = 128;
+constexpr std::size_t kMaximumRuntimeCacheEntries = 262'144;
+constexpr std::size_t kPlacementShardCount = 1024;
+constexpr std::size_t kPlacementOpenShardLimit = 16;
+constexpr std::size_t kPlacementRecordBytes = 16;
+
+using PlacementRecordBytes = std::array<std::uint8_t, kPlacementRecordBytes>;
+
+constexpr void write_u32_le(
+    PlacementRecordBytes& output,
+    std::size_t offset,
+    std::uint32_t value) noexcept
+{
+    output[offset] = static_cast<std::uint8_t>(value);
+    output[offset + 1] = static_cast<std::uint8_t>(value >> 8u);
+    output[offset + 2] = static_cast<std::uint8_t>(value >> 16u);
+    output[offset + 3] = static_cast<std::uint8_t>(value >> 24u);
+}
+
+constexpr std::uint32_t read_u32_le(
+    const PlacementRecordBytes& input,
+    std::size_t offset) noexcept
+{
+    return static_cast<std::uint32_t>(input[offset]) |
+        static_cast<std::uint32_t>(input[offset + 1]) << 8u |
+        static_cast<std::uint32_t>(input[offset + 2]) << 16u |
+        static_cast<std::uint32_t>(input[offset + 3]) << 24u;
+}
+
+constexpr std::int32_t read_i32_le(
+    const PlacementRecordBytes& input,
+    std::size_t offset) noexcept
+{
+    const auto value = read_u32_le(input, offset);
+    if (value <= static_cast<std::uint32_t>(
+            std::numeric_limits<std::int32_t>::max())) {
+        return static_cast<std::int32_t>(value);
+    }
+    return std::numeric_limits<std::int32_t>::min() +
+        static_cast<std::int32_t>(value - 0x80000000u);
+}
+
+constexpr PlacementRecordBytes encode_placement_record(
+    std::int32_t x,
+    std::int32_t y,
+    std::int32_t z,
+    std::uint32_t runtime_id) noexcept
+{
+    PlacementRecordBytes output{};
+    write_u32_le(output, 0, static_cast<std::uint32_t>(x));
+    write_u32_le(output, 4, static_cast<std::uint32_t>(y));
+    write_u32_le(output, 8, static_cast<std::uint32_t>(z));
+    write_u32_le(output, 12, runtime_id);
+    return output;
+}
+
+static_assert(sizeof(PlacementRecordBytes) == kPlacementRecordBytes);
+constexpr auto kPlacementRecordLayoutCheck = encode_placement_record(
+    std::numeric_limits<std::int32_t>::min(),
+    -1,
+    std::numeric_limits<std::int32_t>::max(),
+    std::numeric_limits<std::uint32_t>::max());
+static_assert(read_i32_le(kPlacementRecordLayoutCheck, 0) ==
+    std::numeric_limits<std::int32_t>::min());
+static_assert(read_i32_le(kPlacementRecordLayoutCheck, 4) == -1);
+static_assert(read_i32_le(kPlacementRecordLayoutCheck, 8) ==
+    std::numeric_limits<std::int32_t>::max());
+static_assert(read_u32_le(kPlacementRecordLayoutCheck, 12) ==
+    std::numeric_limits<std::uint32_t>::max());
+
+std::optional<std::int32_t> normalize_placement_coordinate(
+    std::int32_t raw,
+    std::int32_t minimum,
+    std::int32_t offset,
+    std::int32_t dimension) noexcept
+{
+    const auto source = static_cast<std::int64_t>(raw) - minimum;
+    if (dimension <= 0 || source < 0 || source >= dimension) {
+        return std::nullopt;
+    }
+    const auto target = source + offset;
+    if (target < std::numeric_limits<std::int32_t>::min() ||
+        target > std::numeric_limits<std::int32_t>::max()) {
+        return std::nullopt;
+    }
+    return static_cast<std::int32_t>(target);
+}
+
+bool placement_coordinate_in_extent(
+    std::int32_t value,
+    std::int32_t offset,
+    std::int32_t dimension) noexcept
+{
+    if (dimension <= 0) return false;
+    const auto minimum = static_cast<std::int64_t>(offset);
+    const auto maximum = minimum + dimension - 1;
+    return static_cast<std::int64_t>(value) >= minimum &&
+        static_cast<std::int64_t>(value) <= maximum;
+}
 
 std::size_t decoded_limit(std::uintmax_t compressed_size)
 {
@@ -341,13 +448,20 @@ public:
         return static_cast<std::int32_t>(u32(field));
     }
 
-    std::string cstring(const char* field)
+    std::string cstring(
+        const char* field,
+        std::size_t maximum = kMaximumConstantStringBytes)
     {
         std::string value;
         while (true) {
             const auto character = try_u8();
             if (!character) throw std::runtime_error(std::string(field) + " truncated");
             if (*character == 0) return value;
+            if (value.size() >= maximum) {
+                throw std::runtime_error(
+                    std::string(field) + " exceeds " +
+                    std::to_string(maximum) + " bytes");
+            }
             value.push_back(static_cast<char>(*character));
         }
     }
@@ -450,6 +564,9 @@ std::vector<BlockStateProperty> parse_block_states(std::string_view encoded)
         if (separator == std::string_view::npos) {
             if (!trim(part).empty()) throw std::runtime_error("BDX block states 缺少 ':' 或 '='");
         } else {
+            if (result.size() >= kMaximumStateProperties) {
+                throw std::runtime_error("BDX block states 属性过多");
+            }
             if (separator_mode == 0) separator_mode = part[separator];
             else if (separator_mode != part[separator]) {
                 throw std::runtime_error("BDX block states 混用了 ':' 和 '='");
@@ -637,22 +754,215 @@ std::string block_entity_id(std::string_view block_name)
     return {};
 }
 
+std::size_t placement_shard(ChunkPos position) noexcept
+{
+    // Mix both signed coordinates before reducing.  The cast to uint32 keeps
+    // the mapping stable for negative chunk columns without signed overflow.
+    std::uint64_t value =
+        (static_cast<std::uint64_t>(static_cast<std::uint32_t>(position.x)) << 32u) ^
+        static_cast<std::uint32_t>(position.z);
+    value ^= value >> 30u;
+    value *= 0xbf58476d1ce4e5b9ull;
+    value ^= value >> 27u;
+    value *= 0x94d049bb133111ebull;
+    value ^= value >> 31u;
+    return static_cast<std::size_t>(value % kPlacementShardCount);
+}
+
+std::filesystem::path make_bdx_spool_directory(
+    const std::filesystem::path& requested,
+    const void* owner)
+{
+    std::error_code error;
+    auto root = requested;
+    if (root.empty()) root = std::filesystem::temp_directory_path(error);
+    if (error || root.empty()) {
+        throw std::runtime_error("无法确定 BDX 临时目录");
+    }
+    std::filesystem::create_directories(root, error);
+    if (error) {
+        throw std::runtime_error(
+            "无法创建 BDX 临时目录 " + root.string() + ": " + error.message());
+    }
+
+    // create_directory() is the exclusive claim.  Do not accept its
+    // false/no-error "already exists" result: opening shards with append in
+    // a stale or concurrently-created directory would mix two command
+    // streams and break last-wins ordering.
+    static std::atomic<std::uint64_t> sequence{0};
+    const auto wall_clock = std::chrono::system_clock::now().time_since_epoch().count();
+    const auto steady_clock = std::chrono::steady_clock::now().time_since_epoch().count();
+    const auto thread = std::hash<std::thread::id>{}(std::this_thread::get_id());
+    for (std::size_t attempt = 0; attempt < 128; ++attempt) {
+        const auto nonce =
+            std::to_string(static_cast<unsigned long long>(wall_clock)) + "-" +
+            std::to_string(static_cast<unsigned long long>(steady_clock)) + "-" +
+            std::to_string(static_cast<unsigned long long>(
+                reinterpret_cast<std::uintptr_t>(owner))) + "-" +
+            std::to_string(static_cast<unsigned long long>(thread)) + "-" +
+            std::to_string(static_cast<unsigned long long>(
+                sequence.fetch_add(1, std::memory_order_relaxed))) + "-" +
+            std::to_string(attempt);
+        const auto directory = root / ("water_structure_bdx_" + nonce);
+        error.clear();
+        if (std::filesystem::create_directory(directory, error)) {
+            return directory;
+        }
+        if (error && error != std::errc::file_exists) {
+            throw std::runtime_error(
+                "无法创建 BDX placement spool: " + directory.string() + ": " +
+                error.message());
+        }
+    }
+    throw std::runtime_error("无法创建唯一的 BDX placement spool 目录");
+}
+
 } // namespace
+
+BdxStructure::~BdxStructure()
+{
+    cleanup_placement_spool();
+}
+
+void BdxStructure::cleanup_placement_spool() const noexcept
+{
+    try {
+        std::filesystem::path directory;
+        {
+            std::unique_lock lock(mPlacementSpoolMutex);
+            mPlacementSpoolCv.wait(lock, [this] {
+                return !mPlacementSpoolInvalidating;
+            });
+            mPlacementSpoolInvalidating = true;
+            mPlacementSpoolReady.store(false, std::memory_order_release);
+            if (mPlacementSpoolBuilding || mPlacementSpoolReaders != 0) {
+                mPlacementSpoolCv.wait(lock, [this] {
+                    return !mPlacementSpoolBuilding &&
+                        mPlacementSpoolReaders == 0;
+                });
+            }
+            mPlacementSpoolReady.store(false, std::memory_order_release);
+            directory = std::move(mPlacementSpoolDirectory);
+            mPlacementShardPaths.clear();
+            mPlacementSpoolBytes = 0;
+            mPlacementSpoolError.clear();
+        }
+        if (!directory.empty()) {
+            std::error_code error;
+            std::filesystem::remove_all(directory, error);
+        }
+        {
+            std::lock_guard lock(mPlacementSpoolMutex);
+            mPlacementSpoolInvalidating = false;
+        }
+        mPlacementSpoolCv.notify_all();
+    } catch (...) {
+        // Destruction must remain noexcept even if a platform filesystem or
+        // synchronization primitive reports an unusual teardown error.
+        try {
+            {
+                std::lock_guard lock(mPlacementSpoolMutex);
+                mPlacementSpoolInvalidating = false;
+            }
+            mPlacementSpoolCv.notify_all();
+        } catch (...) {
+        }
+    }
+}
+
+void BdxStructure::invalidate_placement_spool() const noexcept
+{
+    // Offset changes and a second read invalidate the normalized coordinates
+    // stored in the spool.  Wait for an in-flight first build so a caller can
+    // safely reuse one reader from a synchronous conversion pipeline.
+    try {
+        std::filesystem::path directory;
+        {
+            std::unique_lock lock(mPlacementSpoolMutex);
+            mPlacementSpoolCv.wait(lock, [this] {
+                return !mPlacementSpoolInvalidating;
+            });
+            mPlacementSpoolInvalidating = true;
+            mPlacementSpoolReady.store(false, std::memory_order_release);
+            if (mPlacementSpoolBuilding || mPlacementSpoolReaders != 0) {
+                mPlacementSpoolCv.wait(lock, [this] {
+                    return !mPlacementSpoolBuilding &&
+                        mPlacementSpoolReaders == 0;
+                });
+            }
+            mPlacementSpoolReady.store(false, std::memory_order_release);
+            directory = std::move(mPlacementSpoolDirectory);
+            mPlacementShardPaths.clear();
+            mPlacementSpoolBytes = 0;
+            mPlacementSpoolError.clear();
+        }
+        if (!directory.empty()) {
+            std::error_code error;
+            std::filesystem::remove_all(directory, error);
+        }
+        {
+            std::lock_guard lock(mPlacementSpoolMutex);
+            mPlacementSpoolInvalidating = false;
+        }
+        mPlacementSpoolCv.notify_all();
+    } catch (...) {
+        // set_offset() is noexcept by the public interface; leaving a stale
+        // spool is safer than terminating the process on cleanup failure.
+        try {
+            {
+                std::lock_guard lock(mPlacementSpoolMutex);
+                mPlacementSpoolInvalidating = false;
+            }
+            mPlacementSpoolCv.notify_all();
+        } catch (...) {
+        }
+    }
+}
+
+void BdxStructure::set_streaming_options(
+    bool allow_temporary_spool,
+    std::filesystem::path temporary_directory,
+    std::size_t temporary_file_limit_bytes)
+{
+    invalidate_placement_spool();
+    mAllowTemporarySpool = allow_temporary_spool;
+    mTemporaryDirectory = std::move(temporary_directory);
+    mTemporaryFileLimitBytes = temporary_file_limit_bytes;
+}
+
+std::size_t BdxStructure::temporary_spool_bytes() const noexcept
+{
+    try {
+        std::lock_guard lock(mPlacementSpoolMutex);
+        return mPlacementSpoolBytes;
+    } catch (...) {
+        return 0;
+    }
+}
 
 void BdxStructure::set_offset(BlockPos offset) noexcept
 {
+    invalidate_placement_spool();
     mOffset = offset;
     mChunkIndex.clear();
+    const auto expanded = [](std::int32_t base, std::int32_t delta) noexcept {
+        const auto magnitude = delta < 0 ? -static_cast<std::int64_t>(delta)
+                                         : static_cast<std::int64_t>(delta);
+        const auto value = static_cast<std::int64_t>(base) + magnitude;
+        return static_cast<std::int32_t>(std::min<std::int64_t>(
+            value, std::numeric_limits<std::int32_t>::max()));
+    };
     mSize = {
-        mOriginalSize.width + std::abs(offset.x),
-        mOriginalSize.height + std::abs(offset.y),
-        mOriginalSize.length + std::abs(offset.z)
+        expanded(mOriginalSize.width, offset.x),
+        expanded(mOriginalSize.height, offset.y),
+        expanded(mOriginalSize.length, offset.z)
     };
 }
 
 Result<void> BdxStructure::read(const std::filesystem::path& path)
 {
     const auto read_start = std::chrono::steady_clock::now();
+    invalidate_placement_spool();
     mSourcePath = path;
     std::ifstream input(path, std::ios::binary);
     if (!input) return Result<void>::failure("无法打开 BDX 文件: " + path.string());
@@ -709,6 +1019,7 @@ Result<void> BdxStructure::read(const std::filesystem::path& path)
         std::chrono::steady_clock::duration sampled_z_count_duration{};
         constexpr std::uint64_t kDetailedProfileSampleMask = 4095;
         std::array<std::uint64_t, 256> command_counts{};
+        std::size_t constant_bytes = 0;
         bool terminated = false;
         const auto profile_interval = std::chrono::seconds(5);
         auto next_profile = read_start + profile_interval;
@@ -718,6 +1029,19 @@ Result<void> BdxStructure::read(const std::filesystem::path& path)
         mNonAirBlocks = 0;
         mBlocksLoaded = false;
         const auto air_runtime_id = mRegistry.air_runtime_id();
+
+        const auto add_coordinate = [](
+            std::int32_t& coordinate,
+            std::int64_t delta,
+            std::string_view axis) {
+            const auto value = static_cast<std::int64_t>(coordinate) + delta;
+            if (value < std::numeric_limits<std::int32_t>::min() ||
+                value > std::numeric_limits<std::int32_t>::max()) {
+                throw std::runtime_error(
+                    "BDX " + std::string(axis) + " 游标超出 int32 范围");
+            }
+            coordinate = static_cast<std::int32_t>(value);
+        };
 
         auto constant = [&](std::uint16_t id) -> const std::string* {
             return id < constants.size() ? &constants[id] : nullptr;
@@ -730,7 +1054,12 @@ Result<void> BdxStructure::read(const std::filesystem::path& path)
             if (!name) return air_runtime_id;
             const auto runtime = mRegistry.legacy_runtime_id(*name, block_data)
                 .value_or(mRegistry.find(*name).value_or(air_runtime_id));
-            legacy_runtime_cache.emplace(key, runtime);
+            // Cache growth must not be proportional to an adversarial number
+            // of distinct command pairs.  A miss after the cap is recomputed,
+            // preserving semantics while bounding the parsing working set.
+            if (legacy_runtime_cache.size() < kMaximumRuntimeCacheEntries) {
+                legacy_runtime_cache.emplace(key, runtime);
+            }
             return runtime;
         };
         auto resolve_state_runtime = [&](std::uint16_t name_id, std::string_view states) {
@@ -762,7 +1091,9 @@ Result<void> BdxStructure::read(const std::filesystem::path& path)
             const auto runtime = encoded
                 ? resolve_state_runtime(name_id, *encoded)
                 : air_runtime_id;
-            state_runtime_cache.emplace(key, runtime);
+            if (state_runtime_cache.size() < kMaximumRuntimeCacheEntries) {
+                state_runtime_cache.emplace(key, runtime);
+            }
             state_direct_valid[slot] = true;
             state_direct_keys[slot] = key;
             state_direct_values[slot] = runtime;
@@ -781,17 +1112,42 @@ Result<void> BdxStructure::read(const std::filesystem::path& path)
         };
         auto store_entity = [&](std::unique_ptr<nbt::tag_compound> entity, std::uint32_t runtime_id) {
             if (!entity || !mCaptureEntities) return;
+            const BlockPos position{ x, y, z };
+            if (mBlockEntities.size() >= kMaximumBlockEntities &&
+                !mBlockEntities.contains(position)) {
+                throw std::runtime_error(
+                    "BDX 方块实体数量超过限制 " +
+                    std::to_string(kMaximumBlockEntities));
+            }
             if (const auto state = mRegistry.state(runtime_id)) {
                 if (const auto id = block_entity_id(state->name); !id.empty()) {
                     entity->operator[]("id") = nbt::tag_string(id);
                 }
             }
-            mBlockEntities[{ x, y, z }] = serialize_compound(*entity);
+            auto payload = serialize_compound(*entity);
+            if (payload.size() > kMaximumConstantStringBytes) {
+                throw std::runtime_error("BDX 方块实体 NBT 超过大小限制");
+            }
+            mBlockEntities[position] = std::move(payload);
         };
         auto place = [&](std::uint32_t runtime_id, std::unique_ptr<nbt::tag_compound> entity) {
+            // A later plain block (including air) invalidates an older block
+            // actor at the same coordinate.  Entity-bearing commands replace
+            // it below, preserving command-stream last-wins semantics.
+            if (mCaptureEntities && !entity) {
+                mBlockEntities.erase({ x, y, z });
+            }
             store_entity(std::move(entity), runtime_id);
+            if (mPlacementConsumer) mPlacementConsumer({ x, y, z }, runtime_id);
             if (runtime_id == air_runtime_id) return;
-            if (mMaterializeBlocks) mBlocks.push_back({ x, y, z, runtime_id });
+            if (mMaterializeBlocks) {
+                if (mBlocks.size() >= kMaximumMaterializedBlocks) {
+                    throw std::runtime_error(
+                        "BDX materialize 方块数量超过限制 " +
+                        std::to_string(kMaximumMaterializedBlocks));
+                }
+                mBlocks.push_back({ x, y, z, runtime_id });
+            }
             if (mBlockConsumer) mBlockConsumer({ x, y, z }, runtime_id);
             ++mNonAirBlocks;
         };
@@ -865,24 +1221,24 @@ Result<void> BdxStructure::read(const std::filesystem::path& path)
 
                     const auto* payload = bytes.data() + cursor + 1;
                     switch (id) {
-                    case 6: z += signed_be16(payload); break;
-                    case 8: ++z; break;
-                    case 12: z += signed_be32(payload); break;
-                    case 14: ++x; break;
-                    case 15: --x; break;
-                    case 16: ++y; break;
-                    case 17: --y; break;
-                    case 18: ++z; break;
-                    case 19: --z; break;
-                    case 20: x += signed_be16(payload); break;
-                    case 21: x += signed_be32(payload); break;
-                    case 22: y += signed_be16(payload); break;
-                    case 23: y += signed_be32(payload); break;
-                    case 24: z += signed_be16(payload); break;
-                    case 25: z += signed_be32(payload); break;
-                    case 28: x += static_cast<std::int8_t>(payload[0]); break;
-                    case 29: y += static_cast<std::int8_t>(payload[0]); break;
-                    case 30: z += static_cast<std::int8_t>(payload[0]); break;
+                    case 6: add_coordinate(z, signed_be16(payload), "Z"); break;
+                    case 8: add_coordinate(z, 1, "Z"); break;
+                    case 12: add_coordinate(z, signed_be32(payload), "Z"); break;
+                    case 14: add_coordinate(x, 1, "X"); break;
+                    case 15: add_coordinate(x, -1, "X"); break;
+                    case 16: add_coordinate(y, 1, "Y"); break;
+                    case 17: add_coordinate(y, -1, "Y"); break;
+                    case 18: add_coordinate(z, 1, "Z"); break;
+                    case 19: add_coordinate(z, -1, "Z"); break;
+                    case 20: add_coordinate(x, signed_be16(payload), "X"); break;
+                    case 21: add_coordinate(x, signed_be32(payload), "X"); break;
+                    case 22: add_coordinate(y, signed_be16(payload), "Y"); break;
+                    case 23: add_coordinate(y, signed_be32(payload), "Y"); break;
+                    case 24: add_coordinate(z, signed_be16(payload), "Z"); break;
+                    case 25: add_coordinate(z, signed_be32(payload), "Z"); break;
+                    case 28: add_coordinate(x, static_cast<std::int8_t>(payload[0]), "X"); break;
+                    case 29: add_coordinate(y, static_cast<std::int8_t>(payload[0]), "Y"); break;
+                    case 30: add_coordinate(z, static_cast<std::int8_t>(payload[0]), "Z"); break;
                     case 31: mPoolId = payload[0]; break;
                     default: break;
                     }
@@ -945,7 +1301,56 @@ Result<void> BdxStructure::read(const std::filesystem::path& path)
                     }
 
                     const BlockPos run_start{ x, y, z };
+                    const auto run_end_z = static_cast<std::int64_t>(z) +
+                        static_cast<std::int64_t>(pairs) - 1;
+                    if (run_end_z > std::numeric_limits<std::int32_t>::max() ||
+                        run_end_z < std::numeric_limits<std::int32_t>::min()) {
+                        throw std::runtime_error("BDX Z run 游标超出 int32 范围");
+                    }
+                    // Keep a separate all-placement route for the bounded
+                    // random-access spool.  The historical consumers below
+                    // intentionally continue receiving non-air values only.
+                    if (mPlacementZRunConsumer) {
+                        mPlacementZRunConsumer(
+                            run_start,
+                            z_run_runtimes,
+                            z_run_contains_air);
+                    }
+                    if (mCaptureEntities && !mBlockEntities.empty()) {
+                        if (mBlockEntities.size() < pairs) {
+                            for (auto entity = mBlockEntities.begin();
+                                 entity != mBlockEntities.end();) {
+                                const auto& position = entity->first;
+                                if (position.x == x && position.y == y &&
+                                    position.z >= z && position.z <= run_end_z) {
+                                    entity = mBlockEntities.erase(entity);
+                                } else {
+                                    ++entity;
+                                }
+                            }
+                        } else {
+                            for (std::size_t index = 0; index < pairs; ++index) {
+                                mBlockEntities.erase({
+                                    x,
+                                    y,
+                                    z + static_cast<std::int32_t>(index)
+                                });
+                            }
+                        }
+                    }
                     if (mMaterializeBlocks) {
+                        const auto non_air_in_run = static_cast<std::size_t>(
+                            std::count_if(
+                                z_run_runtimes.begin(), z_run_runtimes.end(),
+                                [air_runtime_id](std::uint32_t runtime_id) {
+                                    return runtime_id != air_runtime_id;
+                                }));
+                        if (non_air_in_run > kMaximumMaterializedBlocks -
+                                std::min(kMaximumMaterializedBlocks, mBlocks.size())) {
+                            throw std::runtime_error(
+                                "BDX materialize 方块数量超过限制 " +
+                                std::to_string(kMaximumMaterializedBlocks));
+                        }
                         for (std::size_t index = 0; index < z_run_runtimes.size(); ++index) {
                             const auto runtime_id = z_run_runtimes[index];
                             if (runtime_id != air_runtime_id) {
@@ -976,7 +1381,11 @@ Result<void> BdxStructure::read(const std::filesystem::path& path)
                         sampled_z_blocks += pairs;
                     }
                     update_bounds();
-                    z += static_cast<std::int32_t>(pairs);
+                    if (pairs > static_cast<std::size_t>(
+                            std::numeric_limits<std::int32_t>::max())) {
+                        throw std::runtime_error("BDX Z run 长度超过 int32 范围");
+                    }
+                    add_coordinate(z, static_cast<std::int32_t>(pairs), "Z");
                     update_bounds();
                     command_index += pairs * 2;
                     state_placements += pairs;
@@ -1001,12 +1410,20 @@ Result<void> BdxStructure::read(const std::filesystem::path& path)
             try {
                 switch (*command_id) {
                 case 1: {
-                    if (constants.size() >=
-                        static_cast<std::size_t>(std::numeric_limits<std::uint16_t>::max()) + 1) {
+                    if (constants.size() >= kMaximumConstants) {
                         throw std::runtime_error("constant string 表超过 uint16 范围");
                     }
-                    if (mBoundsOnly) decoded.skip_cstring("constant string");
-                    else constants.push_back(decoded.cstring("constant string"));
+                    if (mBoundsOnly) {
+                        decoded.skip_cstring("constant string");
+                    } else {
+                        auto value = decoded.cstring("constant string");
+                        if (value.size() > kMaximumConstantStringBytes ||
+                            constant_bytes > kMaximumConstantBytes - value.size()) {
+                            throw std::runtime_error("BDX constant string 表超过大小限制");
+                        }
+                        constant_bytes += value.size();
+                        constants.push_back(std::move(value));
+                    }
                     metadata = true;
                     break;
                 }
@@ -1021,7 +1438,7 @@ Result<void> BdxStructure::read(const std::filesystem::path& path)
                     }
                     break;
                 }
-                case 6: z += decoded.i16("int16 z"); break;
+                case 6: add_coordinate(z, decoded.i16("int16 z"), "Z"); break;
                 case 7: {
                     if (mBoundsOnly) {
                         decoded.skip(4, "legacy block");
@@ -1033,9 +1450,9 @@ Result<void> BdxStructure::read(const std::filesystem::path& path)
                     }
                     break;
                 }
-                case 8: ++z; break;
+                case 8: add_coordinate(z, 1, "Z"); break;
                 case 9: break;
-                case 12: z += decoded.i32("int32 z"); break;
+                case 12: add_coordinate(z, decoded.i32("int32 z"), "Z"); break;
                 case 13: {
                     if (mBoundsOnly) {
                         decoded.skip(2, "block constant id");
@@ -1048,18 +1465,18 @@ Result<void> BdxStructure::read(const std::filesystem::path& path)
                     }
                     break;
                 }
-                case 14: ++x; break;
-                case 15: --x; break;
-                case 16: ++y; break;
-                case 17: --y; break;
-                case 18: ++z; break;
-                case 19: --z; break;
-                case 20: x += decoded.i16("int16 x"); break;
-                case 21: x += decoded.i32("int32 x"); break;
-                case 22: y += decoded.i16("int16 y"); break;
-                case 23: y += decoded.i32("int32 y"); break;
-                case 24: z += decoded.i16("int16 z"); break;
-                case 25: z += decoded.i32("int32 z"); break;
+                case 14: add_coordinate(x, 1, "X"); break;
+                case 15: add_coordinate(x, -1, "X"); break;
+                case 16: add_coordinate(y, 1, "Y"); break;
+                case 17: add_coordinate(y, -1, "Y"); break;
+                case 18: add_coordinate(z, 1, "Z"); break;
+                case 19: add_coordinate(z, -1, "Z"); break;
+                case 20: add_coordinate(x, decoded.i16("int16 x"), "X"); break;
+                case 21: add_coordinate(x, decoded.i32("int32 x"), "X"); break;
+                case 22: add_coordinate(y, decoded.i16("int16 y"), "Y"); break;
+                case 23: add_coordinate(y, decoded.i32("int32 y"), "Y"); break;
+                case 24: add_coordinate(z, decoded.i16("int16 z"), "Z"); break;
+                case 25: add_coordinate(z, decoded.i32("int32 z"), "Z"); break;
                 case 26:
                     if (mBoundsOnly) skip_command_block_data(decoded);
                     else store_entity(command_block_nbt(read_command_block_data(decoded)), 0);
@@ -1075,9 +1492,9 @@ Result<void> BdxStructure::read(const std::filesystem::path& path)
                     }
                     break;
                 }
-                case 28: x += decoded.i8("int8 x"); break;
-                case 29: y += decoded.i8("int8 y"); break;
-                case 30: z += decoded.i8("int8 z"); break;
+                case 28: add_coordinate(x, decoded.i8("int8 x"), "X"); break;
+                case 29: add_coordinate(y, decoded.i8("int8 y"), "Y"); break;
+                case 30: add_coordinate(z, decoded.i8("int8 z"), "Z"); break;
                 case 31: mPoolId = decoded.u8("runtime pool id"); metadata = true; break;
                 case 32: {
                     if (mBoundsOnly) {
@@ -1196,21 +1613,50 @@ Result<void> BdxStructure::read(const std::filesystem::path& path)
                 " decoded offset " + std::to_string(decoded.offset()));
         }
 
+        const auto dimension = [](std::int32_t minimum,
+                                  std::int32_t maximum,
+                                  char axis) -> std::int32_t {
+            const auto span = static_cast<std::int64_t>(maximum) - minimum + 1;
+            if (span <= 0 || span > std::numeric_limits<std::int32_t>::max()) {
+                throw std::runtime_error(
+                    std::string("BDX ") + axis + " 尺寸超出 int32 范围");
+            }
+            return static_cast<std::int32_t>(span);
+        };
+        const Size parsed_size{
+            dimension(min_x, max_x, 'X'),
+            dimension(min_y, max_y, 'Y'),
+            dimension(min_z, max_z, 'Z')
+        };
+        const auto shift = [](std::int32_t value,
+                              std::int32_t origin,
+                              char axis) -> std::int32_t {
+            const auto shifted = static_cast<std::int64_t>(value) - origin;
+            if (shifted < 0 || shifted > std::numeric_limits<std::int32_t>::max()) {
+                throw std::runtime_error(
+                    std::string("BDX ") + axis + " 坐标超出 int32 范围");
+            }
+            return static_cast<std::int32_t>(shifted);
+        };
         for (auto& block : mBlocks) {
-            block.x -= min_x;
-            block.y -= min_y;
-            block.z -= min_z;
+            block.x = shift(block.x, min_x, 'X');
+            block.y = shift(block.y, min_y, 'Y');
+            block.z = shift(block.z, min_z, 'Z');
         }
         decltype(mBlockEntities) shifted_entities;
         shifted_entities.reserve(mBlockEntities.size());
         for (auto& [pos, payload] : mBlockEntities) {
             shifted_entities.emplace(
-                BlockPos{ pos.x - min_x, pos.y - min_y, pos.z - min_z },
+                BlockPos{
+                    shift(pos.x, min_x, 'X'),
+                    shift(pos.y, min_y, 'Y'),
+                    shift(pos.z, min_z, 'Z')
+                },
                 std::move(payload));
         }
         mBlockEntities = std::move(shifted_entities);
         mMin = { min_x, min_y, min_z };
-        mOriginalSize = { max_x - min_x + 1, max_y - min_y + 1, max_z - min_z + 1 };
+        mOriginalSize = parsed_size;
         mBlocksLoaded = mMaterializeBlocks;
         set_offset({});
         if (std::getenv("WATER_STRUCTURE_PROFILE")) {
@@ -1280,13 +1726,471 @@ Result<void> BdxStructure::ensure_blocks_loaded() const
     return Result<void>::success();
 }
 
+Result<void> BdxStructure::ensure_placement_spool() const
+{
+    if (!mAllowTemporarySpool) {
+        return Result<void>::failure(
+            "BDX chunk random access 需要临时 placement spool，且 allow_temporary_spool=false");
+    }
+
+    std::filesystem::path directory;
+    std::vector<std::filesystem::path> shard_paths;
+    std::size_t spool_bytes = 0;
+    std::string failure;
+    {
+        std::unique_lock lock(mPlacementSpoolMutex);
+        mPlacementSpoolCv.wait(lock, [this] {
+            return !mPlacementSpoolInvalidating;
+        });
+        if (mPlacementSpoolReady.load(std::memory_order_relaxed)) {
+            return Result<void>::success();
+        }
+        if (mPlacementSpoolBuilding) {
+            mPlacementSpoolCv.wait(lock, [this] {
+                return !mPlacementSpoolBuilding ||
+                    mPlacementSpoolReady.load(std::memory_order_acquire);
+            });
+            if (mPlacementSpoolReady.load(std::memory_order_acquire)) {
+                return Result<void>::success();
+            }
+            if (!mPlacementSpoolError.empty()) {
+                return Result<void>::failure(mPlacementSpoolError);
+            }
+        }
+        mPlacementSpoolBuilding = true;
+        mPlacementSpoolError.clear();
+    }
+
+    try {
+        if (mSourcePath.empty()) {
+            throw std::runtime_error("BDX 源文件路径为空");
+        }
+        directory = make_bdx_spool_directory(mTemporaryDirectory, this);
+        shard_paths.resize(kPlacementShardCount);
+
+        // Only a small LRU of shard streams stays open.  A BDX command stream
+        // is single-threaded, so appending to each shard is deterministic and
+        // retains the original command order (last placement wins on replay).
+        std::vector<std::unique_ptr<std::ofstream>> streams(kPlacementShardCount);
+        std::list<std::size_t> lru;
+        std::vector<std::list<std::size_t>::iterator> lru_positions(kPlacementShardCount);
+        std::vector<bool> in_lru(kPlacementShardCount, false);
+        const auto touch = [&](std::size_t shard) {
+            if (in_lru[shard]) {
+                lru.splice(lru.begin(), lru, lru_positions[shard]);
+                return;
+            }
+            lru.push_front(shard);
+            lru_positions[shard] = lru.begin();
+            in_lru[shard] = true;
+            while (lru.size() > kPlacementOpenShardLimit) {
+                const auto victim = lru.back();
+                lru.pop_back();
+                in_lru[victim] = false;
+                if (streams[victim]) {
+                    streams[victim]->flush();
+                    if (!*streams[victim]) {
+                        throw std::runtime_error(
+                            "刷新 BDX placement shard 失败: " +
+                            shard_paths[victim].string());
+                    }
+                    streams[victim].reset();
+                }
+            }
+        };
+        const auto append = [&](BlockPos raw, std::uint32_t runtime_id) {
+            const auto local_x = normalize_placement_coordinate(
+                raw.x, mMin.x, mOffset.x, mOriginalSize.width);
+            const auto local_y = normalize_placement_coordinate(
+                raw.y, mMin.y, mOffset.y, mOriginalSize.height);
+            const auto local_z = normalize_placement_coordinate(
+                raw.z, mMin.z, mOffset.z, mOriginalSize.length);
+            if (!local_x || !local_y || !local_z) {
+                return;
+            }
+            if (spool_bytes > std::numeric_limits<std::size_t>::max() -
+                    kPlacementRecordBytes) {
+                throw std::runtime_error("BDX placement spool 大小溢出");
+            }
+            if (mTemporaryFileLimitBytes != 0 &&
+                (mTemporaryFileLimitBytes < kPlacementRecordBytes ||
+                 spool_bytes > mTemporaryFileLimitBytes - kPlacementRecordBytes)) {
+                throw std::runtime_error(
+                    "BDX placement spool 超过 temporary_file_limit_bytes");
+            }
+            const auto shard = placement_shard({
+                floor_div(*local_x, 16), floor_div(*local_z, 16) });
+            if (!streams[shard]) {
+                shard_paths[shard] = directory /
+                    ("shard-" + [&] {
+                        std::string number(4, '0');
+                        auto value = shard;
+                        for (int index = 3; index >= 0; --index) {
+                            number[static_cast<std::size_t>(index)] =
+                                static_cast<char>('0' + (value % 10));
+                            value /= 10;
+                        }
+                        return number;
+                    }() + ".bin");
+                streams[shard] = std::make_unique<std::ofstream>(
+                    shard_paths[shard], std::ios::binary | std::ios::app);
+                if (!streams[shard] || !*streams[shard]) {
+                    throw std::runtime_error(
+                        "无法创建 BDX placement shard: " + shard_paths[shard].string());
+                }
+            }
+            touch(shard);
+            const auto record = encode_placement_record(
+                *local_x, *local_y, *local_z, runtime_id);
+            streams[shard]->write(
+                reinterpret_cast<const char*>(record.data()),
+                static_cast<std::streamsize>(record.size()));
+            if (!*streams[shard]) {
+                throw std::runtime_error(
+                    "写入 BDX placement shard 失败: " + shard_paths[shard].string());
+            }
+            spool_bytes += record.size();
+        };
+
+        BdxStructure streamed(mRegistry);
+        streamed.mBoundsOnly = false;
+        streamed.mMaterializeBlocks = false;
+        streamed.mCaptureEntities = false;
+        streamed.mPlacementConsumer = append;
+        std::function<void(BlockPos, std::span<const std::uint32_t>, bool)> append_run =
+            [&](BlockPos start,
+                std::span<const std::uint32_t> runtime_ids,
+                bool) {
+                for (std::size_t index = 0; index < runtime_ids.size(); ++index) {
+                    const auto z64 = static_cast<std::int64_t>(start.z) +
+                        static_cast<std::int64_t>(index);
+                    if (z64 < std::numeric_limits<std::int32_t>::min() ||
+                        z64 > std::numeric_limits<std::int32_t>::max()) {
+                        throw std::runtime_error("BDX placement Z run 坐标超出 int32 范围");
+                    }
+                    append({ start.x, start.y, static_cast<std::int32_t>(z64) }, runtime_ids[index]);
+                }
+            };
+        streamed.mPlacementZRunConsumer = {
+            &append_run,
+            [](void* context,
+                BlockPos start,
+                std::span<const std::uint32_t> runtime_ids,
+                bool contains_air) {
+                (*static_cast<decltype(append_run)*>(context))(
+                    start, runtime_ids, contains_air);
+            }
+        };
+        const auto parsed = streamed.read(mSourcePath);
+        if (!parsed) throw std::runtime_error(parsed.error());
+        for (auto& stream : streams) {
+            if (stream) {
+                stream->flush();
+                if (!*stream) throw std::runtime_error("刷新 BDX placement shard 失败");
+                stream.reset();
+            }
+        }
+        std::uintmax_t persisted_bytes = 0;
+        for (const auto& path : shard_paths) {
+            if (path.empty()) continue;
+            std::error_code size_error;
+            const auto size = std::filesystem::file_size(path, size_error);
+            if (size_error ||
+                size > std::numeric_limits<std::uintmax_t>::max() - persisted_bytes) {
+                throw std::runtime_error(
+                    "无法验证 BDX placement shard 大小: " + path.string() +
+                    (size_error ? ": " + size_error.message() : ": overflow"));
+            }
+            persisted_bytes += size;
+        }
+        if (persisted_bytes != spool_bytes) {
+            throw std::runtime_error(
+                "BDX placement spool 写入大小不一致: expected=" +
+                std::to_string(spool_bytes) + " actual=" +
+                std::to_string(persisted_bytes));
+        }
+        if (mTemporaryFileLimitBytes != 0 &&
+            persisted_bytes > mTemporaryFileLimitBytes) {
+            throw std::runtime_error(
+                "BDX placement spool 超过 temporary_file_limit_bytes");
+        }
+
+        {
+            std::lock_guard lock(mPlacementSpoolMutex);
+            mPlacementSpoolDirectory = directory;
+            mPlacementShardPaths = std::move(shard_paths);
+            mPlacementSpoolBytes = spool_bytes;
+            mPlacementSpoolError.clear();
+            mPlacementSpoolBuilding = false;
+            mPlacementSpoolReady.store(true, std::memory_order_release);
+        }
+        mPlacementSpoolCv.notify_all();
+        return Result<void>::success();
+    } catch (const std::exception& error) {
+        try {
+            failure = std::string("BDX placement spool 构建失败: ") + error.what();
+        } catch (...) {
+        }
+    } catch (...) {
+        try {
+            failure = "BDX placement spool 构建失败: unknown error";
+        } catch (...) {
+        }
+    }
+
+    // Publish the failed-builder state before filesystem cleanup.  Waiters
+    // must never remain blocked merely because removal or error formatting on
+    // the failure path encounters another problem.
+    {
+        std::lock_guard lock(mPlacementSpoolMutex);
+        mPlacementSpoolDirectory.clear();
+        mPlacementShardPaths.clear();
+        mPlacementSpoolBytes = 0;
+        mPlacementSpoolBuilding = false;
+        mPlacementSpoolReady.store(false, std::memory_order_release);
+        try {
+            mPlacementSpoolError = failure;
+        } catch (...) {
+            mPlacementSpoolError.clear();
+        }
+    }
+    mPlacementSpoolCv.notify_all();
+    if (!directory.empty()) {
+        std::error_code cleanup_error;
+        std::filesystem::remove_all(directory, cleanup_error);
+        if (cleanup_error) {
+            try {
+                failure += "; 临时目录清理失败 " + directory.string() + ": " +
+                    cleanup_error.message();
+            } catch (...) {
+            }
+        }
+    }
+    return Result<void>::failure(std::move(failure));
+}
+
 Result<ChunkMap> BdxStructure::get_chunks(std::span<const ChunkPos> positions) const
 {
-    if (const auto loaded = ensure_blocks_loaded(); !loaded) {
-        return Result<ChunkMap>::failure(loaded.error());
-    }
     ChunkMap result;
     for (const auto pos : positions) result.emplace(pos, ChunkData{});
+
+    // The initial BDX pass intentionally keeps only bounds and entities.  A
+    // Brotli decoder cannot be snapshotted, so the first random-access request
+    // creates a fixed-record placement spool.  Every later request reads only
+    // the relevant shards and therefore never re-decodes the complete file.
+    if (!mBlocksLoaded) {
+        if (mSourcePath.empty()) {
+            return Result<ChunkMap>::failure("BDX 源文件路径为空");
+        }
+        if (mAllowTemporarySpool) {
+            std::vector<std::filesystem::path> shard_paths;
+            for (;;) {
+                const auto spooled = ensure_placement_spool();
+                if (!spooled) return Result<ChunkMap>::failure(spooled.error());
+
+                std::lock_guard lock(mPlacementSpoolMutex);
+                // An offset/options mutation can invalidate the spool in the
+                // short interval after ensure_placement_spool() returns.  In
+                // that case retry instead of opening paths that cleanup has
+                // already removed.
+                if (mPlacementSpoolInvalidating ||
+                    !mPlacementSpoolReady.load(std::memory_order_acquire)) {
+                    continue;
+                }
+                shard_paths = mPlacementShardPaths;
+                ++mPlacementSpoolReaders;
+                break;
+            }
+            const auto release_reader = [this]() noexcept {
+                try {
+                    {
+                        std::lock_guard lock(mPlacementSpoolMutex);
+                        if (mPlacementSpoolReaders != 0) {
+                            --mPlacementSpoolReaders;
+                        }
+                    }
+                    mPlacementSpoolCv.notify_all();
+                } catch (...) {
+                    // Preserve the original conversion result on unusual
+                    // synchronization failures.
+                }
+            };
+
+            try {
+                auto read_result = [&]() -> Result<ChunkMap> {
+                    // A fixed bitmap keeps request bookkeeping bounded even
+                    // when the caller supplies a very large or duplicate-heavy
+                    // position window.
+                    std::array<bool, kPlacementShardCount> requested_shards{};
+                    for (const auto position : positions) {
+                        requested_shards[placement_shard(position)] = true;
+                    }
+
+                    const auto air = mRegistry.air_runtime_id();
+                    for (std::size_t shard = 0; shard < requested_shards.size(); ++shard) {
+                        if (!requested_shards[shard] ||
+                            shard >= shard_paths.size() ||
+                            shard_paths[shard].empty()) {
+                            continue;
+                        }
+                        std::ifstream input(shard_paths[shard], std::ios::binary);
+                        if (!input) {
+                            return Result<ChunkMap>::failure(
+                                "无法打开 BDX placement shard: " +
+                                shard_paths[shard].string());
+                        }
+                        PlacementRecordBytes record{};
+                        std::size_t record_index = 0;
+                        while (true) {
+                            input.read(
+                                reinterpret_cast<char*>(record.data()),
+                                static_cast<std::streamsize>(record.size()));
+                            const auto count = input.gcount();
+                            if (count == 0 && input.eof() && !input.bad()) break;
+                            if (count != static_cast<std::streamsize>(record.size())) {
+                                return Result<ChunkMap>::failure(
+                                    "BDX placement shard 截断: " +
+                                    shard_paths[shard].string() + " record #" +
+                                    std::to_string(record_index));
+                            }
+                            const auto x = read_i32_le(record, 0);
+                            const auto y = read_i32_le(record, 4);
+                            const auto z = read_i32_le(record, 8);
+                            const auto runtime_id = read_u32_le(record, 12);
+                            if (!placement_coordinate_in_extent(
+                                    x, mOffset.x, mOriginalSize.width) ||
+                                !placement_coordinate_in_extent(
+                                    y, mOffset.y, mOriginalSize.height) ||
+                                !placement_coordinate_in_extent(
+                                    z, mOffset.z, mOriginalSize.length)) {
+                                return Result<ChunkMap>::failure(
+                                    "BDX placement shard 坐标越界: " +
+                                    shard_paths[shard].string() + " record #" +
+                                    std::to_string(record_index));
+                            }
+                            ++record_index;
+                            const ChunkPos chunk_pos{
+                                floor_div(x, 16), floor_div(z, 16) };
+                            auto chunk = result.find(chunk_pos);
+                            if (chunk == result.end()) continue;
+                            const auto sub_y = static_cast<std::int32_t>(
+                                floor_div64(static_cast<std::int64_t>(y) - 64, 16));
+                            auto [sub, inserted] =
+                                chunk->second.sub_chunks.try_emplace(sub_y);
+                            if (inserted) {
+                                sub->second.layer0.fill(air);
+                                sub->second.layer1.fill(air);
+                            }
+                            const auto local_sub_y = static_cast<std::int32_t>(
+                                static_cast<std::int64_t>(y) -
+                                (static_cast<std::int64_t>(sub_y) * 16 + 64));
+                            const auto index = static_cast<std::size_t>(
+                                (local_sub_y * 16 + floor_mod(z, 16)) * 16 +
+                                floor_mod(x, 16));
+                            sub->second.layer0[index] = runtime_id;
+                        }
+                    }
+                    // A placement stream may contain a block followed by air.
+                    // Replay records in append order, then remove all-air
+                    // subchunks without changing last-wins behavior.
+                    for (auto& [_, chunk] : result) {
+                        for (auto it = chunk.sub_chunks.begin();
+                             it != chunk.sub_chunks.end();) {
+                            const auto& data = it->second;
+                            const auto only_air = std::all_of(
+                                data.layer0.begin(), data.layer0.end(),
+                                [air](std::uint32_t value) { return value == air; });
+                            if (only_air) it = chunk.sub_chunks.erase(it);
+                            else ++it;
+                        }
+                    }
+                    return Result<ChunkMap>::success(std::move(result));
+                }();
+                release_reader();
+                return read_result;
+            } catch (...) {
+                release_reader();
+                throw;
+            }
+        }
+
+        // Explicitly disabled spool: retain the compatibility fallback.  It
+        // still decodes once per request, but never allocates a whole-block
+        // vector and is useful for read-only filesystems.
+        const auto air = mRegistry.air_runtime_id();
+        BdxStructure streamed(mRegistry);
+        streamed.mMaterializeBlocks = false;
+        streamed.mCaptureEntities = false;
+        const auto apply_placement = [&](BlockPos raw, std::uint32_t runtime_id) {
+            const auto local_x = normalize_placement_coordinate(
+                raw.x, mMin.x, mOffset.x, mOriginalSize.width);
+            const auto local_y = normalize_placement_coordinate(
+                raw.y, mMin.y, mOffset.y, mOriginalSize.height);
+            const auto local_z = normalize_placement_coordinate(
+                raw.z, mMin.z, mOffset.z, mOriginalSize.length);
+            if (!local_x || !local_y || !local_z) return;
+            const ChunkPos chunk_pos{
+                floor_div(*local_x, 16), floor_div(*local_z, 16) };
+            auto chunk = result.find(chunk_pos);
+            if (chunk == result.end()) return;
+            const auto sub_y = static_cast<std::int32_t>(
+                floor_div64(static_cast<std::int64_t>(*local_y) - 64, 16));
+            auto [sub, inserted] = chunk->second.sub_chunks.try_emplace(sub_y);
+            if (inserted) {
+                sub->second.layer0.fill(air);
+                sub->second.layer1.fill(air);
+            }
+            const auto local_sub_y = static_cast<std::int32_t>(
+                static_cast<std::int64_t>(*local_y) -
+                (static_cast<std::int64_t>(sub_y) * 16 + 64));
+            const auto index = static_cast<std::size_t>(
+                (local_sub_y * 16 + floor_mod(*local_z, 16)) * 16 +
+                floor_mod(*local_x, 16));
+            sub->second.layer0[index] = runtime_id;
+        };
+        streamed.mPlacementConsumer = apply_placement;
+        std::function<void(BlockPos, std::span<const std::uint32_t>, bool)> apply_run =
+            [&](BlockPos start,
+                std::span<const std::uint32_t> runtime_ids,
+                bool) {
+                for (std::size_t index = 0; index < runtime_ids.size(); ++index) {
+                    const auto z64 = static_cast<std::int64_t>(start.z) +
+                        static_cast<std::int64_t>(index);
+                    if (z64 < std::numeric_limits<std::int32_t>::min() ||
+                        z64 > std::numeric_limits<std::int32_t>::max()) {
+                        throw std::runtime_error(
+                            "BDX placement Z run 坐标超出 int32 范围");
+                    }
+                    apply_placement(
+                        { start.x, start.y, static_cast<std::int32_t>(z64) },
+                        runtime_ids[index]);
+                }
+            };
+        streamed.mPlacementZRunConsumer = {
+            &apply_run,
+            [](void* context,
+                BlockPos start,
+                std::span<const std::uint32_t> runtime_ids,
+                bool contains_air) {
+                (*static_cast<decltype(apply_run)*>(context))(
+                    start, runtime_ids, contains_air);
+            }
+        };
+        auto parsed = streamed.read(mSourcePath);
+        if (!parsed) return Result<ChunkMap>::failure(parsed.error());
+        for (auto& [_, chunk] : result) {
+            for (auto it = chunk.sub_chunks.begin();
+                 it != chunk.sub_chunks.end();) {
+                const auto only_air = std::all_of(
+                    it->second.layer0.begin(), it->second.layer0.end(),
+                    [air](std::uint32_t value) { return value == air; });
+                if (only_air) it = chunk.sub_chunks.erase(it);
+                else ++it;
+            }
+        }
+        return Result<ChunkMap>::success(std::move(result));
+    }
+
     if (!mChunkIndex.ensure(mBlocks, mOffset, [](const Block& block) {
         return BlockPos{ block.x, block.y, block.z };
     })) return Result<ChunkMap>::failure("BDX chunk index 超过 uint32 容量");
@@ -1348,10 +2252,36 @@ Result<void> BdxStructure::write_to_world(
         return convert_to_world(*this, world, start, std::move(callbacks));
     }
 
+    WorldConversionOptions conversion_options;
+    conversion_options.worker_count = callbacks.worker_count;
+    conversion_options.max_in_flight_chunks = callbacks.max_in_flight_chunks;
+    conversion_options.soft_memory_budget_bytes = callbacks.soft_memory_budget_bytes;
+    conversion_options.allow_temporary_spool = callbacks.allow_temporary_spool;
+    conversion_options.collect_statistics = callbacks.collect_statistics;
+    conversion_options.temporary_directory = callbacks.temporary_directory;
+    conversion_options.temporary_file_limit_bytes = callbacks.temporary_file_limit_bytes;
+    conversion_options.profiling = callbacks.profiling;
+    adapter->configure_conversion(conversion_options);
+
     // Keep chunk ownership/LRU cheap, but track persisted data per subchunk.
+    // The BDX world path predates the common ChunkStream adapter and has its
+    // own cache.  Derive every cache/queue limit from the caller's soft budget
+    // so this fast path cannot silently grow beyond the bounded pipeline.
+    const auto soft_budget = std::max<std::size_t>(
+        callbacks.soft_memory_budget_bytes, 8u * 1024u * 1024u);
+    constexpr std::size_t kCachedChunkEstimate = 1u * 1024u * 1024u;
+    constexpr std::size_t kWorkerEstimate = 4u * 1024u * 1024u;
+    const auto budget_cache_limit = std::max<std::size_t>(
+        1, (soft_budget / 4) / kCachedChunkEstimate);
+    const auto budget_worker_limit = std::max<std::size_t>(
+        1, soft_budget / kWorkerEstimate);
+    const auto requested_workers = callbacks.worker_count == 0
+        ? std::size_t{2} : callbacks.worker_count;
+    const auto encoding_workers = std::clamp<std::size_t>(
+        std::min(requested_workers, budget_worker_limit), 1, 16);
     // A revisited layer reloads only its 16x16x16 payload rather than every Y
     // layer in the chunk. This preserves bounded memory for arbitrary order.
-    const auto chunk_cache_limit = [] {
+    const auto configured_chunk_cache_limit = [] {
         constexpr std::size_t default_limit = 64;
         const auto* value = std::getenv("WATER_STRUCTURE_BDX_CHUNK_CACHE");
         if (value == nullptr || *value == '\0') return default_limit;
@@ -1363,7 +2293,7 @@ Result<void> BdxStructure::write_to_world(
         }
         return std::clamp<std::size_t>(parsed, 64, 512);
     }();
-    const auto cold_cache_limit = [] {
+    const auto configured_cold_cache_limit = [] {
         constexpr std::size_t default_mebibytes = 64;
         const auto* value = std::getenv("WATER_STRUCTURE_BDX_COLD_CACHE_MB");
         if (value == nullptr || *value == '\0') {
@@ -1377,6 +2307,10 @@ Result<void> BdxStructure::write_to_world(
         }
         return std::min<std::size_t>(parsed, 1024) * 1024 * 1024;
     }();
+    const auto chunk_cache_limit = std::max<std::size_t>(
+        1, std::min(configured_chunk_cache_limit, budget_cache_limit));
+    const auto cold_cache_limit = std::min<std::size_t>(
+        configured_cold_cache_limit, std::max<std::size_t>(1, soft_budget / 8));
     constexpr std::int32_t kMinCachedSubY = kOverworldMinY / 16;
     constexpr std::size_t kCachedSubYCount = (320 - kOverworldMinY) / 16;
     struct CachedChunk {
@@ -1453,7 +2387,10 @@ Result<void> BdxStructure::write_to_world(
         cold_cache_peak_bytes = std::max(cold_cache_peak_bytes, cold_cache_bytes);
     };
 
-    constexpr std::size_t kFlushBatchSize = 16;
+    const auto flush_batch_size = std::max<std::size_t>(
+        1, std::min<std::size_t>(16,
+            soft_budget / std::max<std::size_t>(
+                kWorkerEstimate, encoding_workers * kWorkerEstimate)));
     std::size_t save_batches = 0;
     std::size_t reload_count = 0;
     std::chrono::steady_clock::duration save_duration{};
@@ -1463,6 +2400,8 @@ Result<void> BdxStructure::write_to_world(
     std::chrono::steady_clock::duration reload_duration{};
     std::chrono::steady_clock::duration database_load_duration{};
     std::chrono::steady_clock::duration decode_duration{};
+    std::uint64_t leveldb_batches = 0;
+    std::uint64_t compressed_output_bytes = 0;
     const bool detail_profile =
         std::getenv("WATER_STRUCTURE_PROFILE_DETAIL") != nullptr;
     if (detail_profile) {
@@ -1515,8 +2454,7 @@ Result<void> BdxStructure::write_to_world(
         std::unordered_set<ChunkPos, ChunkPosHash> chunks;
         std::vector<SubChunkPos> layers;
     };
-    constexpr std::size_t kEncodingWorkers = 2;
-    detail::BoundedThreadPool save_pool(kEncodingWorkers, kEncodingWorkers);
+    detail::BoundedThreadPool save_pool(encoding_workers, encoding_workers);
     std::deque<PendingSave> pending_saves;
     const auto chunk_lookaside_slot = [](ChunkPos position) {
         auto mixed = static_cast<std::uint32_t>(position.x) * 0x9e3779b1u ^
@@ -1564,11 +2502,15 @@ Result<void> BdxStructure::write_to_world(
             insert_cold(std::move(payload), evicted);
         }
         if (!evicted.empty()) {
+            for (const auto& payload : evicted) {
+                compressed_output_bytes += payload.payload.size();
+            }
             const auto database_start = std::chrono::steady_clock::now();
             auto saved = adapter->save_subchunk_payloads(std::move(evicted));
             const auto saved_for = std::chrono::steady_clock::now() - database_start;
             database_save_duration += saved_for;
             save_duration += saved_for;
+            ++leveldb_batches;
             if (!saved) {
                 pending_saves.pop_front();
                 return Result<void>::failure(
@@ -1580,7 +2522,7 @@ Result<void> BdxStructure::write_to_world(
     };
     const auto flush_chunks = [&](std::span<const ChunkPos> positions) -> Result<void> {
         if (positions.empty()) return Result<void>::success();
-        if (pending_saves.size() >= kEncodingWorkers) {
+        if (pending_saves.size() >= encoding_workers) {
             auto previous = complete_next_pending_save();
             if (!previous) return previous;
         }
@@ -1709,7 +2651,7 @@ Result<void> BdxStructure::write_to_world(
         }
         if (cache.size() >= chunk_cache_limit) {
             if (detail_profile) ++cache_detail.capacity_flushes;
-            const auto saved = flush_oldest(kFlushBatchSize);
+            const auto saved = flush_oldest(flush_batch_size);
             if (!saved) throw std::runtime_error(saved.error());
         }
 
@@ -1861,7 +2803,8 @@ Result<void> BdxStructure::write_to_world(
     BdxStructure streamed(mRegistry);
     streamed.mBoundsOnly = false;
     streamed.mCaptureEntities = true;
-    streamed.mBlockConsumer = [&](BlockPos raw, std::uint32_t runtime_id) {
+    std::chrono::steady_clock::duration materialization_duration{};
+    auto consume_block = [&](BlockPos raw, std::uint32_t runtime_id) {
         const auto local_x = static_cast<std::int64_t>(raw.x) - mMin.x + mOffset.x;
         const auto local_y = static_cast<std::int64_t>(raw.y) - mMin.y + mOffset.y;
         const auto local_z = static_cast<std::int64_t>(raw.z) - mMin.z + mOffset.z;
@@ -1892,6 +2835,16 @@ Result<void> BdxStructure::write_to_world(
         const auto index = static_cast<std::size_t>(
             floor_mod(x, 16) * 256 + floor_mod(y, 16) * 16 + floor_mod(z, 16));
         cached_sub->layer0[index] = runtime_id;
+    };
+    streamed.mBlockConsumer = [&](BlockPos raw, std::uint32_t runtime_id) {
+        const auto started = std::chrono::steady_clock::now();
+        try {
+            consume_block(raw, runtime_id);
+        } catch (...) {
+            materialization_duration += std::chrono::steady_clock::now() - started;
+            throw;
+        }
+        materialization_duration += std::chrono::steady_clock::now() - started;
     };
     struct ZRouteState {
         bool valid = false;
@@ -2039,18 +2992,91 @@ Result<void> BdxStructure::write_to_world(
         if (sample_run) sampled_world_z_blocks += runtime_ids.size();
         if (detail_profile) ++sampled_world_z_runs;
     };
+    auto measured_consume_z_run = [&](
+        BlockPos raw,
+        std::span<const std::uint32_t> runtime_ids,
+        bool contains_air) {
+        const auto started = std::chrono::steady_clock::now();
+        try {
+            consume_z_run(raw, runtime_ids, contains_air);
+        } catch (...) {
+            materialization_duration += std::chrono::steady_clock::now() - started;
+            throw;
+        }
+        materialization_duration += std::chrono::steady_clock::now() - started;
+    };
     streamed.mZRunConsumer = {
-        &consume_z_run,
+        &measured_consume_z_run,
         [](void* context,
             BlockPos raw,
             std::span<const std::uint32_t> runtime_ids,
             bool contains_air) {
-            (*static_cast<decltype(consume_z_run)*>(context))(
+            (*static_cast<decltype(measured_consume_z_run)*>(context))(
                 raw, runtime_ids, contains_air);
         }
     };
+    const auto parse_start = std::chrono::steady_clock::now();
     const auto parsed = streamed.read(mSourcePath);
-    if (!parsed) return Result<void>::failure(parsed.error());
+    const auto parse_duration = std::chrono::steady_clock::now() - parse_start;
+    const auto total_chunks = static_cast<std::size_t>(mOriginalSize.chunk_x_count()) *
+        static_cast<std::size_t>(mOriginalSize.chunk_z_count());
+    const auto finish = [&](Result<void> result, std::string_view stage) -> Result<void> {
+        if (!result) adapter->mDiscardOnClose = true;
+        if (callbacks.statistics) {
+            ConversionStats stats;
+            stats.source_format = StructureId::BDX;
+            stats.target_format = StructureId::MCWorld;
+            const auto parser_duration = parse_duration > materialization_duration
+                ? parse_duration - materialization_duration
+                : std::chrono::steady_clock::duration{};
+            stats.parse_decompress_ms = static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(parser_duration).count());
+            stats.chunk_materialization_ms = static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    materialization_duration).count());
+            stats.encode_compress_ms = static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(encode_duration).count());
+            stats.leveldb_write_ms = static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    database_save_duration).count());
+            stats.elapsed_ms = static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - stream_start).count());
+            stats.compressed_output_bytes = compressed_output_bytes;
+            stats.leveldb_batches = leveldb_batches;
+            stats.decoded_blocks = streamed.mNonAirBlocks;
+            stats.non_air_blocks = streamed.mNonAirBlocks;
+            stats.source_chunks = total_chunks;
+            stats.completed_chunks = result ? total_chunks : 0;
+            stats.success = result.ok();
+            if (!result) {
+                stats.error_stage = std::string(stage);
+                stats.error_location = result.error();
+            }
+            const auto io = adapter->take_io_stats();
+            stats.encode_compress_ms += io.encode_compress_ms;
+            stats.leveldb_write_ms += io.leveldb_write_ms;
+            stats.leveldb_close_ms += io.leveldb_close_ms;
+            stats.mcworld_unpack_ms += io.mcworld_unpack_ms;
+            stats.mcworld_pack_ms += io.mcworld_pack_ms;
+            stats.compressed_output_bytes += io.compressed_output_bytes;
+            stats.leveldb_batches += io.leveldb_batches;
+            stats.temporary_spool_bytes += io.temporary_spool_bytes;
+            if (result) {
+                adapter->defer_statistics(std::move(stats), callbacks.statistics);
+            } else {
+                try {
+                    callbacks.statistics(stats);
+                } catch (...) {
+                    // Telemetry must not replace the conversion error.
+                }
+            }
+        }
+        return result;
+    };
+    if (!parsed) {
+        return finish(Result<void>::failure(parsed.error()), "parse/decompress");
+    }
     if (profile) {
         const auto parse_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - stream_start).count();
@@ -2168,16 +3194,16 @@ Result<void> BdxStructure::write_to_world(
         }
     }
 
-    const auto total_chunks = static_cast<std::size_t>(mOriginalSize.chunk_x_count()) *
-        static_cast<std::size_t>(mOriginalSize.chunk_z_count());
     if (callbacks.start) callbacks.start(total_chunks);
 
     while (!cache.empty()) {
-        const auto saved = flush_oldest(kFlushBatchSize);
-        if (!saved) return saved;
+        const auto saved = flush_oldest(flush_batch_size);
+        if (!saved) return finish(saved, "encode/leveldb");
     }
     while (!pending_saves.empty()) {
-        if (const auto saved = complete_next_pending_save(); !saved) return saved;
+        if (const auto saved = complete_next_pending_save(); !saved) {
+            return finish(saved, "encode/leveldb");
+        }
     }
     while (!cold_lru.empty()) {
         constexpr std::size_t kPayloadWriteBatchSize = 1024;
@@ -2194,14 +3220,19 @@ Result<void> BdxStructure::write_to_world(
             erase_cold(found);
         }
         if (payloads.empty()) continue;
+        for (const auto& payload : payloads) {
+            compressed_output_bytes += payload.payload.size();
+        }
         const auto database_start = std::chrono::steady_clock::now();
         auto saved = adapter->save_subchunk_payloads(std::move(payloads));
         const auto saved_for = std::chrono::steady_clock::now() - database_start;
         database_save_duration += saved_for;
         save_duration += saved_for;
+        ++leveldb_batches;
         if (!saved) {
-            return Result<void>::failure(
-                "BDX 流式保存剩余冷缓存 payload 失败: " + saved.error());
+            return finish(Result<void>::failure(
+                "BDX 流式保存剩余冷缓存 payload 失败: " + saved.error()),
+                "leveldb write");
         }
     }
 
@@ -2226,8 +3257,11 @@ Result<void> BdxStructure::write_to_world(
         entities[block_to_chunk(target)].push_back({ target, payload });
     }
     for (auto& [position, values] : entities) {
+        const auto database_start = std::chrono::steady_clock::now();
         const auto saved = adapter->save_chunk_nbt(position, values);
-        if (!saved) return saved;
+        database_save_duration += std::chrono::steady_clock::now() - database_start;
+        ++leveldb_batches;
+        if (!saved) return finish(saved, "block entity leveldb write");
     }
 
     if (callbacks.progress) {
@@ -2259,7 +3293,7 @@ Result<void> BdxStructure::write_to_world(
                   << " cold_peak_mb=" << (cold_cache_peak_bytes / (1024 * 1024))
                   << " cache_chunks=" << chunk_cache_limit << '\n';
     }
-    return Result<void>::success();
+    return finish(Result<void>::success(), {});
 }
 
 Result<void> BdxStructure::read_from_world(WorldSource&, BlockBox, ConversionCallbacks)

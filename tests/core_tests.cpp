@@ -1,4 +1,5 @@
-#include <WaterStructure/canonical.hpp>
+﻿#include <WaterStructure/canonical.hpp>
+#include <WaterStructure/chunk_stream.hpp>
 #include <WaterStructure/coordinates.hpp>
 #include <WaterStructure/format_registry.hpp>
 #include <WaterStructure/runtime_registry.hpp>
@@ -8,6 +9,7 @@
 #include "../src/world/archive.hpp"
 #include "../src/formats/nbt_text.hpp"
 #include "../src/formats/mcworld.hpp"
+#include "md5_fixture.hpp"
 
 #include <io/stream_reader.h>
 #include <io/ozlibstream.h>
@@ -21,16 +23,21 @@
 #include <msgpack.hpp>
 #include <nlohmann/json.hpp>
 #include <zlib.h>
-#include <windows.h>
-#include <bcrypt.h>
+#if defined(_WIN32)
+#  include <windows.h>
+#  include <bcrypt.h>
+#endif
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <chrono>
 #include <iostream>
+#include <memory>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 
@@ -79,6 +86,8 @@ std::filesystem::path write_schem_v2_sample()
     document.emplace<nbt::tag_short>("Width", 2);
     document.emplace<nbt::tag_short>("Height", 1);
     document.emplace<nbt::tag_short>("Length", 1);
+    document["Offset"] = nbt::tag_int_array(
+        std::vector<std::int32_t>{ -40, -206, -61 });
     document["Blocks"] = std::move(blocks);
     nbt::tag_compound root;
     root["Schematic"] = std::move(document);
@@ -327,6 +336,16 @@ std::filesystem::path write_ibimport_sample()
     return path;
 }
 
+void set_test_environment(const char* name, const char* value)
+{
+#if defined(_WIN32)
+    _putenv_s(name, value);
+#else
+    if (value == nullptr || *value == '\0') unsetenv(name);
+    else setenv(name, value, 1);
+#endif
+}
+
 std::filesystem::path write_schem_v1_ordered_sample()
 {
     const auto path = std::filesystem::temp_directory_path() /
@@ -447,30 +466,6 @@ std::vector<std::uint8_t> compress_zlib(
     return output;
 }
 
-std::array<std::uint8_t, 16> fixture_md5(std::span<const std::uint8_t> input)
-{
-    BCRYPT_ALG_HANDLE algorithm = nullptr;
-    BCRYPT_HASH_HANDLE hash = nullptr;
-    check(BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_MD5_ALGORITHM, nullptr, 0) >= 0,
-        "open fixture MD5 provider");
-    ULONG object_size = 0;
-    ULONG received = 0;
-    check(BCryptGetProperty(algorithm, BCRYPT_OBJECT_LENGTH,
-        reinterpret_cast<PUCHAR>(&object_size), sizeof(object_size), &received, 0) >= 0,
-        "query fixture MD5 object size");
-    std::vector<std::uint8_t> object(object_size);
-    check(BCryptCreateHash(algorithm, &hash, object.data(), object_size, nullptr, 0, 0) >= 0,
-        "create fixture MD5 hash");
-    check(BCryptHashData(hash, const_cast<PUCHAR>(input.data()),
-        static_cast<ULONG>(input.size()), 0) >= 0, "hash fixture MD5 input");
-    std::array<std::uint8_t, 16> result{};
-    check(BCryptFinishHash(hash, result.data(), static_cast<ULONG>(result.size()), 0) >= 0,
-        "finish fixture MD5 hash");
-    BCryptDestroyHash(hash);
-    BCryptCloseAlgorithmProvider(algorithm, 0);
-    return result;
-}
-
 std::filesystem::path write_tibi_sample(bool truncated)
 {
     std::vector<std::uint8_t> payload;
@@ -502,7 +497,7 @@ std::filesystem::path write_tibi_sample(bool truncated)
     std::vector<std::uint8_t> key_material(header.begin(), header.end());
     const auto suffix = std::string("TIBI_2025/5/19-Start") + std::to_string(payload.size());
     key_material.insert(key_material.end(), suffix.begin(), suffix.end());
-    const auto key = fixture_md5(key_material);
+    const auto key = fixture_md5_portable(key_material);
     std::vector<std::uint8_t> decoded(header.begin(), header.end());
     for (std::size_t index = 0; index < payload.size(); ++index) {
         decoded.push_back(payload[index] ^ key[index % key.size()]);
@@ -667,7 +662,10 @@ std::array<std::filesystem::path, 7> write_gangban_samples()
         { "id", 0 }, { "grids", { { "x", -2 }, { "z", 3 }, { "x1", 0 }, { "z1", 0 } } },
         { "data", nlohmann::json::array({
             nlohmann::json::array({ 0, 0, 0, 4, 0, "nbt", "{id:\"Chest\"}" }),
-            nlohmann::json::array({ 1, 0, 1, 4, 0 })
+            nlohmann::json::array({ 1, 0, 1, 4, 0 }),
+            // Fatalder preserves V3 records immediately beyond a declared
+            // header extent without expanding GetSize().
+            nlohmann::json::array({ 0, 0, 0, 4, 1 })
         }) }
     });
 
@@ -1201,6 +1199,164 @@ void test_zip_round_trip()
     check(!cleanup_error, "mcworld zip cleanup");
 }
 
+void test_zip_streaming_entry()
+{
+    // This payload is intentionally larger than the archive implementation's
+    // 64 KiB transfer window.  The test exercises both bounded inflate input
+    // and bounded output writes without requiring an entry-sized buffer.
+    const auto unique = std::to_string(
+        std::chrono::high_resolution_clock::now().time_since_epoch().count());
+    const auto root = std::filesystem::temp_directory_path() /
+        ("water_structure_cpp_zip_stream_" + unique);
+    const auto source = root / "source";
+    const auto extracted = root / "extracted";
+    const auto archive_path = root / "stream.mcworld";
+    std::filesystem::create_directories(source);
+    const auto source_file = source / "large.bin";
+    constexpr std::size_t payload_size = 8 * 1024 * 1024 + 123;
+    std::vector<std::uint8_t> pattern(64 * 1024);
+    std::uint32_t random_state = 0x6d2b79f5u;
+    for (std::size_t i = 0; i < pattern.size(); ++i) {
+        random_state ^= random_state << 13u;
+        random_state ^= random_state >> 17u;
+        random_state ^= random_state << 5u;
+        pattern[i] = static_cast<std::uint8_t>(random_state & 0xffu);
+    }
+    {
+        std::ofstream output(source_file, std::ios::binary | std::ios::trunc);
+        check(output.good(), "create large ZIP source");
+        std::size_t remaining = payload_size;
+        while (remaining != 0) {
+            const auto count = std::min<std::size_t>(remaining, pattern.size());
+            output.write(reinterpret_cast<const char*>(pattern.data()),
+                static_cast<std::streamsize>(count));
+            check(output.good(), "write large ZIP source");
+            remaining -= count;
+        }
+    }
+    const auto packed = water_structure::archive::create_zip(source, archive_path);
+    check(packed.ok(), "stream ZIP pack");
+    const auto unpacked = water_structure::archive::extract_zip(archive_path, extracted);
+    check(unpacked.ok(), "stream ZIP extract");
+    const auto output_file = extracted / "large.bin";
+    check(std::filesystem::is_regular_file(output_file) &&
+        std::filesystem::file_size(output_file) == payload_size,
+        "stream ZIP output size");
+    {
+        std::ifstream input(output_file, std::ios::binary);
+        check(input.good(), "open stream ZIP output");
+        std::size_t remaining = payload_size;
+        std::vector<std::uint8_t> actual(pattern.size());
+        while (remaining != 0) {
+            const auto count = std::min<std::size_t>(remaining, pattern.size());
+            input.read(reinterpret_cast<char*>(actual.data()),
+                static_cast<std::streamsize>(count));
+            check(input.gcount() == static_cast<std::streamsize>(count),
+                "read stream ZIP output");
+            for (std::size_t i = 0; i < count; ++i) {
+                check(actual[i] == pattern[i], "stream ZIP output contents");
+            }
+            remaining -= count;
+        }
+    }
+
+    // Corrupt the central-directory CRC and ensure extraction fails after
+    // streaming the entry instead of silently committing bad output.
+    const auto read_bytes = [](const std::filesystem::path& path) {
+        std::ifstream input(path, std::ios::binary);
+        return std::vector<std::uint8_t>(
+            std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
+    };
+    const auto write_bytes = [](const std::filesystem::path& path,
+        const std::vector<std::uint8_t>& bytes) {
+        std::ofstream output(path, std::ios::binary | std::ios::trunc);
+        output.write(reinterpret_cast<const char*>(bytes.data()),
+            static_cast<std::streamsize>(bytes.size()));
+        return output.good();
+    };
+    const auto find_signature = [](const std::vector<std::uint8_t>& bytes, std::uint32_t signature) {
+        if (bytes.size() < 4) return std::string::npos;
+        for (std::size_t i = bytes.size() - 4;; --i) {
+            const auto value = static_cast<std::uint32_t>(bytes[i]) |
+                (static_cast<std::uint32_t>(bytes[i + 1]) << 8u) |
+                (static_cast<std::uint32_t>(bytes[i + 2]) << 16u) |
+                (static_cast<std::uint32_t>(bytes[i + 3]) << 24u);
+            if (value == signature) return i;
+            if (i == 0) break;
+        }
+        return std::string::npos;
+    };
+    const auto archive_bytes = read_bytes(archive_path);
+    const auto central_offset = find_signature(archive_bytes, 0x02014b50u);
+    check(central_offset != std::string::npos, "find ZIP central directory");
+    const auto eocd_offset = find_signature(archive_bytes, 0x06054b50u);
+    check(eocd_offset != std::string::npos, "find ZIP EOCD");
+    auto zip64_marker = archive_bytes;
+    zip64_marker[eocd_offset + 8] = zip64_marker[eocd_offset + 9] = 0xffu;
+    zip64_marker[eocd_offset + 10] = zip64_marker[eocd_offset + 11] = 0xffu;
+    const auto zip64_marker_path = root / "zip64-marker.mcworld";
+    check(write_bytes(zip64_marker_path, zip64_marker), "write ZIP64 marker");
+    const auto zip64_result = water_structure::archive::extract_zip(
+        zip64_marker_path, root / "zip64-out");
+    check(!zip64_result.ok() && zip64_result.error().find("ZIP64") != std::string::npos,
+        "ZIP64 marker explicitly rejected");
+    auto corrupt_crc = archive_bytes;
+    corrupt_crc[central_offset + 16] ^= 0xffu;
+    const auto corrupt_crc_path = root / "corrupt-crc.mcworld";
+    check(write_bytes(corrupt_crc_path, corrupt_crc), "write corrupt ZIP CRC");
+    const auto corrupt_crc_result = water_structure::archive::extract_zip(
+        corrupt_crc_path, root / "corrupt-crc-out");
+    check(!corrupt_crc_result.ok() &&
+        corrupt_crc_result.error().find("CRC32") != std::string::npos,
+        "corrupt ZIP CRC rejected");
+    check(!std::filesystem::exists(root / "corrupt-crc-out" / "large.bin"),
+        "corrupt ZIP output removed");
+
+    auto truncated = archive_bytes;
+    truncated.resize(truncated.size() - 1);
+    const auto truncated_path = root / "truncated.mcworld";
+    check(write_bytes(truncated_path, truncated), "write truncated ZIP");
+    const auto truncated_result = water_structure::archive::extract_zip(
+        truncated_path, root / "truncated-out");
+    check(!truncated_result.ok(), "truncated ZIP rejected");
+
+    // A name with parent traversal must be rejected before any output file is
+    // opened.  Keep the replacement name the same length as the original so
+    // the test only changes ZIP name bytes, not offsets or descriptors.
+    const auto traversal_source = root / "traversal-source";
+    std::filesystem::create_directories(traversal_source);
+    {
+        std::ofstream output(traversal_source / "payload.bin", std::ios::binary | std::ios::trunc);
+        output << "payload";
+    }
+    const auto traversal_archive = root / "traversal.mcworld";
+    check(water_structure::archive::create_zip(traversal_source, traversal_archive).ok(),
+        "create traversal ZIP");
+    auto traversal_bytes = read_bytes(traversal_archive);
+    const auto local_offset = find_signature(traversal_bytes, 0x04034b50u);
+    const auto traversal_central_offset = find_signature(traversal_bytes, 0x02014b50u);
+    constexpr std::string_view traversal_name = "../evil.bin";
+    check(local_offset != std::string::npos &&
+        traversal_central_offset != std::string::npos &&
+        traversal_name.size() == 11,
+        "find traversal ZIP headers");
+    std::copy(traversal_name.begin(), traversal_name.end(),
+        traversal_bytes.begin() + local_offset + 30);
+    std::copy(traversal_name.begin(), traversal_name.end(),
+        traversal_bytes.begin() + traversal_central_offset + 46);
+    check(write_bytes(traversal_archive, traversal_bytes), "write traversal ZIP");
+    const auto traversal_result = water_structure::archive::extract_zip(
+        traversal_archive, root / "traversal-out");
+    check(!traversal_result.ok() &&
+        traversal_result.error().find("路径不安全") != std::string::npos,
+        "traversal ZIP rejected");
+    check(!std::filesystem::exists(root / "evil.bin"), "traversal ZIP does not escape destination");
+
+    std::error_code cleanup_error;
+    std::filesystem::remove_all(root, cleanup_error);
+    check(!cleanup_error, "stream ZIP cleanup");
+}
+
 void test_new_mcworld_archive()
 {
     const auto unique = std::to_string(
@@ -1226,6 +1382,37 @@ void test_new_mcworld_archive()
     check(std::filesystem::is_regular_file(extracted / "level.dat") &&
         std::filesystem::is_directory(extracted / "db"),
         "new .mcworld contains Bedrock world metadata and LevelDB");
+    const auto no_spool_input = water_structure::BedrockWorldAdapter::open(
+        archive_path, water_structure::WorldOpenOptions{
+            .write_back_archive = false,
+            .allow_temporary_spool = false
+        });
+    check(!no_spool_input.ok() &&
+        no_spool_input.error().find("allow_temporary_spool=false") != std::string::npos,
+        ".mcworld input rejects disabled temporary spool");
+    const auto no_spool_output_path = root / "no-spool.mcworld";
+    const auto no_spool_output = water_structure::BedrockWorldAdapter::open(
+        no_spool_output_path, water_structure::WorldOpenOptions{
+            .allow_temporary_spool = false
+        });
+    check(!no_spool_output.ok() && !std::filesystem::exists(no_spool_output_path),
+        ".mcworld output rejects disabled temporary spool without creating a file");
+    const auto limited_extract = water_structure::archive::extract_zip(
+        archive_path, root / "limited-extract", 1);
+    check(!limited_extract.ok() &&
+        limited_extract.error().find("temporary_file_limit_bytes") != std::string::npos,
+        ".mcworld extraction enforces the declared spool limit");
+    const auto limited_output_path = root / "limited-output.mcworld";
+    auto limited_output = water_structure::BedrockWorldAdapter::open(
+        limited_output_path, water_structure::WorldOpenOptions{
+            .temporary_file_limit_bytes = 1
+        });
+    check(limited_output.ok(), "limited .mcworld output opens transactionally");
+    if (limited_output) {
+        const auto limited_close = limited_output.value().close();
+        check(!limited_close.ok() && !std::filesystem::exists(limited_output_path),
+            ".mcworld output limit aborts before atomic replace");
+    }
 
     std::error_code cleanup_error;
     std::filesystem::remove_all(root, cleanup_error);
@@ -1245,6 +1432,7 @@ public:
     water_structure::Result<water_structure::ChunkMap> get_chunks(
         std::span<const water_structure::ChunkPos> positions) const override
     {
+        chunk_batch_peak = std::max(chunk_batch_peak, positions.size());
         water_structure::ChunkMap chunks;
         for (const auto pos : positions) {
             water_structure::ChunkData chunk;
@@ -1257,9 +1445,29 @@ public:
         }
         return water_structure::Result<water_structure::ChunkMap>::success(std::move(chunks));
     }
+    water_structure::Result<void> visit_chunks(
+        std::span<const water_structure::ChunkPos> positions,
+        const water_structure::ChunkVisitor& visitor) const override
+    {
+        visit_batch_peak = std::max(visit_batch_peak, positions.size());
+        auto chunks = get_chunks(positions);
+        if (!chunks) return water_structure::Result<void>::failure(chunks.error());
+        for (const auto position : positions) {
+            const auto found = chunks.value().find(position);
+            if (found == chunks.value().end()) continue;
+            auto visited = visitor(position, found->second);
+            if (!visited) return visited;
+            if (fail_after_first_chunk) {
+                return water_structure::Result<void>::failure(
+                    "intentional structure stream failure");
+            }
+        }
+        return water_structure::Result<void>::success();
+    }
     water_structure::Result<water_structure::NbtChunkMap> get_chunk_nbt(
         std::span<const water_structure::ChunkPos> positions) const override
     {
+        nbt_batch_peak = std::max(nbt_batch_peak, positions.size());
         water_structure::NbtChunkMap entities;
         for (const auto pos : positions) {
             entities.emplace(pos, std::vector<water_structure::BlockEntity>{});
@@ -1283,6 +1491,11 @@ public:
     {
         return water_structure::Result<void>::failure("unused");
     }
+
+    mutable std::size_t chunk_batch_peak = 0;
+    mutable std::size_t nbt_batch_peak = 0;
+    mutable std::size_t visit_batch_peak = 0;
+    bool fail_after_first_chunk = false;
 };
 
 class TestWorld final : public water_structure::WorldTarget {
@@ -1305,6 +1518,43 @@ public:
 
     water_structure::ChunkPos saved_pos{};
     water_structure::ChunkData saved_chunk;
+};
+
+class RecordingChunkSink final : public water_structure::ChunkSink {
+public:
+    water_structure::Result<void> push(
+        water_structure::StreamChunk&& chunk) override
+    {
+        positions.push_back(chunk.position);
+        return water_structure::Result<void>::success();
+    }
+
+    water_structure::Result<void> finish() override
+    {
+        finished = true;
+        return water_structure::Result<void>::success();
+    }
+
+    std::vector<water_structure::ChunkPos> positions;
+    bool finished = false;
+};
+
+class FailingChunkSink final : public water_structure::ChunkSink {
+public:
+    water_structure::Result<void> push(water_structure::StreamChunk&&) override
+    {
+        ++received;
+        if (received >= fail_at) {
+            return water_structure::Result<void>::failure("intentional sink failure");
+        }
+        return water_structure::Result<void>::success();
+    }
+
+    void cancel() noexcept override { cancelled = true; }
+
+    std::size_t fail_at = 2;
+    std::size_t received = 0;
+    bool cancelled = false;
 };
 
 class BlockEntityStructure final : public water_structure::IStructure {
@@ -1367,6 +1617,11 @@ int main()
         check(water_structure::floor_div(15, 16) == 0, "positive floor_div");
         check(water_structure::floor_div(-1, 16) == -1, "negative floor_div");
         check(water_structure::floor_div(-17, 16) == -2, "negative floor_div across boundary");
+        check(water_structure::floor_div64(-64, 16) == -4,
+            "floor_div64 exact negative boundary");
+        check(water_structure::floor_div64(-65, 16) == -5 &&
+            water_structure::floor_mod64(-65, 16) == 15,
+            "floor_div64 negative boundary remainder");
         check(water_structure::floor_mod(-1, 16) == 15, "negative floor_mod");
         check(water_structure::structure_y_to_chunk_local(0) == -64, "block entity minimum y");
         check(water_structure::structure_y_to_chunk_local(63) == -1, "block entity local y");
@@ -1459,6 +1714,14 @@ int main()
             registry.legacy_runtime_id("minecraft:stone_block_slab", 0),
             "legacy names are case-normalized");
         check(water_structure::FormatRegistry::formats().size() == 37, "format count");
+        check(std::ranges::count_if(
+                water_structure::FormatRegistry::formats(),
+                [](const auto& format) { return format.reader_implemented; }) == 36,
+            "audited reader capability count");
+        check(std::ranges::count_if(
+                water_structure::FormatRegistry::formats(),
+                [](const auto& format) { return format.writer_implemented; }) == 11,
+            "audited writer capability count");
         for (const auto format_id : {
             water_structure::StructureId::Schematic,
             water_structure::StructureId::SchemV1,
@@ -1478,6 +1741,44 @@ int main()
                 format->writer_implemented && format->world_export_implemented,
                 "Go FromMCWorld writer capability");
         }
+        const auto file_capability = water_structure::FormatRegistry::capability(
+            water_structure::StructureId::Schematic,
+            water_structure::StructureId::SchemV1);
+        check(file_capability.ok() && file_capability.value().supported &&
+            !file_capability.value().streaming && file_capability.value().lossy,
+            "audited file-to-file capability does not overstate native streaming or fidelity");
+        const auto missing_writer_capability = water_structure::FormatRegistry::capability(
+            water_structure::StructureId::Schematic,
+            water_structure::StructureId::Construction);
+        check(missing_writer_capability.ok() &&
+            !missing_writer_capability.value().supported &&
+            missing_writer_capability.value().reason.find("writer") != std::string::npos,
+            "audited capability rejects missing writer");
+        const auto to_world_capability = water_structure::FormatRegistry::capability(
+            water_structure::StructureId::MianYangV1,
+            water_structure::StructureId::MCWorld,
+            water_structure::ConversionDirection::StructureToWorld);
+        check(to_world_capability.ok() && to_world_capability.value().supported,
+            "audited structure-to-world capability");
+        const auto from_world_capability = water_structure::FormatRegistry::capability(
+            water_structure::StructureId::MCWorld,
+            water_structure::StructureId::SchemV1,
+            water_structure::ConversionDirection::WorldToStructure);
+        check(from_world_capability.ok() && from_world_capability.value().supported &&
+            from_world_capability.value().streaming && from_world_capability.value().lossy,
+            "world-to-structure uses MCWorld reader plus verified file writer");
+        const auto unsupported_loss = water_structure::FormatRegistry::capability(
+            water_structure::StructureId::MCFunction,
+            water_structure::StructureId::Construction);
+        check(unsupported_loss.ok() && !unsupported_loss.value().supported &&
+            !unsupported_loss.value().streaming && !unsupported_loss.value().lossy,
+            "unsupported capability does not advertise pipeline properties");
+        const auto mcworld_copy = water_structure::FormatRegistry::capability(
+            water_structure::StructureId::MCWorld,
+            water_structure::StructureId::MCWorld,
+            water_structure::ConversionDirection::StructureToWorld);
+        check(mcworld_copy.ok() && mcworld_copy.value().supported,
+            "MCWorld can stream into another world target");
         const auto sibi_format = std::ranges::find_if(
             water_structure::FormatRegistry::formats(),
             [](const auto& value) { return value.id == water_structure::StructureId::SIBI; });
@@ -1498,6 +1799,7 @@ int main()
                 "MianYang reader capability");
         }
         test_zip_round_trip();
+        test_zip_streaming_entry();
         test_new_mcworld_archive();
 
         const auto schematic_path = write_schematic_sample();
@@ -1635,10 +1937,10 @@ int main()
         const auto mcfunction_source = water_structure::FormatRegistry::open(
             mcfunction_source_path, registry);
         check(mcfunction_source.ok(), "MCFunction writer source parses");
-        _putenv_s("WATER_STRUCTURE_MCFUNCTION_PARSE_THREADS", "2");
+        set_test_environment("WATER_STRUCTURE_MCFUNCTION_PARSE_THREADS", "2");
         const auto mcfunction_parallel_source = water_structure::FormatRegistry::open(
             mcfunction_source_path, registry);
-        _putenv_s("WATER_STRUCTURE_MCFUNCTION_PARSE_THREADS", "");
+        set_test_environment("WATER_STRUCTURE_MCFUNCTION_PARSE_THREADS", "");
         check(mcfunction_parallel_source.ok(),
             "MCFunction bounded parallel reader parses");
         check(mcfunction_parallel_source.value()->size().width ==
@@ -1657,10 +1959,14 @@ int main()
         water_structure::ConversionOptions mcfunction_progress_options{
             .thread_count = 1
         };
+        mcfunction_progress_options.collect_statistics = true;
+        water_structure::ConversionStats mcfunction_stats;
         mcfunction_progress_options.callbacks.start =
             [&](std::size_t total) { mcfunction_progress_total = total; };
         mcfunction_progress_options.callbacks.progress =
             [&]() { ++mcfunction_progress_done; };
+        mcfunction_progress_options.callbacks.statistics =
+            [&](const water_structure::ConversionStats& value) { mcfunction_stats = value; };
         const auto mcfunction_single_thread_written = water_structure::FormatRegistry::write(
             *mcfunction_source.value(), water_structure::StructureId::MCFunction,
             mcfunction_single_thread_path, registry, mcfunction_progress_options);
@@ -1669,6 +1975,10 @@ int main()
         check(mcfunction_progress_total > 0 &&
             mcfunction_progress_done == mcfunction_progress_total,
             "MCFunction writer reports chunk progress");
+        check(mcfunction_stats.success &&
+            mcfunction_stats.target_format == water_structure::StructureId::MCFunction &&
+            mcfunction_stats.source_chunks == mcfunction_stats.completed_chunks,
+            "conversion statistics report completed chunks");
         water_structure::ConversionOptions mcfunction_no_clear_options{
             .clear_air = false
         };
@@ -1872,7 +2182,20 @@ int main()
         check(schem_v2.ok(), "synthetic SchemV2 parses");
         check(schem_v2.value()->id() == water_structure::StructureId::SchemV2,
             "SchemV2 trial detection");
+        check(schem_v2.value()->size().width == 2 &&
+                schem_v2.value()->size().height == 1 &&
+                schem_v2.value()->size().length == 1 &&
+                schem_v2.value()->offset() == water_structure::BlockPos{},
+            "SchemV2 file Offset remains placement metadata");
         check(schem_v2.value()->count_non_air_blocks().value() == 1, "synthetic SchemV2 non-air count");
+        const std::array<water_structure::ChunkPos, 1> schem_v2_positions{ {
+            water_structure::ChunkPos{ 0, 0 }
+        } };
+        const auto schem_v2_chunks = schem_v2.value()->get_chunks(schem_v2_positions);
+        check(schem_v2_chunks.ok() &&
+                schem_v2_chunks.value().at({ 0, 0 }).sub_chunks.at(-4).layer0[0] ==
+                    registry.compatible_java_runtime_id("minecraft:stone").value(),
+            "SchemV2 file Offset does not move decoded blocks");
         const auto schem_direct_path = write_schem_v1_ordered_sample();
         const auto schem_direct = water_structure::FormatRegistry::open_as(
             schem_direct_path, water_structure::StructureId::SchemV1, registry,
@@ -2064,6 +2387,49 @@ int main()
         const auto bdx_entities = bdx.value()->get_chunk_nbt(bdx_positions);
         check(bdx_entities.ok() && bdx_entities.value().at({ 0, 0 }).size() == 3,
             "BDX command/chest/raw NBT");
+        const auto bdx_stats_path = bdx_path.parent_path() /
+            "water_structure_cpp_bdx_stats.schem";
+        std::optional<water_structure::ConversionStats> bdx_stats;
+        water_structure::ConversionOptions bdx_stats_options;
+        bdx_stats_options.collect_statistics = true;
+        bdx_stats_options.callbacks.statistics =
+            [&](const water_structure::ConversionStats& stats) { bdx_stats = stats; };
+        const auto bdx_stats_write = water_structure::FormatRegistry::write(
+            *bdx.value(), water_structure::StructureId::SchemV2,
+            bdx_stats_path, registry, bdx_stats_options);
+        check(bdx_stats_write.ok() && bdx_stats.has_value() && bdx_stats->success,
+            "BDX random-access writer reports conversion statistics");
+        check(bdx_stats && bdx_stats->temporary_spool_bytes != 0,
+            "BDX placement spool bytes are included in conversion statistics");
+        std::filesystem::remove(bdx_stats_path);
+        const auto bdx_world_path = bdx_path.parent_path() /
+            "water_structure_cpp_bdx_stats_world";
+        std::error_code bdx_world_cleanup_error;
+        std::filesystem::remove_all(bdx_world_path, bdx_world_cleanup_error);
+        auto bdx_world = water_structure::BedrockWorldAdapter::open(bdx_world_path);
+        check(bdx_world.ok(), "BDX statistics world opens");
+        std::optional<water_structure::ConversionStats> bdx_world_stats;
+        if (bdx_world) {
+            water_structure::ConversionCallbacks bdx_world_callbacks;
+            bdx_world_callbacks.worker_count = 1;
+            bdx_world_callbacks.soft_memory_budget_bytes = 32u * 1024u * 1024u;
+            bdx_world_callbacks.collect_statistics = true;
+            bdx_world_callbacks.statistics =
+                [&](const water_structure::ConversionStats& stats) {
+                    bdx_world_stats = stats;
+                };
+            const auto converted = bdx.value()->write_to_world(
+                bdx_world.value(), {}, std::move(bdx_world_callbacks));
+            check(converted.ok() && !bdx_world_stats.has_value(),
+                "BDX world statistics wait for close/archive completion");
+            const auto closed = bdx_world.value().close();
+            check(closed.ok() && bdx_world_stats && bdx_world_stats->success &&
+                    bdx_world_stats->target_format == water_structure::StructureId::MCWorld &&
+                    bdx_world_stats->decoded_blocks == 10 &&
+                    bdx_world_stats->leveldb_batches != 0,
+                "BDX fast world path reports final stage statistics");
+        }
+        std::filesystem::remove_all(bdx_world_path, bdx_world_cleanup_error);
         if (const auto* fixture_output = std::getenv("WATER_STRUCTURE_BDX_FIXTURE_OUTPUT")) {
             std::filesystem::copy_file(
                 bdx_path,
@@ -2229,13 +2595,28 @@ int main()
         for (std::size_t index = 0; index < gangban_paths.size(); ++index) {
             preserve_benchmark_fixture(gangban_paths[index]);
             const auto opened = water_structure::FormatRegistry::open(gangban_paths[index], registry);
-            check(opened.ok() && opened.value()->id() == gangban_ids[index],
-                "GangBan magic detection and parse");
+            if (!opened) {
+                throw std::runtime_error(
+                    "GangBan magic detection and parse v" + std::to_string(index + 1) +
+                    ": " + opened.error());
+            }
+            if (opened.value()->id() != gangban_ids[index]) {
+                throw std::runtime_error(
+                    "GangBan magic detection returned wrong version at fixture v" +
+                    std::to_string(index + 1));
+            }
             const auto size = opened.value()->size();
             check(size.width == (index == 4 ? 1 : 2) && size.height == 1 && size.length == 1,
                 "GangBan dimensions");
-            check(opened.value()->count_non_air_blocks().value() == 1,
+            check(opened.value()->count_non_air_blocks().value() == (index == 2 ? 2 : 1),
                 "GangBan non-air count");
+            if (index == 2) {
+                const auto chunks = opened.value()->get_chunks(mianyang_positions);
+                check(chunks.ok() &&
+                        chunks.value().at({ 0, 0 }).sub_chunks.at(-4).layer0[16] ==
+                            registry.compatible_java_runtime_id("minecraft:stone").value(),
+                    "GangBanV3 preserves records outside declared header extent");
+            }
             const auto entities = opened.value()->get_chunk_nbt(mianyang_positions);
             check(entities.ok() && entities.value().at({ 0, 0 }).size() == gangban_entities[index],
                 "GangBan typed block entity NBT");
@@ -2246,6 +2627,20 @@ int main()
                 format->reader_implemented && format->world_import_implemented,
                 "GangBan capabilities");
         }
+        const auto large_detection_path = std::filesystem::temp_directory_path() /
+            "water_structure_cpp_gangban_detection_stream.json";
+        {
+            std::ofstream output(large_detection_path, std::ios::binary | std::ios::trunc);
+            output << '[';
+            for (std::size_t index = 0; index < 250'000; ++index) output << "0,";
+            output << R"({"ep":[0,0,0]},["minecraft:stone"]])";
+        }
+        const auto large_detection = water_structure::FormatRegistry::detect(
+            large_detection_path);
+        check(large_detection.ok() &&
+            large_detection.value().id == water_structure::StructureId::GangBanV5,
+            "JSON format detection streams large root arrays");
+        std::filesystem::remove(large_detection_path);
         const auto truncated_gangban = std::filesystem::temp_directory_path() /
             "water_structure_cpp_gangban_v7_truncated.reb";
         {
@@ -2392,6 +2787,14 @@ int main()
                 msgpack_size.length == 1 &&
                 opened.value()->count_non_air_blocks().value() == 2,
                 "MessagePack format bounds and count");
+            const std::array<water_structure::ChunkPos, 1> msgpack_positions{{ { 0, 0 } }};
+            const auto msgpack_chunks = opened.value()->get_chunks(msgpack_positions);
+            check(msgpack_chunks.ok() &&
+                    msgpack_chunks.value().at({ 0, 0 }).sub_chunks.contains(-4) &&
+                    !msgpack_chunks.value().at({ 0, 0 }).sub_chunks.contains(-5) &&
+                    msgpack_chunks.value().at({ 0, 0 }).sub_chunks.at(-4).layer0[0] !=
+                        registry.air_runtime_id(),
+                "MessagePack exact -64 storage boundary materializes in subchunk -4");
             const auto format = std::ranges::find_if(
                 water_structure::FormatRegistry::formats(),
                 [&](const auto& value) { return value.id == format_id; });
@@ -2414,6 +2817,14 @@ int main()
         check(bcf_size.width == 2 && bcf_size.height == 1 && bcf_size.length == 1 &&
             bcf.value()->count_non_air_blocks().value() == 2,
             "BCF cuboid bounds and count");
+        const std::array<water_structure::ChunkPos, 1> bcf_positions{{ { 0, 0 } }};
+        const auto bcf_chunks = bcf.value()->get_chunks(bcf_positions);
+        check(bcf_chunks.ok() &&
+                bcf_chunks.value().at({ 0, 0 }).sub_chunks.contains(-4) &&
+                !bcf_chunks.value().at({ 0, 0 }).sub_chunks.contains(-5) &&
+                bcf_chunks.value().at({ 0, 0 }).sub_chunks.at(-4).layer0[0] !=
+                    registry.air_runtime_id(),
+            "BCF exact -64 storage boundary materializes in subchunk -4 layer 0");
         const auto bcf_format = std::ranges::find_if(
             water_structure::FormatRegistry::formats(),
             [](const auto& value) { return value.id == water_structure::StructureId::BCF; });
@@ -2541,6 +2952,28 @@ int main()
             tibi_layer[1] == registry.find("minecraft:dirt").value() &&
             tibi_layer[5] == registry.find("minecraft:stone").value(),
             "TIBI setblock, fill and reversed fill materialization");
+        const auto no_tibi_spool = water_structure::FormatRegistry::open(
+            tibi_path, registry, { .allow_temporary_spool = false });
+        check(!no_tibi_spool.ok() &&
+            no_tibi_spool.error().find("allow_temporary_spool=false") != std::string::npos,
+            "TIBI reports a capability error when its required spool is disabled");
+        const auto tibi_spool_directory = std::filesystem::temp_directory_path() /
+            "water_structure_cpp_tibi_spool_test";
+        std::error_code tibi_spool_error;
+        std::filesystem::remove_all(tibi_spool_directory, tibi_spool_error);
+        const auto bounded_tibi = water_structure::FormatRegistry::open(
+            tibi_path, registry, {
+                .soft_memory_budget_bytes = 64u * 1024u * 1024u,
+                .allow_temporary_spool = true,
+                .temporary_directory = tibi_spool_directory,
+                .temporary_file_limit_bytes = 16u * 1024u * 1024u
+            });
+        check(bounded_tibi.ok(), "TIBI two-pass bounded spool parses under a 64 MiB soft budget");
+        check(std::filesystem::is_directory(tibi_spool_directory) &&
+            std::filesystem::directory_iterator(tibi_spool_directory) ==
+                std::filesystem::directory_iterator{},
+            "TIBI removes its decoded spool after parsing");
+        std::filesystem::remove_all(tibi_spool_directory, tibi_spool_error);
         const auto tibi_format = std::ranges::find_if(
             water_structure::FormatRegistry::formats(),
             [](const auto& value) { return value.id == water_structure::StructureId::TIBI; });
@@ -2571,6 +3004,76 @@ int main()
                 return water_structure::Result<void>::success();
             });
         check(visited.ok() && visited_chunks == 1, "default visit_chunks compatibility path");
+
+        RecordingChunkSink recording_sink;
+        water_structure::ChunkStream ordered_stream(
+            [](water_structure::ChunkSink& sink) -> water_structure::Result<void> {
+                for (std::int32_t index = 0; index < 64; ++index) {
+                    water_structure::StreamChunk chunk;
+                    chunk.position = { index, -index };
+                    auto pushed = sink.push(std::move(chunk));
+                    if (!pushed) return pushed;
+                }
+                return water_structure::Result<void>::success();
+            });
+        const auto chunk_stream_result = ordered_stream.pump(recording_sink, {
+            .worker_count = 2,
+            .max_in_flight_chunks = 1,
+            .soft_memory_budget_bytes = 64u * 1024u * 1024u
+        });
+        check(chunk_stream_result.ok() && recording_sink.finished &&
+            recording_sink.positions.size() == 64 &&
+            recording_sink.positions.front() == water_structure::ChunkPos{ 0, 0 } &&
+            recording_sink.positions.back() == water_structure::ChunkPos{ 63, -63 },
+            "ChunkStream preserves order with a one-chunk backpressure window");
+
+        std::vector<water_structure::ChunkPos> bounded_positions;
+        for (std::int32_t index = 0; index < 11; ++index) {
+            bounded_positions.push_back({ index, 0 });
+        }
+        RecordingChunkSink bounded_sink;
+        auto bounded_stream = water_structure::ChunkStream::from_structure(
+            structure, std::move(bounded_positions), 3);
+        const auto bounded_result = bounded_stream.pump(bounded_sink, {
+            .max_in_flight_chunks = 3,
+            .soft_memory_budget_bytes = 8u * 1024u * 1024u
+        });
+        check(bounded_result.ok() && bounded_sink.positions.size() == 11 &&
+            structure.visit_batch_peak <= 3 && structure.nbt_batch_peak <= 3,
+            "ChunkStream bounds source materialization and NBT batches");
+
+        FailingChunkSink failing_sink;
+        water_structure::ChunkStream failing_stream(
+            [](water_structure::ChunkSink& sink) -> water_structure::Result<void> {
+                for (std::int32_t index = 0; index < 16; ++index) {
+                    water_structure::StreamChunk chunk;
+                    chunk.position = { index, 0 };
+                    auto pushed = sink.push(std::move(chunk));
+                    if (!pushed) return pushed;
+                }
+                return water_structure::Result<void>::success();
+            });
+        const auto sink_failure = failing_stream.pump(failing_sink, {
+            .max_in_flight_chunks = 1,
+            .soft_memory_budget_bytes = 4u * 1024u * 1024u
+        });
+        check(!sink_failure.ok() &&
+            sink_failure.error().find("intentional sink failure") != std::string::npos &&
+            failing_sink.cancelled,
+            "ChunkStream propagates sink failure and cancels the pipeline");
+
+        RecordingChunkSink producer_error_sink;
+        water_structure::ChunkStream producer_error_stream(
+            [](water_structure::ChunkSink&) -> water_structure::Result<void> {
+                return water_structure::Result<void>::failure("intentional producer failure");
+            });
+        const auto producer_failure = producer_error_stream.pump(producer_error_sink, {
+            .max_in_flight_chunks = 1,
+            .soft_memory_budget_bytes = 4u * 1024u * 1024u
+        });
+        check(!producer_failure.ok() &&
+            producer_failure.error().find("intentional producer failure") != std::string::npos,
+            "ChunkStream propagates producer failure");
 
         // --- MCWorld palette streaming interface + MCFunction palette path ---
         {
@@ -2704,11 +3207,11 @@ int main()
                 world_structure, water_structure::StructureId::MCFunction,
                 palette_mcfunction, registry);
             check(written_palette.ok(), "MCFunction palette path succeeds");
-            ::_putenv_s("WATER_STRUCTURE_MCFUNCTION_NO_PALETTE", "1");
+            set_test_environment("WATER_STRUCTURE_MCFUNCTION_NO_PALETTE", "1");
             const auto written_generic = water_structure::FormatRegistry::write(
                 world_structure, water_structure::StructureId::MCFunction,
                 generic_mcfunction, registry);
-            ::_putenv_s("WATER_STRUCTURE_MCFUNCTION_NO_PALETTE", "");
+            set_test_environment("WATER_STRUCTURE_MCFUNCTION_NO_PALETTE", "");
             check(written_generic.ok(), "MCFunction generic path succeeds");
             {
                 std::ifstream palette_file(palette_mcfunction, std::ios::binary);
@@ -2742,6 +3245,139 @@ int main()
             std::filesystem::remove(palette_mcfunction);
             std::filesystem::remove(generic_mcfunction);
             std::filesystem::remove_all(palette_world_dir, cleanup_error);
+        }
+
+        {
+            const auto stats_archive = std::filesystem::temp_directory_path() /
+                "water_structure_cpp_deferred_stats.mcworld";
+            std::error_code cleanup_error;
+            std::filesystem::remove(stats_archive, cleanup_error);
+            auto stats_world = water_structure::BedrockWorldAdapter::open(stats_archive);
+            check(stats_world.ok(), "statistics archive opens");
+            std::size_t statistics_calls = 0;
+            water_structure::ConversionStats final_statistics;
+            water_structure::ConversionCallbacks callbacks;
+            callbacks.collect_statistics = true;
+            callbacks.statistics = [&](const water_structure::ConversionStats& value) {
+                ++statistics_calls;
+                final_statistics = value;
+            };
+            const auto stats_written = schematic.value()->write_to_world(
+                stats_world.value(), { 0, -4, 0 }, std::move(callbacks));
+            check(stats_written.ok() && statistics_calls == 0,
+                "world statistics wait for LevelDB close and archive packing");
+            const auto stats_closed = stats_world.value().close();
+            check(stats_closed.ok() && statistics_calls == 1 &&
+                final_statistics.success &&
+                final_statistics.target_format == water_structure::StructureId::MCWorld &&
+                final_statistics.completed_chunks == final_statistics.source_chunks,
+                "world statistics publish one final post-close snapshot");
+            std::filesystem::remove(stats_archive, cleanup_error);
+        }
+
+        {
+            const auto destructor_archive = std::filesystem::temp_directory_path() /
+                "water_structure_cpp_destructor_stats.mcworld";
+            std::error_code cleanup_error;
+            std::filesystem::remove(destructor_archive, cleanup_error);
+            std::size_t early_calls = 0;
+            std::size_t late_calls = 0;
+            {
+                auto destructor_world = water_structure::BedrockWorldAdapter::open(
+                    destructor_archive);
+                check(destructor_world.ok(), "destructor statistics archive opens");
+                auto callback_lifetime = std::make_shared<int>(1);
+                std::weak_ptr<int> weak_lifetime = callback_lifetime;
+                water_structure::ConversionCallbacks callbacks;
+                callbacks.collect_statistics = true;
+                callbacks.statistics = [weak_lifetime, &early_calls, &late_calls](
+                    const water_structure::ConversionStats&) {
+                    if (weak_lifetime.expired()) ++late_calls;
+                    else ++early_calls;
+                };
+                const auto written = schematic.value()->write_to_world(
+                    destructor_world.value(), { 0, -4, 0 }, std::move(callbacks));
+                check(written.ok() && early_calls == 0,
+                    "destructor statistics remain deferred before scope exit");
+                // callbacks and callback_lifetime are destroyed before the
+                // adapter. Its destructor must close resources without
+                // invoking deferred user code with expired captures.
+            }
+            check(early_calls == 0 && late_calls == 0,
+                "world destructor does not invoke deferred statistics callbacks");
+            std::filesystem::remove(destructor_archive, cleanup_error);
+        }
+
+        {
+            // A failed stream is an aborted archive transaction: existing
+            // bytes remain unchanged, a new target is not created, and the
+            // destructor never commits the partial LevelDB contents.
+            const auto transaction_bytes = [](const std::filesystem::path& path) {
+                std::ifstream input(path, std::ios::binary);
+                return std::vector<std::uint8_t>{
+                    std::istreambuf_iterator<char>(input),
+                    std::istreambuf_iterator<char>() };
+            };
+            const auto transaction_archive = std::filesystem::temp_directory_path() /
+                "water_structure_cpp_failed_transaction.mcworld";
+            const auto new_transaction_archive = std::filesystem::temp_directory_path() /
+                "water_structure_cpp_failed_new_transaction.mcworld";
+            std::error_code cleanup_error;
+            std::filesystem::remove(transaction_archive, cleanup_error);
+            cleanup_error.clear();
+            std::filesystem::remove(new_transaction_archive, cleanup_error);
+            {
+                auto baseline = water_structure::BedrockWorldAdapter::open(transaction_archive);
+                check(baseline.ok(), "failed transaction baseline opens");
+                check(baseline.value().close().ok(), "failed transaction baseline closes");
+            }
+            const auto original_archive = transaction_bytes(transaction_archive);
+            TestStructure failing_structure;
+            failing_structure.fail_after_first_chunk = true;
+            const auto partial_chunks = failing_structure.get_chunks(
+                std::array{ water_structure::ChunkPos{ 0, 0 } });
+            check(partial_chunks.ok(), "failed transaction partial chunk builds");
+            {
+                auto transaction = water_structure::BedrockWorldAdapter::open(
+                    transaction_archive);
+                check(transaction.ok(), "existing transaction archive opens");
+                check(transaction.value().save_chunk(
+                    { 0, 0 }, partial_chunks.value().at({ 0, 0 })).ok(),
+                    "existing transaction writes partial chunk");
+                const auto failed = failing_structure.write_to_world(
+                    transaction.value(), { 0, -4, 0 }, {});
+                check(!failed.ok(), "existing transaction reports stream failure");
+            }
+            check(transaction_bytes(transaction_archive) == original_archive,
+                "failed transaction preserves existing archive bytes");
+            {
+                auto transaction = water_structure::BedrockWorldAdapter::open(
+                    new_transaction_archive);
+                check(transaction.ok(), "new transaction archive opens");
+                check(transaction.value().save_chunk(
+                    { 0, 0 }, partial_chunks.value().at({ 0, 0 })).ok(),
+                    "new transaction writes partial chunk");
+                const auto failed = failing_structure.write_to_world(
+                    transaction.value(), { 0, -4, 0 }, {});
+                check(!failed.ok(), "new transaction reports stream failure");
+            }
+            check(!std::filesystem::exists(new_transaction_archive),
+                "failed transaction does not create a new archive");
+            const auto temporary_prefix = transaction_archive.filename().string() +
+                ".water_structure_tmp-";
+            bool leaked_temporary_archive = false;
+            for (const auto& entry : std::filesystem::directory_iterator(
+                    transaction_archive.parent_path())) {
+                if (entry.path().filename().string().starts_with(temporary_prefix)) {
+                    leaked_temporary_archive = true;
+                    break;
+                }
+            }
+            check(!leaked_temporary_archive,
+                "failed transaction removes temporary archive files");
+            std::filesystem::remove(transaction_archive, cleanup_error);
+            cleanup_error.clear();
+            std::filesystem::remove(new_transaction_archive, cleanup_error);
         }
 
         const auto converted = structure.write_to_world(world, { 3, 2, -5 }, {});

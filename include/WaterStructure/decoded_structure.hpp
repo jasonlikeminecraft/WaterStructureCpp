@@ -19,6 +19,10 @@ public:
     void clear();
     void set_size(Size size) noexcept { mOriginalSize = size; mSize = size; }
     void set_offset(BlockPos offset) noexcept;
+    // Some legacy readers (notably GangBanV3) preserve records just outside
+    // the declared header bounds.  Keep the declared Size unchanged while
+    // allowing those sparse records to be exposed to chunk consumers.
+    void set_include_out_of_bounds(bool enabled) noexcept { mIncludeOutOfBounds = enabled; }
     Size size() const noexcept { return mSize; }
     Size original_size() const noexcept { return mOriginalSize; }
     BlockPos offset() const noexcept { return mOffset; }
@@ -39,8 +43,10 @@ private:
     Size mSize{};
     BlockPos mOffset{};
     std::map<BlockPos, std::uint32_t, std::less<>> mBlocks;
+    std::map<BlockPos, std::uint32_t, std::less<>> mOutOfBoundsBlocks;
     std::map<BlockPos, NbtPayload, std::less<>> mEntities;
     std::size_t mNonAirBlocks = 0;
+    bool mIncludeOutOfBounds = false;
 };
 
 } // namespace water_structure

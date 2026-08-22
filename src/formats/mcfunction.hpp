@@ -4,6 +4,8 @@
 #include <WaterStructure/structure.hpp>
 
 #include <filesystem>
+#include <atomic>
+#include <mutex>
 #include <optional>
 #include <vector>
 
@@ -56,7 +58,8 @@ private:
     mutable std::int32_t mIndexMinZ = 0;
     mutable std::int32_t mIndexWidth = 0;
     mutable std::int32_t mIndexLength = 0;
-    mutable bool mCommandIndexReady = false;
+    mutable std::atomic_bool mCommandIndexReady = false;
+    mutable std::mutex mCommandIndexMutex;
     mutable std::optional<std::size_t> mNonAirBlocks;
 };
 

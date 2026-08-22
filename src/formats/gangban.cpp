@@ -18,10 +18,13 @@
 #include <limits>
 #include <map>
 #include <optional>
+#include <set>
 #include <sstream>
+#include <streambuf>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <functional>
 #include <utility>
 #include <vector>
 
@@ -33,11 +36,6 @@ constexpr std::size_t kMaxDecodedBytes = 2ull * 1024 * 1024 * 1024;
 
 struct PendingBlock {
     BlockPos world{};
-    std::uint32_t runtime_id = 0;
-    std::optional<NbtPayload> nbt;
-};
-
-struct AccumulatedBlock {
     std::uint32_t runtime_id = 0;
     std::optional<NbtPayload> nbt;
 };
@@ -82,59 +80,278 @@ struct Bounds {
     }
 };
 
-std::vector<std::uint8_t> inflate_zlib_file(const std::filesystem::path& path)
-{
-    std::ifstream input(path, std::ios::binary);
-    if (!input) throw std::runtime_error("cannot open compressed GangBan file: " + path.string());
+using Json = nlohmann::json;
 
-    z_stream stream{};
-    if (inflateInit(&stream) != Z_OK) throw std::runtime_error("cannot initialize zlib decoder");
-    struct Guard {
-        z_stream* stream;
-        ~Guard() { inflateEnd(stream); }
-    } guard{ &stream };
+// V7 used to inflate the complete JSON payload into a vector before parsing it.
+// This stream buffer keeps both compressed and decoded working sets fixed at
+// 64 KiB while retaining the old compressed-offset diagnostics and 2 GiB
+// decoded-stream limit.
+class ZlibInflateBuffer final : public std::streambuf {
+public:
+    explicit ZlibInflateBuffer(const std::filesystem::path& path)
+        : mInput(path, std::ios::binary)
+    {
+        if (!mInput) {
+            throw std::runtime_error("cannot open compressed GangBan file: " + path.string());
+        }
+        if (inflateInit(&mStream) != Z_OK) {
+            throw std::runtime_error("cannot initialize zlib decoder");
+        }
+        mInitialized = true;
+        setg(mDecoded.data(), mDecoded.data(), mDecoded.data());
+    }
 
-    std::array<std::uint8_t, kStreamChunk> compressed{};
-    std::array<std::uint8_t, kStreamChunk> decoded{};
-    std::vector<std::uint8_t> output;
-    int status = Z_OK;
-    while (status != Z_STREAM_END) {
-        if (stream.avail_in == 0) {
-            input.read(reinterpret_cast<char*>(compressed.data()),
-                static_cast<std::streamsize>(compressed.size()));
-            const auto count = input.gcount();
-            if (count <= 0) {
-                throw std::runtime_error(
-                    "zlib stream truncated at compressed offset " + std::to_string(stream.total_in));
+    ~ZlibInflateBuffer() override
+    {
+        if (mInitialized) inflateEnd(&mStream);
+    }
+
+    const std::string& error() const noexcept { return mError; }
+
+protected:
+    int_type underflow() override
+    {
+        if (gptr() < egptr()) return traits_type::to_int_type(*gptr());
+        if (mFinished || !mError.empty()) return traits_type::eof();
+
+        while (true) {
+            if (mStream.avail_in == 0) {
+                mInput.read(reinterpret_cast<char*>(mCompressed.data()),
+                    static_cast<std::streamsize>(mCompressed.size()));
+                const auto count = mInput.gcount();
+                if (count <= 0) {
+                    mError = "zlib stream truncated at compressed offset " +
+                        std::to_string(mStream.total_in);
+                    return traits_type::eof();
+                }
+                mStream.next_in = mCompressed.data();
+                mStream.avail_in = static_cast<uInt>(count);
             }
-            stream.next_in = compressed.data();
-            stream.avail_in = static_cast<uInt>(count);
-        }
-        stream.next_out = decoded.data();
-        stream.avail_out = static_cast<uInt>(decoded.size());
-        status = inflate(&stream, Z_NO_FLUSH);
-        if (status != Z_OK && status != Z_STREAM_END) {
-            throw std::runtime_error(
-                "zlib decode failed at compressed offset " + std::to_string(stream.total_in));
-        }
-        const auto produced = decoded.size() - stream.avail_out;
-        if (output.size() > kMaxDecodedBytes - produced) {
-            throw std::runtime_error("decoded GangBan payload exceeds 2 GiB");
-        }
-        output.insert(output.end(), decoded.begin(), decoded.begin() + static_cast<std::ptrdiff_t>(produced));
-    }
-    return output;
-}
 
-nlohmann::json read_document(const std::filesystem::path& path, bool compressed)
-{
-    if (compressed) {
-        const auto bytes = inflate_zlib_file(path);
-        return nlohmann::json::parse(bytes.begin(), bytes.end());
+            mStream.next_out = reinterpret_cast<Bytef*>(mDecoded.data());
+            mStream.avail_out = static_cast<uInt>(mDecoded.size());
+            const auto status = inflate(&mStream, Z_NO_FLUSH);
+            if (status != Z_OK && status != Z_STREAM_END) {
+                mError = "zlib decode failed at compressed offset " +
+                    std::to_string(mStream.total_in);
+                return traits_type::eof();
+            }
+            const auto produced = mDecoded.size() - mStream.avail_out;
+            if (mDecodedBytes > kMaxDecodedBytes - produced) {
+                mError = "decoded GangBan payload exceeds 2 GiB";
+                return traits_type::eof();
+            }
+            mDecodedBytes += produced;
+            if (status == Z_STREAM_END) mFinished = true;
+            if (produced != 0) {
+                setg(mDecoded.data(), mDecoded.data(),
+                    mDecoded.data() + static_cast<std::ptrdiff_t>(produced));
+                return traits_type::to_int_type(*gptr());
+            }
+            if (mFinished) return traits_type::eof();
+        }
     }
+
+private:
+    std::ifstream mInput;
+    z_stream mStream{};
+    bool mInitialized = false;
+    bool mFinished = false;
+    std::size_t mDecodedBytes = 0;
+    std::string mError;
+    std::array<Bytef, kStreamChunk> mCompressed{};
+    std::array<char, kStreamChunk> mDecoded{};
+};
+
+class ZlibInflateInput final {
+public:
+    explicit ZlibInflateInput(const std::filesystem::path& path)
+        : mBuffer(path), mStream(&mBuffer) {}
+
+    std::istream& stream() noexcept { return mStream; }
+
+    void finish()
+    {
+        // A SAX consumer may reject JSON before reaching the compressed tail.
+        // Draining preserves the former inflate-before-parse error precedence.
+        std::array<char, 4096> scratch{};
+        while (mStream.read(scratch.data(), static_cast<std::streamsize>(scratch.size())) ||
+            mStream.gcount() != 0) {
+        }
+        if (!mBuffer.error().empty()) throw std::runtime_error(mBuffer.error());
+    }
+
+private:
+    ZlibInflateBuffer mBuffer;
+    std::istream mStream;
+};
+
+// Builds at most one direct child of the root array. This is deliberately not
+// a whole-document DOM: completed entries are moved to the caller immediately.
+class RootArrayEntrySax final : public nlohmann::json_sax<Json> {
+public:
+    using Callback = std::function<void(std::size_t, Json&&)>;
+
+    explicit RootArrayEntrySax(Callback callback) : mCallback(std::move(callback)) {}
+
+    bool null() override { return scalar(nullptr); }
+    bool boolean(bool value) override { return scalar(value); }
+    bool number_integer(number_integer_t value) override { return scalar(value); }
+    bool number_unsigned(number_unsigned_t value) override { return scalar(value); }
+    bool number_float(number_float_t value, const string_t&) override { return scalar(value); }
+    bool string(string_t& value) override { return scalar(std::move(value)); }
+    bool binary(binary_t& value) override { return scalar(Json::binary(std::move(value))); }
+
+    bool start_object(std::size_t) override
+    {
+        if (!mRootStarted) return fail("root is not an array");
+        if (mRootEnded) return fail("JSON value follows the root array");
+        mFrames.push_back({ Json::object(), {}, false });
+        return true;
+    }
+
+    bool key(string_t& value) override
+    {
+        if (mFrames.empty() || !mFrames.back().value.is_object()) {
+            return fail("object key appears outside an object");
+        }
+        mFrames.back().key = std::move(value);
+        mFrames.back().has_key = true;
+        return true;
+    }
+
+    bool end_object() override
+    {
+        if (mFrames.empty() || !mFrames.back().value.is_object()) {
+            return fail("mismatched object terminator");
+        }
+        return complete_container();
+    }
+
+    bool start_array(std::size_t) override
+    {
+        if (!mRootStarted) {
+            mRootStarted = true;
+            return true;
+        }
+        if (mRootEnded) return fail("JSON value follows the root array");
+        mFrames.push_back({ Json::array(), {}, false });
+        return true;
+    }
+
+    bool end_array() override
+    {
+        if (mFrames.empty()) {
+            if (!mRootStarted || mRootEnded) return fail("mismatched array terminator");
+            mRootEnded = true;
+            return true;
+        }
+        if (!mFrames.back().value.is_array()) return fail("mismatched array terminator");
+        return complete_container();
+    }
+
+    bool parse_error(
+        std::size_t position, const std::string&, const nlohmann::detail::exception& error) override
+    {
+        mError = "JSON parse error at byte " + std::to_string(position) + ": " + error.what();
+        return false;
+    }
+
+    const std::string& error() const noexcept { return mError; }
+
+    void finish() const
+    {
+        if (!mError.empty()) throw std::runtime_error(mError);
+        if (!mRootStarted || !mRootEnded || !mFrames.empty()) {
+            throw std::runtime_error("root array is incomplete");
+        }
+    }
+
+private:
+    struct Frame {
+        Json value;
+        std::string key;
+        bool has_key = false;
+    };
+
+    template <typename Value>
+    bool scalar(Value&& value)
+    {
+        if (!mRootStarted) return fail("root is not an array");
+        if (mRootEnded) return fail("JSON value follows the root array");
+        return append(Json(std::forward<Value>(value)));
+    }
+
+    bool complete_container()
+    {
+        auto value = std::move(mFrames.back().value);
+        mFrames.pop_back();
+        return append(std::move(value));
+    }
+
+    bool append(Json value)
+    {
+        if (mFrames.empty()) {
+            mCallback(mIndex++, std::move(value));
+            return true;
+        }
+        auto& parent = mFrames.back();
+        if (parent.value.is_array()) {
+            parent.value.push_back(std::move(value));
+            return true;
+        }
+        if (!parent.value.is_object() || !parent.has_key) {
+            return fail("object value is missing its key");
+        }
+        parent.value[std::move(parent.key)] = std::move(value);
+        parent.key.clear();
+        parent.has_key = false;
+        return true;
+    }
+
+    bool fail(std::string message)
+    {
+        if (mError.empty()) mError = std::move(message);
+        return false;
+    }
+
+    Callback mCallback;
+    std::vector<Frame> mFrames;
+    std::size_t mIndex = 0;
+    bool mRootStarted = false;
+    bool mRootEnded = false;
+    std::string mError;
+};
+
+template <typename Callback>
+void for_each_root_entry(
+    const std::filesystem::path& path, bool compressed, Callback&& callback)
+{
+    auto parse = [&](std::istream& input) {
+        RootArrayEntrySax sax(std::forward<Callback>(callback));
+        const auto parsed = Json::sax_parse(input, &sax);
+        if (!parsed) {
+            throw std::runtime_error(
+                sax.error().empty() ? "cannot parse GangBan root array" : sax.error());
+        }
+        sax.finish();
+    };
+
+    if (compressed) {
+        ZlibInflateInput input(path);
+        try {
+            parse(input.stream());
+        } catch (...) {
+            input.finish();
+            throw;
+        }
+        input.finish();
+        return;
+    }
+
     std::ifstream input(path, std::ios::binary);
     if (!input) throw std::runtime_error("cannot open GangBan file: " + path.string());
-    return nlohmann::json::parse(input);
+    parse(input);
 }
 
 std::int64_t json_integer(const nlohmann::json& value, std::string_view field)
@@ -439,29 +656,35 @@ Result<void> GangBanStructure::read(const std::filesystem::path& path)
     mNonAirBlocks = 0;
     try {
         const auto compressed = mVersion == StructureId::GangBanV7;
-        const auto document = read_document(path, compressed);
-        if (!document.is_array()) throw std::runtime_error("root is not an array");
 
         if (mVersion == StructureId::GangBanV1 || mVersion == StructureId::GangBanV2) {
+            std::size_t document_size = 0;
+            std::optional<Json> penultimate;
+            std::optional<Json> last;
+            for_each_root_entry(path, compressed, [&](std::size_t index, Json&& entry) {
+                document_size = index + 1;
+                penultimate = std::move(last);
+                last = std::move(entry);
+            });
+
             const auto has_range = mVersion == StructureId::GangBanV1 ||
-                (document.size() >= 2 && document[document.size() - 2].is_object() &&
-                    document[document.size() - 2].contains("start") &&
-                    document[document.size() - 2].contains("end"));
-            if (document.size() < (has_range ? 2u : 1u)) throw std::runtime_error("root array is too short");
-            const auto& palette_object = document.back();
+                (document_size >= 2 && penultimate && penultimate->is_object() &&
+                    penultimate->contains("start") && penultimate->contains("end"));
+            if (document_size < (has_range ? 2u : 1u) || !last) {
+                throw std::runtime_error("root array is too short");
+            }
+            const auto& palette_object = *last;
             if (!palette_object.is_object() || !palette_object.contains("list")) {
                 throw std::runtime_error("palette object is missing list");
             }
             const auto palette = string_palette(palette_object["list"], "palette.list");
-            const auto block_count = document.size() - (has_range ? 2 : 1);
-            std::vector<PendingBlock> blocks;
-            blocks.reserve(block_count);
-            Bounds inferred;
+            const auto block_count = document_size - (has_range ? 2 : 1);
 
             BlockPos origin{};
             Size declared_size{};
             if (has_range) {
-                const auto& range = document[document.size() - 2];
+                if (!penultimate) throw std::runtime_error("range object is missing start/end");
+                const auto& range = *penultimate;
                 if (!range.is_object() || !range.contains("start") || !range.contains("end")) {
                     throw std::runtime_error("range object is missing start/end");
                 }
@@ -474,9 +697,13 @@ Result<void> GangBanStructure::read(const std::filesystem::path& path)
                 declared_size = declared.size();
             }
 
-            for (std::size_t index = 0; index < block_count; ++index) {
+            // Release the JSON form of the tail before the block passes. The
+            // string palette is the only tail data required from this point.
+            penultimate.reset();
+            last.reset();
+
+            auto decode_block = [&](const Json& entry, std::size_t index) -> PendingBlock {
                 try {
-                    const auto& entry = document[index];
                     if (!entry.is_object() || !entry.contains("id") || !entry.contains("p")) {
                         throw std::runtime_error("entry is missing id/p");
                     }
@@ -484,74 +711,238 @@ Result<void> GangBanStructure::read(const std::filesystem::path& path)
                     validate_palette_index(palette_index, palette.size(), index);
                     const auto aux = entry.contains("aux") ? json_u16(entry["aux"], "aux") : 0;
                     const auto world = position3(entry["p"], "p");
-                    inferred.add(world);
-                    PendingBlock block{ world, runtime_id(palette[palette_index], aux), std::nullopt };
+                    PendingBlock block{
+                        world,
+                        runtime_id(palette[static_cast<std::size_t>(palette_index)], aux),
+                        std::nullopt
+                    };
                     if (entry.contains("cmds") && !entry["cmds"].is_null()) {
                         block.nbt = command_nbt_v1(entry["cmds"]);
                     }
-                    blocks.push_back(std::move(block));
+                    return block;
                 } catch (const std::exception& error) {
                     throw std::runtime_error("block index " + std::to_string(index) + ": " + error.what());
                 }
-            }
+            };
+
+            // The validation pass preserves the old behavior of parsing every
+            // block before checking whether any block lies outside a declared
+            // range. It also infers V2 bounds without retaining PendingBlock[];
+            // a final pass materializes directly into the sparse store.
+            Bounds inferred;
+            for_each_root_entry(path, compressed, [&](std::size_t index, Json&& entry) {
+                if (index >= block_count) return;
+                const auto block = decode_block(entry, index);
+                inferred.add(block.world);
+            });
+
             if (!has_range) {
                 origin = inferred.minimum;
                 declared_size = inferred.size();
             }
             mStore.set_size(declared_size);
-            for (std::size_t index = 0; index < blocks.size(); ++index) {
-                const auto local = subtract(blocks[index].world, origin);
+            for_each_root_entry(path, compressed, [&](std::size_t index, Json&& entry) {
+                if (index >= block_count) return;
+                auto block = decode_block(entry, index);
+                const auto local = subtract(block.world, origin);
                 if (has_range && (local.x < 0 || local.y < 0 || local.z < 0 ||
                     local.x >= declared_size.width || local.y >= declared_size.height ||
                     local.z >= declared_size.length)) {
                     throw std::runtime_error("block index " + std::to_string(index) + " is outside declared range");
                 }
-                mStore.put(local, blocks[index].runtime_id);
-                if (blocks[index].nbt) mStore.put_entity(local, std::move(*blocks[index].nbt));
-                if (blocks[index].runtime_id != mRegistry.air_runtime_id()) ++mNonAirBlocks;
-            }
+                mStore.put(local, block.runtime_id);
+                if (block.nbt) mStore.put_entity(local, std::move(*block.nbt));
+            });
+            mNonAirBlocks = mStore.count_non_air();
             return Result<void>::success();
         }
 
         if (mVersion == StructureId::GangBanV3 || mVersion == StructureId::GangBanV4) {
-            if (document.size() < 3 || !document[0].is_object()) {
+            struct ChunkMetadata {
+                std::int32_t x = 0;
+                std::int32_t z = 0;
+                std::size_t data_occurrences = 0;
+            };
+
+            std::optional<Json> header;
+            std::optional<Json> raw_palette;
+            std::vector<ChunkMetadata> chunk_metadata;
+
+            auto parse_callback_pass = [&](auto&& callback) {
+                std::ifstream input(path, std::ios::binary);
+                if (!input) throw std::runtime_error("cannot open GangBan file: " + path.string());
+                const auto discarded = nlohmann::json::parse(
+                    input, std::forward<decltype(callback)>(callback));
+                (void)discarded;
+            };
+
+            bool root_is_array = false;
+            std::size_t root_index = 0;
+            bool inside_chunk = false;
+            bool inside_data = false;
+            std::string chunk_key;
+            Json grids_raw;
+            bool has_grids = false;
+            std::size_t data_occurrences = 0;
+            bool final_data_is_array = false;
+            const auto metadata_callback = [&](int depth, Json::parse_event_t event,
+                                               Json& parsed) -> bool {
+                if (depth == 0 && event == Json::parse_event_t::array_start) {
+                    root_is_array = true;
+                    return true;
+                }
+                if (depth == 0 && (event == Json::parse_event_t::object_start ||
+                        event == Json::parse_event_t::value)) {
+                    return false;
+                }
+                if (depth == 1 && event == Json::parse_event_t::object_start) {
+                    if (root_index < 2) return true;
+                    inside_chunk = true;
+                    inside_data = false;
+                    chunk_key.clear();
+                    grids_raw = {};
+                    has_grids = false;
+                    data_occurrences = 0;
+                    final_data_is_array = false;
+                    return true;
+                }
+                if (depth == 1 && event == Json::parse_event_t::array_start) {
+                    if (root_index < 2) return true;
+                    throw std::runtime_error(
+                        "chunk index " + std::to_string(root_index - 2) + " is invalid");
+                }
+                if (depth == 1 && event == Json::parse_event_t::value) {
+                    if (root_index == 0) header = parsed;
+                    else if (root_index == 1) raw_palette = parsed;
+                    else {
+                        throw std::runtime_error(
+                            "chunk index " + std::to_string(root_index - 2) + " is invalid");
+                    }
+                    ++root_index;
+                    return false;
+                }
+                if (inside_chunk && depth == 2 && event == Json::parse_event_t::key) {
+                    chunk_key = parsed.get<std::string>();
+                    return true;
+                }
+                if (inside_data && depth == 3 &&
+                    (event == Json::parse_event_t::value ||
+                        event == Json::parse_event_t::object_start ||
+                        event == Json::parse_event_t::array_start ||
+                        event == Json::parse_event_t::object_end ||
+                        event == Json::parse_event_t::array_end)) {
+                    return false;
+                }
+                if (inside_data && depth == 2 && event == Json::parse_event_t::array_end) {
+                    inside_data = false;
+                    return false;
+                }
+                if (inside_chunk && depth == 2 &&
+                    (event == Json::parse_event_t::value ||
+                        event == Json::parse_event_t::object_start ||
+                        event == Json::parse_event_t::array_start)) {
+                    if (chunk_key == "grids") {
+                        has_grids = true;
+                        if (event == Json::parse_event_t::object_start) return true;
+                        grids_raw = event == Json::parse_event_t::array_start
+                            ? Json::array() : parsed;
+                        return false;
+                    }
+                    if (chunk_key == "data") {
+                        if (data_occurrences == std::numeric_limits<std::size_t>::max()) {
+                            throw std::runtime_error("data occurrence count overflow");
+                        }
+                        ++data_occurrences;
+                        final_data_is_array = event == Json::parse_event_t::array_start;
+                        inside_data = final_data_is_array;
+                        return inside_data;
+                    }
+                    return false;
+                }
+                if (inside_chunk && depth == 2 && event == Json::parse_event_t::object_end &&
+                    chunk_key == "grids") {
+                    grids_raw = parsed;
+                    has_grids = true;
+                    return false;
+                }
+                if (inside_chunk && depth == 2 &&
+                    (event == Json::parse_event_t::object_end ||
+                        event == Json::parse_event_t::array_end)) {
+                    return false;
+                }
+                if (inside_chunk && depth == 1 && event == Json::parse_event_t::object_end) {
+                    const auto chunk_index = root_index - 2;
+                    if (!has_grids || !grids_raw.is_object() ||
+                        data_occurrences == 0 || !final_data_is_array) {
+                        throw std::runtime_error(
+                            "chunk index " + std::to_string(chunk_index) + " is invalid");
+                    }
+                    chunk_metadata.push_back({
+                        json_i32(grids_raw.at("x"), "grids.x"),
+                        json_i32(grids_raw.at("z"), "grids.z"),
+                        data_occurrences
+                    });
+                    inside_chunk = false;
+                    ++root_index;
+                    return false;
+                }
+                if (depth == 1 && (event == Json::parse_event_t::object_end ||
+                        event == Json::parse_event_t::array_end)) {
+                    if (root_index == 0) header = parsed;
+                    else if (root_index == 1) raw_palette = parsed;
+                    ++root_index;
+                    return false;
+                }
+                return true;
+            };
+            parse_callback_pass(metadata_callback);
+            if (!root_is_array || root_index < 3 || chunk_metadata.empty() ||
+                !header || !header->is_object() || !raw_palette) {
                 throw std::runtime_error("header/chunk array is incomplete");
             }
+
             std::vector<std::string> palette;
             BlockPos declared_origin{};
             Size declared_size{};
             if (mVersion == StructureId::GangBanV3) {
-                if (!document[1].is_string()) throw std::runtime_error("V3 palette is not a string");
-                palette = parse_v3_palette(document[1].get<std::string>());
+                if (!raw_palette->is_string()) throw std::runtime_error("V3 palette is not a string");
+                palette = parse_v3_palette(raw_palette->get<std::string>());
                 declared_origin = {
-                    json_i32(document[0].at("x"), "header.x"),
-                    json_i32(document[0].at("y"), "header.y"),
-                    json_i32(document[0].at("z"), "header.z")
+                    json_i32(header->at("x"), "header.x"),
+                    json_i32(header->at("y"), "header.y"),
+                    json_i32(header->at("z"), "header.z")
                 };
                 declared_size = {
-                    json_i32(document[0].at("xcha"), "header.xcha"),
-                    json_i32(document[0].at("ycha"), "header.ycha"),
-                    json_i32(document[0].at("zcha"), "header.zcha")
+                    json_i32(header->at("xcha"), "header.xcha"),
+                    json_i32(header->at("ycha"), "header.ycha"),
+                    json_i32(header->at("zcha"), "header.zcha")
                 };
                 if (declared_size.width <= 0 || declared_size.height <= 0 || declared_size.length <= 0) {
                     throw std::runtime_error("V3 dimensions must be positive");
                 }
             } else {
-                palette = string_palette(document[1], "V4 palette");
+                palette = string_palette(*raw_palette, "V4 palette");
             }
+            header.reset();
+            raw_palette.reset();
 
-            std::map<BlockPos, AccumulatedBlock, std::less<>> accumulated;
             Bounds bounds;
-            std::size_t block_index = 0;
-            for (std::size_t chunk_index = 2; chunk_index < document.size(); ++chunk_index) {
-                const auto& chunk = document[chunk_index];
-                if (!chunk.is_object() || !chunk.contains("grids") || !chunk.contains("data") ||
-                    !chunk["grids"].is_object() || !chunk["data"].is_array()) {
-                    throw std::runtime_error("chunk index " + std::to_string(chunk_index - 2) + " is invalid");
-                }
-                const auto chunk_x = json_i32(chunk["grids"].at("x"), "grids.x");
-                const auto chunk_z = json_i32(chunk["grids"].at("z"), "grids.z");
-                for (const auto& entry : chunk["data"]) {
+            std::set<BlockPos, std::less<>> first_entity_positions;
+            auto stream_entries = [&](const bool materialize) -> std::size_t {
+                bool pass_root_is_array = false;
+                std::size_t pass_root_index = 0;
+                std::size_t pass_chunk_index = 0;
+                bool pass_inside_chunk = false;
+                bool pass_inside_data = false;
+                bool active_data = false;
+                std::string pass_chunk_key;
+                std::size_t pass_data_occurrence = 0;
+                std::size_t block_index = 0;
+
+                auto consume_entry = [&](const Json& entry) {
+                    if (pass_chunk_index >= chunk_metadata.size()) {
+                        throw std::runtime_error("GangBan chunk stream changed while parsing");
+                    }
                     try {
                         if (!entry.is_array() || entry.size() < 5) throw std::runtime_error("entry has fewer than five fields");
                         const auto palette_index = json_i32(entry[0], "palette index");
@@ -560,158 +951,299 @@ Result<void> GangBanStructure::read(const std::filesystem::path& path)
                         const auto relative_x = json_i32(entry[2], "local x");
                         const auto world_y = json_i32(entry[3], "y");
                         const auto relative_z = json_i32(entry[4], "local z");
-                        const auto x64 = static_cast<std::int64_t>(chunk_x) + relative_x;
-                        const auto z64 = static_cast<std::int64_t>(chunk_z) + relative_z;
+                        const auto x64 = static_cast<std::int64_t>(
+                            chunk_metadata[pass_chunk_index].x) + relative_x;
+                        const auto z64 = static_cast<std::int64_t>(
+                            chunk_metadata[pass_chunk_index].z) + relative_z;
                         if (x64 < std::numeric_limits<std::int32_t>::min() || x64 > std::numeric_limits<std::int32_t>::max() ||
                             z64 < std::numeric_limits<std::int32_t>::min() || z64 > std::numeric_limits<std::int32_t>::max()) {
                             throw std::runtime_error("world coordinate exceeds int32");
                         }
                         const BlockPos world{ static_cast<std::int32_t>(x64), world_y, static_cast<std::int32_t>(z64) };
-                        const auto current_nbt = snbt_payload(entry);
-                        const auto runtime = runtime_id(palette[palette_index], aux);
-                        if (mVersion == StructureId::GangBanV3) {
-                            const auto local = subtract(world, declared_origin);
-                            auto [found, inserted] = accumulated.try_emplace(local, AccumulatedBlock{ runtime, current_nbt });
-                            if (inserted) {
-                                if (runtime != mRegistry.air_runtime_id()) ++mNonAirBlocks;
-                            } else {
-                                found->second.runtime_id = runtime;
-                                if (!found->second.nbt && current_nbt) found->second.nbt = current_nbt;
-                            }
-                        } else {
+                        if (!materialize) {
                             bounds.add(world);
-                            auto [found, inserted] = accumulated.try_emplace(world, AccumulatedBlock{ runtime, current_nbt });
-                            if (!inserted) {
-                                found->second.runtime_id = runtime;
-                                if (current_nbt) found->second.nbt = current_nbt;
+                            ++block_index;
+                            return;
+                        }
+                        auto current_nbt = snbt_payload(entry);
+                        const auto runtime = runtime_id(
+                            palette[static_cast<std::size_t>(palette_index)], aux);
+                        const auto local = mVersion == StructureId::GangBanV3
+                            ? subtract(world, declared_origin)
+                            : subtract(world, bounds.minimum);
+                        mStore.put(local, runtime);
+                        if (current_nbt) {
+                            if (mVersion == StructureId::GangBanV4 ||
+                                first_entity_positions.insert(local).second) {
+                                mStore.put_entity(local, std::move(*current_nbt));
                             }
                         }
                     } catch (const std::exception& error) {
                         throw std::runtime_error("block index " + std::to_string(block_index) + ": " + error.what());
                     }
                     ++block_index;
+                };
+
+                const auto callback = [&](int depth, Json::parse_event_t event,
+                                          Json& parsed) -> bool {
+                    if (depth == 0 && event == Json::parse_event_t::array_start) {
+                        pass_root_is_array = true;
+                        return true;
+                    }
+                    if (pass_root_index < 2 && depth == 1 &&
+                        (event == Json::parse_event_t::value ||
+                            event == Json::parse_event_t::object_end ||
+                            event == Json::parse_event_t::array_end)) {
+                        ++pass_root_index;
+                        return false;
+                    }
+                    if (pass_root_index < 2 && depth == 1 &&
+                        (event == Json::parse_event_t::object_start ||
+                            event == Json::parse_event_t::array_start)) {
+                        // Keep the root container open so its depth-1 end
+                        // event advances past the header/palette entry. If
+                        // this is skipped wholesale, nlohmann-json does not
+                        // emit that end event and the first chunk is never
+                        // visited on the second streaming pass.
+                        return true;
+                    }
+                    if (pass_root_index < 2 && depth > 1) return false;
+                    if (depth == 1 && event == Json::parse_event_t::object_start) {
+                        if (pass_chunk_index >= chunk_metadata.size()) {
+                            throw std::runtime_error("GangBan chunk stream changed while parsing");
+                        }
+                        pass_inside_chunk = true;
+                        pass_inside_data = false;
+                        active_data = false;
+                        pass_chunk_key.clear();
+                        pass_data_occurrence = 0;
+                        return true;
+                    }
+                    if (pass_inside_chunk && depth == 2 && event == Json::parse_event_t::key) {
+                        pass_chunk_key = parsed.get<std::string>();
+                        return true;
+                    }
+                    if (pass_inside_chunk && depth == 2 && pass_chunk_key == "data" &&
+                        (event == Json::parse_event_t::value ||
+                            event == Json::parse_event_t::object_start ||
+                            event == Json::parse_event_t::array_start)) {
+                        ++pass_data_occurrence;
+                        pass_inside_data = event == Json::parse_event_t::array_start;
+                        active_data = pass_inside_data && pass_data_occurrence ==
+                            chunk_metadata[pass_chunk_index].data_occurrences;
+                        return pass_inside_data;
+                    }
+                    if (pass_inside_data && depth == 3) {
+                        if (event == Json::parse_event_t::object_start ||
+                            event == Json::parse_event_t::array_start) {
+                            return active_data;
+                        }
+                        if (event == Json::parse_event_t::value ||
+                            event == Json::parse_event_t::object_end ||
+                            event == Json::parse_event_t::array_end) {
+                            if (active_data) consume_entry(parsed);
+                            return false;
+                        }
+                    }
+                    if (pass_inside_data && depth == 2 && event == Json::parse_event_t::array_end) {
+                        pass_inside_data = false;
+                        active_data = false;
+                        return false;
+                    }
+                    if (pass_inside_chunk && depth == 2 &&
+                        (event == Json::parse_event_t::value ||
+                            event == Json::parse_event_t::object_start ||
+                            event == Json::parse_event_t::array_start ||
+                            event == Json::parse_event_t::object_end ||
+                            event == Json::parse_event_t::array_end)) {
+                        return false;
+                    }
+                    if (pass_inside_chunk && depth == 1 && event == Json::parse_event_t::object_end) {
+                        pass_inside_chunk = false;
+                        ++pass_chunk_index;
+                        ++pass_root_index;
+                        return false;
+                    }
+                    return true;
+                };
+                parse_callback_pass(callback);
+                if (!pass_root_is_array || pass_chunk_index != chunk_metadata.size()) {
+                    throw std::runtime_error("GangBan chunk stream changed while parsing");
                 }
-            }
-            if (accumulated.empty()) throw std::runtime_error("structure has no blocks");
+                return block_index;
+            };
+
+            const auto validated_blocks = stream_entries(false);
+            if (validated_blocks == 0) throw std::runtime_error("structure has no blocks");
             if (mVersion == StructureId::GangBanV3) {
                 mStore.set_size(declared_size);
-                for (auto& [local, block] : accumulated) {
-                    mStore.put(local, block.runtime_id);
-                    if (block.nbt) mStore.put_entity(local, std::move(*block.nbt));
-                }
+                // Fatalder keeps V3 records that lie one cell beyond the
+                // declared xcha/ycha/zcha bounds. Preserve those records in
+                // chunk materialization without changing the reported size.
+                mStore.set_include_out_of_bounds(true);
             } else {
                 mStore.set_size(bounds.size());
-                for (auto& [world, block] : accumulated) {
-                    const auto local = subtract(world, bounds.minimum);
-                    mStore.put(local, block.runtime_id);
-                    if (block.nbt) mStore.put_entity(local, std::move(*block.nbt));
-                    if (block.runtime_id != mRegistry.air_runtime_id()) ++mNonAirBlocks;
-                }
             }
+            const auto materialized_blocks = stream_entries(true);
+            if (materialized_blocks != validated_blocks) {
+                throw std::runtime_error("GangBan chunk stream changed while parsing");
+            }
+            mNonAirBlocks = mStore.count_non_air();
             return Result<void>::success();
         }
 
         if (mVersion == StructureId::GangBanV5 || mVersion == StructureId::GangBanV6 ||
             mVersion == StructureId::GangBanV7) {
-            if (document.empty()) throw std::runtime_error("root array is empty");
-            const auto palette = string_palette(document.back(), "palette");
+            std::size_t document_size = 0;
+            std::optional<Json> penultimate;
+            std::optional<Json> last;
+            for_each_root_entry(path, compressed, [&](std::size_t index, Json&& entry) {
+                document_size = index + 1;
+                penultimate = std::move(last);
+                last = std::move(entry);
+            });
+            if (document_size == 0 || !last) throw std::runtime_error("root array is empty");
+            const auto palette = string_palette(*last, "palette");
             const auto v5 = mVersion == StructureId::GangBanV5;
-            const auto stream_end = document.size() - (v5 ? 2 : 1);
+            const auto stream_end = document_size - (v5 ? 2 : 1);
             if (v5) {
-                if (document.size() < 2 || !document[document.size() - 2].is_object() ||
-                    !document[document.size() - 2].contains("ep") ||
-                    !document[document.size() - 2]["ep"].is_array() ||
-                    document[document.size() - 2]["ep"].size() != 3) {
+                if (document_size < 2 || !penultimate || !penultimate->is_object() ||
+                    !penultimate->contains("ep") || !(*penultimate)["ep"].is_array() ||
+                    (*penultimate)["ep"].size() != 3) {
                     throw std::runtime_error("V5 area ep is invalid");
                 }
                 for (std::size_t index = 0; index < 3; ++index) {
-                    (void)json_integer(document[document.size() - 2]["ep"][index], "area.ep");
+                    (void)json_integer((*penultimate)["ep"][index], "area.ep");
                 }
             }
+            penultimate.reset();
+            last.reset();
 
-            std::map<BlockPos, AccumulatedBlock, std::less<>> accumulated;
             Bounds bounds;
-            auto place = [&](BlockPos world, std::int32_t primary, std::int32_t secondary,
-                             const nlohmann::json* payload, std::size_t block_index) {
-                std::uint32_t runtime = 0;
-                std::optional<NbtPayload> nbt;
-                if (payload != nullptr && payload->is_object()) {
-                    runtime = runtime_id(command_block_name(secondary), static_cast<std::uint16_t>(primary));
-                    nbt = command_nbt_v5(*payload, secondary);
-                } else {
-                    validate_palette_index(primary, palette.size(), block_index);
-                    runtime = runtime_id(palette[primary], static_cast<std::uint16_t>(secondary));
-                    if (payload != nullptr && payload->is_array()) nbt = container_nbt(palette[primary], *payload);
-                }
-                bounds.add(world);
-                auto [found, inserted] = accumulated.try_emplace(world, AccumulatedBlock{ runtime, nbt });
-                if (!inserted) {
-                    found->second.runtime_id = runtime;
-                    if (!found->second.nbt && nbt) found->second.nbt = std::move(nbt);
-                }
-            };
+            std::set<BlockPos, std::less<>> first_entity_positions;
+            auto process_stream = [&](const bool materialize) -> std::size_t {
+                auto place = [&](BlockPos world, std::int32_t primary,
+                                 std::int32_t secondary, const Json* payload,
+                                 std::size_t block_index) {
+                    std::uint32_t runtime = 0;
+                    std::optional<NbtPayload> nbt;
+                    if (payload != nullptr && payload->is_object()) {
+                        runtime = runtime_id(command_block_name(secondary),
+                            static_cast<std::uint16_t>(primary));
+                        nbt = command_nbt_v5(*payload, secondary);
+                    } else {
+                        validate_palette_index(primary, palette.size(), block_index);
+                        runtime = runtime_id(palette[static_cast<std::size_t>(primary)],
+                            static_cast<std::uint16_t>(secondary));
+                        if (payload != nullptr && payload->is_array()) {
+                            nbt = container_nbt(
+                                palette[static_cast<std::size_t>(primary)], *payload);
+                        }
+                    }
+                    if (!materialize) {
+                        bounds.add(world);
+                        return;
+                    }
+                    const auto local = subtract(world, bounds.minimum);
+                    mStore.put(local, runtime);
+                    if (nbt && first_entity_positions.insert(local).second) {
+                        mStore.put_entity(local, std::move(*nbt));
+                    }
+                };
 
-            if (v5) {
-                std::size_t index = 0;
-                std::size_t block_index = 0;
-                while (index < stream_end) {
-                    if (stream_end - index < 6) {
-                        throw std::runtime_error("block index " + std::to_string(block_index) +
-                            " is truncated at stream index " + std::to_string(index));
-                    }
-                    try {
-                        std::array<std::int32_t, 6> base{};
-                        for (std::size_t field = 0; field < base.size(); ++field) {
-                            base[field] = json_i32(document[index + field], "V5 block field");
+                if (v5) {
+                    std::array<std::int32_t, 6> base{};
+                    std::size_t field_count = 0;
+                    std::size_t block_index = 0;
+                    auto finish_block = [&](const Json* payload) {
+                        try {
+                            place({ base[1], base[2], base[3] }, base[4], base[5],
+                                payload, block_index);
+                        } catch (const std::exception& error) {
+                            throw std::runtime_error("block index " +
+                                std::to_string(block_index) + ": " + error.what());
                         }
-                        index += base.size();
-                        const nlohmann::json* payload = nullptr;
-                        if (index < stream_end && (document[index].is_array() || document[index].is_object())) {
-                            payload = &document[index++];
+                        ++block_index;
+                        field_count = 0;
+                    };
+
+                    for_each_root_entry(path, compressed, [&](std::size_t index, Json&& entry) {
+                        if (index >= stream_end) return;
+                        if (field_count == base.size()) {
+                            if (entry.is_array() || entry.is_object()) {
+                                finish_block(&entry);
+                                return;
+                            }
+                            finish_block(nullptr);
                         }
-                        place({ base[1], base[2], base[3] }, base[4], base[5], payload, block_index);
-                    } catch (const std::exception& error) {
-                        throw std::runtime_error("block index " + std::to_string(block_index) + ": " + error.what());
-                    }
-                    ++block_index;
+                        if (field_count == 0 && stream_end - index < base.size()) {
+                            throw std::runtime_error("block index " +
+                                std::to_string(block_index) +
+                                " is truncated at stream index " + std::to_string(index));
+                        }
+                        try {
+                            base[field_count++] = json_i32(entry, "V5 block field");
+                        } catch (const std::exception& error) {
+                            throw std::runtime_error("block index " +
+                                std::to_string(block_index) + ": " + error.what());
+                        }
+                    });
+                    if (field_count == base.size()) finish_block(nullptr);
+                    return block_index;
                 }
-            } else {
+
                 std::int64_t x = 0, y = 0, z = 0;
                 std::size_t block_index = 0;
-                for (std::size_t index = 0; index < stream_end; ++index) {
-                    const auto& entry = document[index];
+                for_each_root_entry(path, compressed, [&](std::size_t index, Json&& entry) {
+                    if (index >= stream_end) return;
                     try {
-                        if (!entry.is_array()) throw std::runtime_error("stream entry is not an array");
-                        if (entry.size() >= 5 && entry[3].is_string() && entry[4].is_string()) continue;
-                        if (entry.size() < 5) throw std::runtime_error("stream entry has fewer than five fields");
+                        if (!entry.is_array()) {
+                            throw std::runtime_error("stream entry is not an array");
+                        }
+                        if (entry.size() >= 5 && entry[3].is_string() &&
+                            entry[4].is_string()) {
+                            return;
+                        }
+                        if (entry.size() < 5) {
+                            throw std::runtime_error(
+                                "stream entry has fewer than five fields");
+                        }
                         x += json_i32(entry[0], "dx");
                         y += json_i32(entry[1], "dy");
                         z += json_i32(entry[2], "dz");
-                        if (x < std::numeric_limits<std::int32_t>::min() || x > std::numeric_limits<std::int32_t>::max() ||
-                            y < std::numeric_limits<std::int32_t>::min() || y > std::numeric_limits<std::int32_t>::max() ||
-                            z < std::numeric_limits<std::int32_t>::min() || z > std::numeric_limits<std::int32_t>::max()) {
+                        if (x < std::numeric_limits<std::int32_t>::min() ||
+                            x > std::numeric_limits<std::int32_t>::max() ||
+                            y < std::numeric_limits<std::int32_t>::min() ||
+                            y > std::numeric_limits<std::int32_t>::max() ||
+                            z < std::numeric_limits<std::int32_t>::min() ||
+                            z > std::numeric_limits<std::int32_t>::max()) {
                             throw std::runtime_error("delta cursor exceeds int32");
                         }
                         const auto primary = json_i32(entry[3], "primary");
                         const auto secondary = json_i32(entry[4], "secondary");
                         const auto* payload = entry.size() >= 6 ? &entry[5] : nullptr;
-                        place({ static_cast<std::int32_t>(x), static_cast<std::int32_t>(y), static_cast<std::int32_t>(z) },
+                        place({ static_cast<std::int32_t>(x),
+                                  static_cast<std::int32_t>(y),
+                                  static_cast<std::int32_t>(z) },
                             primary, secondary, payload, block_index);
                     } catch (const std::exception& error) {
-                        throw std::runtime_error("block index " + std::to_string(block_index) +
-                            " stream index " + std::to_string(index) + ": " + error.what());
+                        throw std::runtime_error("block index " +
+                            std::to_string(block_index) + " stream index " +
+                            std::to_string(index) + ": " + error.what());
                     }
                     ++block_index;
-                }
-            }
-            if (accumulated.empty()) throw std::runtime_error("structure has no blocks");
+                });
+                return block_index;
+            };
+
+            const auto validated_blocks = process_stream(false);
+            if (validated_blocks == 0) throw std::runtime_error("structure has no blocks");
             mStore.set_size(bounds.size());
-            for (auto& [world, block] : accumulated) {
-                const auto local = subtract(world, bounds.minimum);
-                mStore.put(local, block.runtime_id);
-                if (block.nbt) mStore.put_entity(local, std::move(*block.nbt));
-                if (block.runtime_id != mRegistry.air_runtime_id()) ++mNonAirBlocks;
+            const auto materialized_blocks = process_stream(true);
+            if (materialized_blocks != validated_blocks) {
+                throw std::runtime_error("GangBan command stream changed while parsing");
             }
+            mNonAirBlocks = mStore.count_non_air();
             return Result<void>::success();
         }
 

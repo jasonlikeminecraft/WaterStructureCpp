@@ -4,7 +4,10 @@
 #include <WaterStructure/structure.hpp>
 
 #include <cstdint>
+#include <atomic>
 #include <filesystem>
+#include <mutex>
+#include <unordered_map>
 #include <vector>
 
 namespace water_structure {
@@ -18,6 +21,11 @@ public:
     Size size() const noexcept override { return mSize; }
     BlockPos offset() const noexcept override { return mOffset; }
     void set_offset(BlockPos offset) noexcept override;
+    void set_streaming_options(
+        std::size_t soft_memory_budget_bytes,
+        bool allow_temporary_spool,
+        std::filesystem::path temporary_directory = {},
+        std::size_t temporary_file_limit_bytes = 0);
     Result<void> read(const std::filesystem::path& path) override;
     Result<ChunkMap> get_chunks(std::span<const ChunkPos> positions) const override;
     Result<NbtChunkMap> get_chunk_nbt(std::span<const ChunkPos> positions) const override;
@@ -43,6 +51,16 @@ private:
     Size mOriginalSize{};
     Size mSize{};
     std::size_t mNonAirBlocks = 0;
+    std::size_t mSoftMemoryBudgetBytes = 450u * 1024u * 1024u;
+    bool mAllowTemporarySpool = true;
+    std::filesystem::path mTemporaryDirectory;
+    std::size_t mTemporaryFileLimitBytes = 0;
+    bool mStreamingOptionsConfigured = false;
+    mutable std::unordered_map<ChunkPos, std::vector<std::uint32_t>, ChunkPosHash>
+        mCommandIndex;
+    mutable std::vector<std::uint32_t> mBroadCommands;
+    mutable std::atomic_bool mCommandIndexReady = false;
+    mutable std::mutex mCommandIndexMutex;
 };
 
 } // namespace water_structure

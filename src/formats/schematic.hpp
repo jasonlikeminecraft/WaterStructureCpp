@@ -37,6 +37,11 @@ private:
     BlockPos mOffset{};
     std::vector<std::int8_t> mBlocks;
     std::vector<std::int8_t> mData;
+    // A legacy id/data pair has only 65,536 possible values.  Keep its
+    // resolved runtime id on the heap for the lifetime of the reader so
+    // bounded chunk batches do not rebuild the mapping table repeatedly.
+    std::vector<std::uint32_t> mRuntimeCache;
+    std::vector<std::uint8_t> mRuntimeCacheState;
 };
 
 } // namespace water_structure

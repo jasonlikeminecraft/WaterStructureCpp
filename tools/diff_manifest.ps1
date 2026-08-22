@@ -3,9 +3,25 @@ param(
     [Parameter(Mandatory = $true)][string]$CppManifest,
     [string]$InputPath,
     [string]$GoManifestTool,
-    [string]$CppManifestTool
+    [string]$CppManifestTool,
+    [string]$StreamDiffTool,
+    [string]$LimitedRunner,
+    [ValidateRange(64, 500)][int]$MemoryLimitMiB = 500,
+    # Round-trip comparisons intentionally use different input files. Their
+    # semantic manifests must match even though the source byte hashes cannot.
+    [switch]$IgnoreInputSha
 )
 
+# The top-level chunks and block_entities arrays can contain millions of
+# records. Keep this wrapper small: the Go helper reads JSON tokens and does
+# an ordered merge without ConvertFrom-Json on either large array. The JSON
+# report is bounded (at most 100 differences), so parsing it here is safe.
+$goPath = (Resolve-Path -LiteralPath $GoManifest -ErrorAction Stop).Path
+$cppPath = (Resolve-Path -LiteralPath $CppManifest -ErrorAction Stop).Path
+if ([string]::IsNullOrWhiteSpace($StreamDiffTool)) {
+    $nativeName = if ($env:OS -eq 'Windows_NT') { 'stream_manifest_diff.exe' } else { 'stream_manifest_diff' }
+    $StreamDiffTool = Join-Path $PSScriptRoot ("stream_manifest_diff\$nativeName")
+}
 if ([string]::IsNullOrWhiteSpace($GoManifestTool)) {
     $GoManifestTool = Join-Path $PSScriptRoot 'go_manifest\go_manifest.exe'
 }
@@ -13,55 +29,104 @@ if ([string]::IsNullOrWhiteSpace($CppManifestTool)) {
     $CppManifestTool = Join-Path (Split-Path $PSScriptRoot -Parent) 'build\windows\x64\release\cpp_manifest.exe'
 }
 
-$go = Get-Content -Raw -Encoding UTF8 -LiteralPath $GoManifest | ConvertFrom-Json
-$cpp = Get-Content -Raw -Encoding UTF8 -LiteralPath $CppManifest | ConvertFrom-Json
+$token = [Guid]::NewGuid().ToString('N')
+$reportPath = Join-Path ([IO.Path]::GetTempPath()) "water-structure-manifest-diff-$token.json"
+$limitedReportPath = Join-Path ([IO.Path]::GetTempPath()) "water-structure-manifest-limit-$token.json"
+$runnerExit = 2
+
+function Invoke-LimitedTool {
+    param(
+        [Parameter(Mandatory = $true)][string]$Executable,
+        [Parameter(Mandatory = $true)][string[]]$Arguments,
+        [string]$WorkingDirectory,
+        [string]$RunnerReportPath
+    )
+    if ([string]::IsNullOrWhiteSpace($LimitedRunner)) {
+        if ([string]::IsNullOrWhiteSpace($WorkingDirectory)) {
+            & $Executable @Arguments 2>&1 | Out-Null
+        } else {
+            Push-Location $WorkingDirectory
+            try { & $Executable @Arguments 2>&1 | Out-Null } finally { Pop-Location }
+        }
+        return $LASTEXITCODE
+    }
+    if (-not (Test-Path -LiteralPath $LimitedRunner -PathType Leaf)) {
+        throw "limited_runner not found: $LimitedRunner"
+    }
+    $limitArgs = @(
+        '-limit-mib', [string]$MemoryLimitMiB,
+        '-output', $RunnerReportPath
+    )
+    if (-not [string]::IsNullOrWhiteSpace($WorkingDirectory)) {
+        $limitArgs += @('-cwd', $WorkingDirectory)
+    }
+    $limitArgs += @('--', $Executable)
+    $limitArgs += $Arguments
+    & $LimitedRunner @limitArgs | Out-Null
+    $limitedExit = $LASTEXITCODE
+    if (-not (Test-Path -LiteralPath $RunnerReportPath -PathType Leaf)) {
+        throw "limited_runner did not produce report (exit code $limitedExit)"
+    }
+    $limitReport = Get-Content -Raw -Encoding UTF8 -LiteralPath $RunnerReportPath | ConvertFrom-Json
+    $run = @($limitReport.runs)[0]
+    if ($null -eq $run) { throw 'limited_runner report contains no run' }
+    if ([bool]$run.memory_limit_exceeded) {
+        throw "manifest helper exceeded ${MemoryLimitMiB} MiB"
+    }
+    if ([string]$run.termination -ne 'exited') {
+        throw "manifest helper terminated: $($run.termination)"
+    }
+    return [int]$run.exit_code
+}
+
+try {
+    if (Test-Path -LiteralPath $StreamDiffTool -PathType Leaf) {
+        $streamArguments = @(
+            '--go', $goPath, '--cpp', $cppPath, '--report', $reportPath
+        )
+        if ($IgnoreInputSha) { $streamArguments += '--ignore-input-sha' }
+        $runnerExit = Invoke-LimitedTool $StreamDiffTool $streamArguments '' $limitedReportPath
+    } elseif (Get-Command go -ErrorAction SilentlyContinue) {
+        # go run keeps the same CLI usable on Linux, macOS and Termux when no
+        # generated native helper has been installed beside this script.
+        $goArguments = @(
+            'run', '.', '--go', $goPath, '--cpp', $cppPath, '--report', $reportPath
+        )
+        if ($IgnoreInputSha) { $goArguments += '--ignore-input-sha' }
+        $runnerExit = Invoke-LimitedTool 'go' $goArguments `
+            (Join-Path $PSScriptRoot 'stream_manifest_diff') $limitedReportPath
+    } else {
+        throw "stream_manifest_diff not found and Go is not installed: $StreamDiffTool"
+    }
+    if (-not (Test-Path -LiteralPath $reportPath -PathType Leaf)) {
+        throw "stream_manifest_diff did not produce a report (exit code $runnerExit)"
+    }
+    $report = Get-Content -Raw -Encoding UTF8 -LiteralPath $reportPath | ConvertFrom-Json
+} finally {
+    Remove-Item -LiteralPath $reportPath, $limitedReportPath -Force -ErrorAction SilentlyContinue
+}
+
+if ($runnerExit -eq 2) {
+    throw "stream_manifest_diff failed to parse manifests"
+}
+
 $differences = [System.Collections.Generic.List[string]]::new()
 $firstBlockMismatch = $null
-
 function Add-Difference {
     param([string]$Path, $GoValue, $CppValue)
     $script:differences.Add("${Path}: Go=$GoValue C++=$CppValue")
 }
-
-function Compare-Scalar {
-    param([string]$Path, $GoValue, $CppValue)
-    if ([string]$GoValue -cne [string]$CppValue) {
-        Add-Difference $Path $GoValue $CppValue
+if ($null -ne $report.differences) {
+    foreach ($difference in @($report.differences)) {
+        if ($null -ne $difference) { $differences.Add([string]$difference) }
     }
 }
-
-function Compare-Array {
-    param([string]$Path, $GoValue, $CppValue)
-    $goArray = @($GoValue)
-    $cppArray = @($CppValue)
-    if ($goArray.Count -ne $cppArray.Count) {
-        Add-Difference "$Path.length" $goArray.Count $cppArray.Count
-        return
-    }
-    for ($index = 0; $index -lt $goArray.Count; $index++) {
-        Compare-Scalar "${Path}[$index]" $goArray[$index] $cppArray[$index]
-    }
-}
-
-function Compare-NbtFields {
-    param([string]$Path, $GoFields, $CppFields)
-    $goByPath = @{}
-    foreach ($field in @($GoFields)) { $goByPath[[string]$field.path] = $field }
-    $cppByPath = @{}
-    foreach ($field in @($CppFields)) { $cppByPath[[string]$field.path] = $field }
-    $fieldPaths = @($goByPath.Keys + $cppByPath.Keys | Sort-Object -Unique)
-    foreach ($fieldPath in $fieldPaths) {
-        $current = "$Path.nbt$fieldPath"
-        if (-not $goByPath.ContainsKey($fieldPath)) {
-            Add-Difference "$current.presence" $false $true
-            continue
-        }
-        if (-not $cppByPath.ContainsKey($fieldPath)) {
-            Add-Difference "$current.presence" $true $false
-            continue
-        }
-        Compare-Scalar "$current.type" $goByPath[$fieldPath].type $cppByPath[$fieldPath].type
-        Compare-Scalar "$current.value_sha256" $goByPath[$fieldPath].value_sha256 $cppByPath[$fieldPath].value_sha256
+if ($null -ne $report.first_block_mismatch) {
+    $firstBlockMismatch = [pscustomobject]@{
+        ChunkX = [int]$report.first_block_mismatch.chunk_x
+        ChunkZ = [int]$report.first_block_mismatch.chunk_z
+        SubY = [int]$report.first_block_mismatch.sub_y
+        Layer = [int]$report.first_block_mismatch.layer
     }
 }
 
@@ -80,14 +145,23 @@ function Expand-BlockMismatch {
         return
     }
 
-    $token = [Guid]::NewGuid().ToString('N')
-    $goDetailPath = Join-Path ([IO.Path]::GetTempPath()) "water-structure-go-detail-$token.json"
-    $cppDetailPath = Join-Path ([IO.Path]::GetTempPath()) "water-structure-cpp-detail-$token.json"
+    $detailToken = [Guid]::NewGuid().ToString('N')
+    $goDetailPath = Join-Path ([IO.Path]::GetTempPath()) "water-structure-go-detail-$detailToken.json"
+    $cppDetailPath = Join-Path ([IO.Path]::GetTempPath()) "water-structure-cpp-detail-$detailToken.json"
+    $goLimitPath = Join-Path ([IO.Path]::GetTempPath()) "water-structure-go-detail-limit-$detailToken.json"
+    $cppLimitPath = Join-Path ([IO.Path]::GetTempPath()) "water-structure-cpp-detail-limit-$detailToken.json"
     try {
-        & $GoManifestTool $InputPath $goDetailPath '--detail' $Mismatch.ChunkX $Mismatch.ChunkZ $Mismatch.SubY $Mismatch.Layer
-        if ($LASTEXITCODE -ne 0) { throw "Go manifest detail failed with exit code $LASTEXITCODE" }
-        & $CppManifestTool $InputPath $cppDetailPath '--detail' $Mismatch.ChunkX $Mismatch.ChunkZ $Mismatch.SubY $Mismatch.Layer
-        if ($LASTEXITCODE -ne 0) { throw "C++ manifest detail failed with exit code $LASTEXITCODE" }
+        $goDetailExit = Invoke-LimitedTool $GoManifestTool @(
+            $InputPath, $goDetailPath, '--detail', [string]$Mismatch.ChunkX,
+            [string]$Mismatch.ChunkZ, [string]$Mismatch.SubY, [string]$Mismatch.Layer
+        ) '' $goLimitPath
+        if ($goDetailExit -ne 0) { throw "Go manifest detail failed with exit code $goDetailExit" }
+        $cppDetailExit = Invoke-LimitedTool $CppManifestTool @(
+            $InputPath, $cppDetailPath, '--detail', [string]$Mismatch.ChunkX,
+            [string]$Mismatch.ChunkZ, [string]$Mismatch.SubY, [string]$Mismatch.Layer
+        ) '' $cppLimitPath
+        if ($cppDetailExit -ne 0) { throw "C++ manifest detail failed with exit code $cppDetailExit" }
+        # Detail is one 16x16x16 layer, not an unbounded manifest array.
         $goDetail = Get-Content -Raw -Encoding UTF8 -LiteralPath $goDetailPath | ConvertFrom-Json
         $cppDetail = Get-Content -Raw -Encoding UTF8 -LiteralPath $cppDetailPath | ConvertFrom-Json
         $goCells = @($goDetail.detail)
@@ -108,95 +182,21 @@ function Expand-BlockMismatch {
         }
         Write-Warning "All detailed blocks match in the first mismatched layer; verify that both manifests were generated by the current tools."
     } finally {
-        Remove-Item -LiteralPath $goDetailPath, $cppDetailPath -Force -ErrorAction SilentlyContinue
-    }
-}
-
-Compare-Scalar 'schema' $go.schema $cpp.schema
-Compare-Scalar 'block_hash_algorithm' $go.block_hash_algorithm $cpp.block_hash_algorithm
-Compare-Scalar 'nbt_hash_algorithm' $go.nbt_hash_algorithm $cpp.nbt_hash_algorithm
-Compare-Scalar 'input_sha256' $go.input_sha256 $cpp.input_sha256
-
-if (($null -ne $go.error) -or ($null -ne $cpp.error)) {
-    if (($null -eq $go.error) -or ($null -eq $cpp.error)) {
-        Add-Difference 'error.presence' ($null -ne $go.error) ($null -ne $cpp.error)
-    } else {
-        Compare-Scalar 'error.category' $go.error.category $cpp.error.category
-        Compare-Scalar 'error.offset' $go.error.offset $cpp.error.offset
-        Compare-Scalar 'error.command_index' $go.error.command_index $cpp.error.command_index
-        Compare-Array 'error.coordinate' $go.error.coordinate $cpp.error.coordinate
-    }
-} else {
-    Compare-Scalar 'format' $go.format $cpp.format
-    Compare-Array 'size' $go.size $cpp.size
-    Compare-Array 'offset' $go.offset $cpp.offset
-    Compare-Scalar 'non_air_blocks' $go.non_air_blocks $cpp.non_air_blocks
-
-    $goChunks = @{}
-    foreach ($chunk in @($go.chunks)) { $goChunks["$($chunk.x),$($chunk.z)"] = $chunk }
-    $cppChunks = @{}
-    foreach ($chunk in @($cpp.chunks)) { $cppChunks["$($chunk.x),$($chunk.z)"] = $chunk }
-    $chunkKeys = @($goChunks.Keys + $cppChunks.Keys | Sort-Object -Unique)
-    foreach ($key in $chunkKeys) {
-        $path = "chunks[$key]"
-        if (-not $goChunks.ContainsKey($key)) { Add-Difference "$path.presence" $false $true; continue }
-        if (-not $cppChunks.ContainsKey($key)) { Add-Difference "$path.presence" $true $false; continue }
-        $goSubChunks = @{}
-        foreach ($subChunk in @($goChunks[$key].subchunks)) { $goSubChunks[[string]$subChunk.y] = $subChunk }
-        $cppSubChunks = @{}
-        foreach ($subChunk in @($cppChunks[$key].subchunks)) { $cppSubChunks[[string]$subChunk.y] = $subChunk }
-        $subChunkKeys = @($goSubChunks.Keys + $cppSubChunks.Keys | Sort-Object {[int]$_} -Unique)
-        foreach ($subKey in $subChunkKeys) {
-            $subPath = "$path.subchunks[y=$subKey]"
-            if (-not $goSubChunks.ContainsKey($subKey)) { Add-Difference "$subPath.presence" $false $true; continue }
-            if (-not $cppSubChunks.ContainsKey($subKey)) { Add-Difference "$subPath.presence" $true $false; continue }
-            foreach ($layer in 0, 1) {
-                $property = "layer${layer}_sha256"
-                $goHash = $goSubChunks[$subKey].$property
-                $cppHash = $cppSubChunks[$subKey].$property
-                if (($null -eq $script:firstBlockMismatch) -and ([string]$goHash -cne [string]$cppHash)) {
-                    $coordinates = $key -split ',', 2
-                    $script:firstBlockMismatch = [pscustomobject]@{
-                        ChunkX = [int]$coordinates[0]
-                        ChunkZ = [int]$coordinates[1]
-                        SubY = [int]$subKey
-                        Layer = $layer
-                    }
-                }
-                Compare-Scalar "$subPath.$property" $goHash $cppHash
-            }
-        }
-    }
-
-    $goEntities = @($go.block_entities | Sort-Object x, y, z)
-    $cppEntities = @($cpp.block_entities | Sort-Object x, y, z)
-    if ($goEntities.Count -ne $cppEntities.Count) {
-        Add-Difference 'block_entities.length' $goEntities.Count $cppEntities.Count
-    }
-    $entityCount = [Math]::Min($goEntities.Count, $cppEntities.Count)
-    for ($index = 0; $index -lt $entityCount; $index++) {
-        $goEntity = $goEntities[$index]
-        $cppEntity = $cppEntities[$index]
-        $path = "block_entities[$index]"
-        Compare-Scalar "$path.x" $goEntity.x $cppEntity.x
-        Compare-Scalar "$path.y" $goEntity.y $cppEntity.y
-        Compare-Scalar "$path.z" $goEntity.z $cppEntity.z
-        if (($goEntity.x -eq $cppEntity.x) -and ($goEntity.y -eq $cppEntity.y) -and ($goEntity.z -eq $cppEntity.z)) {
-            $path = "block_entities[x=$($goEntity.x),y=$($goEntity.y),z=$($goEntity.z)]"
-        }
-        Compare-Scalar "$path.nbt_sha256" $goEntity.nbt_sha256 $cppEntity.nbt_sha256
-        if ([string]$goEntity.nbt_sha256 -cne [string]$cppEntity.nbt_sha256) {
-            Compare-NbtFields $path $goEntity.nbt_fields $cppEntity.nbt_fields
-        }
+        Remove-Item -LiteralPath $goDetailPath, $cppDetailPath,
+            $goLimitPath, $cppLimitPath -Force -ErrorAction SilentlyContinue
     }
 }
 
 if ($differences.Count -ne 0) {
-    if ($null -ne $firstBlockMismatch) {
-        Expand-BlockMismatch $firstBlockMismatch
-    }
+    if ($null -ne $firstBlockMismatch) { Expand-BlockMismatch $firstBlockMismatch }
+    $reportedCount = [uint64]$report.difference_count
+    if ($reportedCount -eq 0) { $reportedCount = $differences.Count }
     $limit = [Math]::Min($differences.Count, 100)
-    Write-Error "manifest mismatch ($($differences.Count) differences):`n$($differences.GetRange(0, $limit) -join "`n")"
+    Write-Error "manifest mismatch ($reportedCount differences):`n$($differences.GetRange(0, $limit) -join "`n")"
+    exit 1
+}
+if ($runnerExit -ne 0) {
+    Write-Error "manifest mismatch (stream_manifest_diff exit code $runnerExit)"
     exit 1
 }
 Write-Output "manifest match: $GoManifest == $CppManifest"

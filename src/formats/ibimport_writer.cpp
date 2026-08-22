@@ -229,9 +229,29 @@ private:
 
 class StringWriter final {
 public:
-    void write(std::string_view bytes) { mBytes.append(bytes); }
+    explicit StringWriter(
+        std::size_t memory_limit = 2u * 1024u * 1024u,
+        bool allow_temporary_spool = true)
+        : mMemoryLimit(std::max<std::size_t>(memory_limit, 4096)),
+          mAllowTemporarySpool(allow_temporary_spool)
+    {
+        mBytes.reserve(std::min<std::size_t>(mMemoryLimit, 256u * 1024u));
+    }
+    void write(std::string_view bytes)
+    {
+        if (bytes.size() > mMemoryLimit - std::min(mMemoryLimit, mBytes.size())) {
+            throw std::runtime_error(mAllowTemporarySpool
+                ? "capability error: IBImport writer 命令批次超过 soft_memory_budget，"
+                  "当前协议不支持受控临时 spool"
+                : "capability error: IBImport writer 命令缓冲超过 soft_memory_budget，"
+                  "且 allow_temporary_spool=false");
+        }
+        mBytes.append(bytes);
+    }
     std::string take() { return std::move(mBytes); }
 private:
+    std::size_t mMemoryLimit;
+    bool mAllowTemporarySpool;
     std::string mBytes;
 };
 
@@ -514,9 +534,12 @@ Result<PreparedPaletteChunk> prepare_palette_chunk(
     return Result<PreparedPaletteChunk>::success(std::move(result));
 }
 
-std::string encode_palette_chunk(PreparedPaletteChunk input)
+std::string encode_palette_chunk(
+    PreparedPaletteChunk input,
+    std::size_t output_memory_limit,
+    bool allow_temporary_spool)
 {
-    StringWriter output;
+    StringWriter output(output_memory_limit, allow_temporary_spool);
     const auto state_for = [&](std::uint32_t handle) -> std::string_view {
         const auto& states = input.shared_states ? *input.shared_states : input.states;
         return handle < states.size() ? states[handle] : std::string_view{};
@@ -535,9 +558,11 @@ std::string encode_generic_chunk(
     int z_begin,
     int z_end,
     int height,
-    std::unordered_map<std::uint32_t, std::string>& state_cache)
+    std::unordered_map<std::uint32_t, std::string>& state_cache,
+    std::size_t output_memory_limit,
+    bool allow_temporary_spool)
 {
-    StringWriter output;
+    StringWriter output(output_memory_limit, allow_temporary_spool);
     write_chunk_commands(
         output, chunk, registry, x_begin, x_end, z_begin, z_end,
         height, state_cache);
@@ -604,9 +629,25 @@ Result<void> write_ibimport(
     if (size.width <= 0 || size.height <= 0 || size.length <= 0 || size.volume() <= 0) {
         return Result<void>::failure("IBImport 输出尺寸无效");
     }
-    auto output_buffer = std::make_unique<char[]>(1024 * 1024);
+    const auto budget = options.soft_memory_budget_bytes;
+    if (budget < 64u * 1024u) {
+        return Result<void>::failure("IBImport writer soft_memory_budget 至少需要 64 KiB");
+    }
+    const auto estimated_subchunks = static_cast<std::size_t>(
+        std::max(1, (size.height + 15) / 16));
+    const auto estimated_chunk_bytes = std::max<std::size_t>(64u * 1024u,
+        estimated_subchunks * 4096u * (sizeof(std::uint32_t) + sizeof(std::uint8_t)) +
+        64u * 1024u);
+    if (estimated_chunk_bytes > budget / 2) {
+        return Result<void>::failure(
+            "IBImport writer 单 chunk 命令窗口超过 soft_memory_budget");
+    }
+    const auto output_buffer_size = std::max<std::size_t>(4096,
+        std::min<std::size_t>(1024u * 1024u, budget / 16));
+    auto output_buffer = std::make_unique<char[]>(output_buffer_size);
     std::ofstream output;
-    output.rdbuf()->pubsetbuf(output_buffer.get(), 1024 * 1024);
+    output.rdbuf()->pubsetbuf(output_buffer.get(),
+        static_cast<std::streamsize>(output_buffer_size));
     output.open(output_path, std::ios::binary | std::ios::trunc);
     if (!output) return Result<void>::failure("无法创建 IBImport: " + output_path.string());
     try {
@@ -629,14 +670,11 @@ Result<void> write_ibimport(
         std::unordered_map<const std::vector<BlockState>*,
             std::shared_ptr<const SharedPaletteEncoding>> shared_palette_encodings;
         constexpr std::size_t kDefaultPaletteBatchSize = 32;
-        constexpr std::size_t kGenericBatchMemoryBudget = 96ull * 1024ull * 1024ull;
-        const auto estimated_subchunks = static_cast<std::size_t>(
-            std::max(1, (size.height + 15) / 16));
-        const auto estimated_chunk_bytes = estimated_subchunks * sizeof(SubChunkData) +
-            64ull * 1024ull;
+        const auto generic_memory_budget = std::min<std::size_t>(
+            96ull * 1024ull * 1024ull, budget / 2);
         const auto generic_batch_size = std::max<std::size_t>(1, std::min<std::size_t>(
             static_cast<std::size_t>(size.chunk_x_count()),
-            kGenericBatchMemoryBudget / std::max<std::size_t>(1, estimated_chunk_bytes)));
+            generic_memory_budget / std::max<std::size_t>(1, estimated_chunk_bytes)));
         const auto preferred_palette_batch = structure.preferred_palette_batch_size();
         const auto palette_batch_size = std::max<std::size_t>(1,
             preferred_palette_batch == 0
@@ -644,14 +682,27 @@ Result<void> write_ibimport(
                 : std::min<std::size_t>(
                     static_cast<std::size_t>(size.chunk_x_count()),
                     preferred_palette_batch));
+        const auto chunk_window = options.max_in_flight_chunks == 0
+            ? std::max<std::size_t>(1, budget / estimated_chunk_bytes)
+            : std::min(options.max_in_flight_chunks,
+                std::max<std::size_t>(1, budget / estimated_chunk_bytes));
+        const auto bounded_palette_batch = std::min(palette_batch_size, chunk_window);
+        const auto bounded_generic_batch = std::min(generic_batch_size, chunk_window);
         std::vector<ChunkPos> positions;
-        positions.reserve(std::max(palette_batch_size, generic_batch_size));
-        const auto worker_count = std::max<std::size_t>(
-            1, options.thread_count == 0 ? 3 : options.thread_count);
-        const auto max_in_flight = std::max<std::size_t>(
-            1, options.max_in_flight_tasks == 0
-                ? worker_count * 2
-                : options.max_in_flight_tasks);
+        positions.reserve(std::max(bounded_palette_batch, bounded_generic_batch));
+        auto worker_count = std::max<std::size_t>(
+            1, options.resolved_worker_count() == 0 ? 3 : options.resolved_worker_count());
+        worker_count = std::min(worker_count, chunk_window);
+        const auto requested_in_flight = options.max_in_flight_tasks == 0
+            ? worker_count * 2 : options.max_in_flight_tasks;
+        const auto max_in_flight = std::max<std::size_t>(1,
+            std::min(requested_in_flight, chunk_window));
+        // Encoded command strings are retained until the ordered drain.  Size
+        // each task's string budget against the number of simultaneously
+        // retained futures, rather than assigning every task budget/4 (which
+        // could multiply the process footprint beyond the requested budget).
+        const auto output_memory_limit = std::max<std::size_t>(4096,
+            budget / (max_in_flight + worker_count + 4));
         detail::BoundedThreadPool encode_pool(worker_count, max_in_flight);
         struct WorkerContext {
             std::unordered_map<std::uint32_t, std::string> state_cache;
@@ -682,7 +733,7 @@ Result<void> write_ibimport(
             for (int batch_x = 0; batch_x < size.chunk_x_count();) {
                 auto batch_end = std::min(
                     size.chunk_x_count(), batch_x + static_cast<int>(
-                        palette_enabled ? palette_batch_size : generic_batch_size));
+                        palette_enabled ? bounded_palette_batch : bounded_generic_batch));
                 positions.clear();
                 for (auto chunk_x = batch_x; chunk_x < batch_end; ++chunk_x)
                     positions.push_back({ chunk_x, chunk_z });
@@ -706,9 +757,11 @@ Result<void> write_ibimport(
                             palette_prepare_ms += elapsed_ms(prepare_start);
                             if (!prepared) return Result<void>::failure(prepared.error());
                             pending.push_back(encode_pool.submit(
-                                [input = std::move(prepared).value()]() mutable {
+                                [input = std::move(prepared).value(), output_memory_limit,
+                                 allow_temporary_spool = options.allow_temporary_spool]() mutable {
                                     const auto start = Clock::now();
-                                    auto commands = encode_palette_chunk(std::move(input));
+                                    auto commands = encode_palette_chunk(
+                                        std::move(input), output_memory_limit, allow_temporary_spool);
                                     const auto duration = std::chrono::duration<double, std::milli>(
                                         Clock::now() - start).count();
                                     return EncodedChunk{ std::move(commands), duration, true };
@@ -731,7 +784,7 @@ Result<void> write_ibimport(
                     // this same range using the larger generic batch so Schem does
                     // not decode the first rows twice.
                     batch_end = std::min(
-                        size.chunk_x_count(), batch_x + static_cast<int>(generic_batch_size));
+                        size.chunk_x_count(), batch_x + static_cast<int>(bounded_generic_batch));
                     positions.clear();
                     for (auto chunk_x = batch_x; chunk_x < batch_end; ++chunk_x)
                         positions.push_back({ chunk_x, chunk_z });
@@ -751,13 +804,16 @@ Result<void> write_ibimport(
                     const auto z_end = std::min(size.length, (position.z + 1) * 16);
                     pending.push_back(encode_pool.submit_indexed(
                         [chunk = std::move(chunk), &registry, &worker_contexts,
-                         x_begin, x_end, z_begin, z_end, height = size.height]
+                         x_begin, x_end, z_begin, z_end, height = size.height,
+                         output_memory_limit,
+                         allow_temporary_spool = options.allow_temporary_spool]
                         (std::size_t worker_index) mutable {
                             const auto start = Clock::now();
                             auto commands = encode_generic_chunk(
                                 std::move(chunk), registry,
                                 x_begin, x_end, z_begin, z_end, height,
-                                worker_contexts[worker_index]->state_cache);
+                                worker_contexts[worker_index]->state_cache,
+                                output_memory_limit, allow_temporary_spool);
                             const auto duration = std::chrono::duration<double, std::milli>(
                                 Clock::now() - start).count();
                             return EncodedChunk{ std::move(commands), duration, false };

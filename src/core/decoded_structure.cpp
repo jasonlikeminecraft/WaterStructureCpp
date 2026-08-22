@@ -9,11 +9,13 @@ namespace water_structure {
 void SparseBlockStore::clear()
 {
     mBlocks.clear();
+    mOutOfBoundsBlocks.clear();
     mEntities.clear();
     mNonAirBlocks = 0;
     mOriginalSize = {};
     mSize = {};
     mOffset = {};
+    mIncludeOutOfBounds = false;
 }
 
 void SparseBlockStore::set_offset(BlockPos offset) noexcept
@@ -33,6 +35,11 @@ void SparseBlockStore::put(BlockPos local, std::uint32_t runtime_id)
         --mNonAirBlocks;
     }
     mBlocks[local] = runtime_id;
+    const bool outside = local.x < 0 || local.y < 0 || local.z < 0 ||
+        local.x >= mOriginalSize.width || local.y >= mOriginalSize.height ||
+        local.z >= mOriginalSize.length;
+    if (mIncludeOutOfBounds && outside) mOutOfBoundsBlocks[local] = runtime_id;
+    else mOutOfBoundsBlocks.erase(local);
     if (runtime_id != mRegistry.air_runtime_id()) ++mNonAirBlocks;
 }
 
@@ -103,6 +110,27 @@ Result<ChunkMap> SparseBlockStore::get_chunks_impl(
                     sub->second.layer0[static_cast<std::size_t>((ly * 16 + lz) * 16 + lx)] =
                         block->second;
                 }
+            }
+        }
+
+        if (mIncludeOutOfBounds && !mOutOfBoundsBlocks.empty()) {
+            for (const auto& [local, runtime_id] : mOutOfBoundsBlocks) {
+                const auto world_x = local.x + mOffset.x;
+                const auto world_y = local.y + mOffset.y;
+                const auto world_z = local.z + mOffset.z;
+                if (floor_div(world_x, 16) != chunk_pos.x ||
+                    floor_div(world_z, 16) != chunk_pos.z) continue;
+                const auto sub_y = floor_div(world_y - 64, 16);
+                auto [sub, inserted] = chunk.sub_chunks.try_emplace(sub_y);
+                if (inserted) {
+                    sub->second.layer0.fill(air_runtime_id);
+                    if (include_layer1) sub->second.layer1.fill(air_runtime_id);
+                }
+                const auto lx = floor_mod(world_x, 16);
+                const auto ly = floor_mod(world_y - 64, 16);
+                const auto lz = floor_mod(world_z, 16);
+                sub->second.layer0[static_cast<std::size_t>((ly * 16 + lz) * 16 + lx)] =
+                    runtime_id;
             }
         }
     }

@@ -17,3 +17,12 @@ test-world/
 *.obj
 *.lib
 *.exe
+# Local test/build outputs (keep fixture files and source examples trackable).
+__pycache__/
+*.py[cod]
+/tmp-*/
+/release-*/
+tools/limited_runner/limited_runner
+tools/limited_runner/limited_runner.exe
+tools/go_manifest/go_manifest
+tools/go_manifest/go_manifest.exe

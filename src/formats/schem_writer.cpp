@@ -99,7 +99,8 @@ Result<void> write_byte_array(
     const std::string& name,
     const std::vector<StripeFile>& stripes,
     int height,
-    std::uint64_t total_size)
+    std::uint64_t total_size,
+    std::size_t copy_buffer_size)
 {
     if (total_size > static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max())) {
         return Result<void>::failure("Schem BlockData 超过 int32");
@@ -114,7 +115,10 @@ Result<void> write_byte_array(
         inputs.emplace_back(stripe.path, std::ios::binary);
         if (!inputs.back()) return Result<void>::failure("无法读取 Schem 临时 BlockData");
     }
-    std::vector<char> buffer(kCopyBufferSize);
+    if (copy_buffer_size == 0) {
+        return Result<void>::failure("Schem writer soft_memory_budget 太小，无法建立复制缓冲");
+    }
+    std::vector<char> buffer(copy_buffer_size);
     for (int y = 0; y < height; ++y) {
         for (std::size_t stripe_index = 0; stripe_index < stripes.size(); ++stripe_index) {
             auto& input = inputs[stripe_index];
@@ -142,10 +146,19 @@ Result<void> write_schem(
     const IStructure& structure,
     RuntimeRegistry& registry,
     StructureId format,
-    const std::filesystem::path& output_path)
+    const std::filesystem::path& output_path,
+    const ConversionOptions& options)
 {
     if (format != StructureId::SchemV1 && format != StructureId::SchemV2) {
         return Result<void>::failure("Schem writer 收到不支持的格式");
+    }
+    if (!options.allow_temporary_spool) {
+        return Result<void>::failure(
+            "capability error: Schem writer 需要临时 BlockData spool，allow_temporary_spool=false");
+    }
+    const auto budget = options.soft_memory_budget_bytes;
+    if (budget < 64u * 1024u) {
+        return Result<void>::failure("Schem writer soft_memory_budget 至少需要 64 KiB");
     }
     const auto size = structure.size();
     if (size.width <= 0 || size.height <= 0 || size.length <= 0 ||
@@ -180,6 +193,25 @@ Result<void> write_schem(
     double encode_ms = 0.0;
     const auto chunk_z_count = size.chunk_z_count();
     const auto chunk_x_count = size.chunk_x_count();
+    const auto chunk_count = static_cast<std::uint64_t>(chunk_x_count) *
+        static_cast<std::uint64_t>(chunk_z_count);
+    if (options.max_in_flight_chunks != 0 &&
+        chunk_count > options.max_in_flight_chunks) {
+        return Result<void>::failure(
+            "Schem writer 无法在 max_in_flight_chunks 窗口内保持整行 chunk；请增大窗口或使用直接流式 reader");
+    }
+    // Schem's protocol requires a seek-free row order.  Keep the transient
+    // row and copy buffers bounded by a fraction of the caller's budget.
+    const auto row_budget = std::max<std::size_t>(1, budget / 8);
+    const auto estimated_subchunks = static_cast<std::uint64_t>((size.height + 15) / 16);
+    const auto estimated_chunk_bytes = std::max<std::uint64_t>(64u * 1024u,
+        estimated_subchunks * 4096u * sizeof(std::uint32_t) + 8u * 1024u);
+    if (static_cast<std::uint64_t>(chunk_x_count) * estimated_chunk_bytes > budget) {
+        return Result<void>::failure(
+            "Schem writer 的单行 chunk 窗口超过 soft_memory_budget；无法安全物化输入");
+    }
+    const auto copy_buffer_size = std::max<std::size_t>(4096,
+        std::min<std::size_t>(kCopyBufferSize, budget / 16));
     std::uint64_t total_block_data = 0;
     for (int chunk_z = 0; chunk_z < chunk_z_count; ++chunk_z) {
         std::vector<ChunkPos> positions;
@@ -202,8 +234,13 @@ Result<void> write_schem(
         std::uint64_t stripe_size = 0;
         std::vector<const BlockLayer*> layers(static_cast<std::size_t>(chunk_x_count));
         std::vector<char> row_buffer;
-        row_buffer.resize(static_cast<std::size_t>(size.width) *
-            static_cast<std::size_t>(z_end - z_begin) * 5);
+        const auto row_capacity = static_cast<std::size_t>(size.width) *
+            static_cast<std::size_t>(z_end - z_begin) * 5;
+        if (row_capacity > row_budget) {
+            return Result<void>::failure(
+                "Schem writer row buffer 超过 soft_memory_budget；请降低读取窗口或增大预算");
+        }
+        row_buffer.resize(row_capacity);
         const auto palette_index_for = [&](const std::uint32_t runtime_id) {
             if (runtime_id < runtime_palette_cache.size()) {
                 const auto cached = runtime_palette_cache[runtime_id];
@@ -302,7 +339,8 @@ Result<void> write_schem(
         writer.write_tag("Height", nbt::tag_short(static_cast<std::int16_t>(size.height)));
         writer.write_tag("Length", nbt::tag_short(static_cast<std::int16_t>(size.length)));
         if (format == StructureId::SchemV1) {
-            auto written = write_byte_array(writer, "BlockData", temporary.files, size.height, total_block_data);
+            auto written = write_byte_array(writer, "BlockData", temporary.files, size.height,
+                total_block_data, copy_buffer_size);
             if (!written) return written;
             writer.write_tag("PaletteMax", nbt::tag_int(static_cast<std::int32_t>(palette.size())));
             writer.write_tag("Palette", encoded_palette);
@@ -310,7 +348,8 @@ Result<void> write_schem(
             writer.write_tag("Version", nbt::tag_int(2));
             writer.write_type(nbt::tag_type::Compound);
             writer.write_string("Blocks");
-            auto written = write_byte_array(writer, "Data", temporary.files, size.height, total_block_data);
+            auto written = write_byte_array(writer, "Data", temporary.files, size.height,
+                total_block_data, copy_buffer_size);
             if (!written) return written;
             writer.write_tag("Palette", encoded_palette);
             writer.write_type(nbt::tag_type::End);

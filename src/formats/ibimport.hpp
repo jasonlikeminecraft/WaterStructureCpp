@@ -4,6 +4,8 @@
 #include <WaterStructure/structure.hpp>
 
 #include <filesystem>
+#include <atomic>
+#include <mutex>
 #include <optional>
 #include <unordered_map>
 #include <vector>
@@ -44,7 +46,8 @@ private:
     std::vector<NbtBlock> mNbtBlocks;
     mutable std::unordered_map<ChunkPos, std::vector<std::uint32_t>, ChunkPosHash> mCommandIndex;
     mutable std::vector<std::uint32_t> mBroadCommands;
-    mutable bool mCommandIndexReady = false;
+    mutable std::atomic_bool mCommandIndexReady = false;
+    mutable std::mutex mCommandIndexMutex;
     mutable std::optional<std::size_t> mNonAirBlocks;
 };
 

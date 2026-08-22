@@ -6,10 +6,14 @@
 #include <BedrockWorldOperator/BedrockWorldOperator.hpp>
 
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <optional>
 
 namespace water_structure {
+
+struct WorldConversionOptions;
+class BdxStructure;
 
 namespace detail {
 class BoundedThreadPool;
@@ -33,6 +37,30 @@ struct ChunkWrite {
 struct EncodedSubChunkData {
     SubChunkPos pos{};
     std::vector<std::uint8_t> payload;
+};
+
+// Adapter-side stage counters. Encoding is CPU work (possibly parallel),
+// whereas LevelDB and archive commits are serialized; keeping them separate
+// prevents save time from being reported as one opaque I/O bucket.
+struct WorldIoStats {
+    std::uint64_t encode_compress_ms = 0;
+    std::uint64_t leveldb_write_ms = 0;
+    std::uint64_t leveldb_close_ms = 0;
+    std::uint64_t mcworld_unpack_ms = 0;
+    std::uint64_t mcworld_pack_ms = 0;
+    std::uint64_t compressed_output_bytes = 0;
+    std::uint64_t leveldb_batches = 0;
+    std::uint64_t temporary_spool_bytes = 0;
+};
+
+struct WorldOpenOptions {
+    bool write_back_archive = true;
+    bool allow_temporary_spool = true;
+    std::filesystem::path temporary_directory{};
+    // Zero is unlimited. For archive inputs this limits the declared total
+    // uncompressed size; for outputs it limits both the temporary world data
+    // and the generated archive before the atomic replace.
+    std::size_t temporary_file_limit_bytes = 0;
 };
 
 // Palette-preserving view of one subchunk. `indices` are in Bedrock native
@@ -61,6 +89,9 @@ public:
 class BedrockWorldAdapter final : public WorldSource, public WorldTarget {
 public:
     static Result<BedrockWorldAdapter> open(const std::filesystem::path& directory, bool write_back_archive = true);
+    static Result<BedrockWorldAdapter> open(
+        const std::filesystem::path& directory,
+        const WorldOpenOptions& options);
 
     BedrockWorldAdapter() = default;
     BedrockWorldAdapter(BedrockWorldAdapter&&) noexcept = default;
@@ -69,7 +100,15 @@ public:
     BedrockWorldAdapter& operator=(const BedrockWorldAdapter&) = delete;
     ~BedrockWorldAdapter() override;
 
+    // Call close() explicitly when a statistics callback was supplied. The
+    // destructor still closes and packs resources, but deliberately does not
+    // invoke user code because captures referenced by the callback may already
+    // have been destroyed during stack unwinding.
     Result<void> close();
+    // Close the LevelDB handle and remove only adapter-owned temporary files
+    // without creating/replacing the destination archive. Use this after a
+    // failed conversion so a partial .mcworld cannot overwrite a valid one.
+    Result<void> discard();
     bool valid() const noexcept;
     const std::filesystem::path& directory() const noexcept { return mDirectory; }
 
@@ -103,12 +142,32 @@ public:
     Result<void> save_chunk(ChunkPos pos, const ChunkData& chunk) override;
     Result<void> save_chunks(std::span<const ChunkWrite> chunks) override;
     Result<void> save_chunk_nbt(ChunkPos pos, std::span<const BlockEntity> entities) override;
+    void configure_conversion(const WorldConversionOptions& options) noexcept;
+    // Transfer and reset counters without adding a virtual to WorldTarget;
+    // third-party WorldTarget implementations therefore keep their ABI.
+    WorldIoStats take_io_stats() noexcept;
 
 private:
+    friend class BdxStructure;
+    friend Result<void> convert_to_world(
+        const IStructure& structure,
+        WorldTarget& world,
+        SubChunkPos start,
+        const WorldConversionOptions& options);
+
+    void defer_statistics(
+        ConversionStats stats,
+        std::function<void(const ConversionStats&)> callback) noexcept;
+    void emit_deferred_statistics(bool success, std::string_view error_stage = {}) noexcept;
+    Result<void> cleanup_temporary_artifacts();
+
     std::filesystem::path mDirectory;
     std::filesystem::path mArchivePath;
     std::filesystem::path mTemporaryDirectory;
+    std::filesystem::path mPendingArchivePath;
     bool mWriteBackArchive = true;
+    bool mDiscardOnClose = false;
+    std::size_t mTemporaryFileLimitBytes = 0;
     std::optional<BedrockWorldOperator::World> mWorld;
     // Lazily created so repeated save_chunks() calls (for example one Schem
     // Z stripe at a time) reuse the workers instead of creating threads for
@@ -116,8 +175,31 @@ private:
     // commits remain on the caller thread.
     mutable std::unique_ptr<detail::BoundedThreadPool, detail::BoundedThreadPoolDeleter> mEncodePool;
     mutable std::size_t mEncodePoolWorkers = 0;
+    mutable std::size_t mConfiguredWorkerCount = 0;
+    mutable std::size_t mConfiguredMaxInFlightChunks = 0;
+    mutable std::size_t mConfiguredSoftMemoryBudget = 450u * 1024u * 1024u;
+    mutable WorldIoStats mIoStats{};
+    std::optional<ConversionStats> mDeferredStats;
+    std::function<void(const ConversionStats&)> mDeferredStatisticsCallback;
+};
+
+struct WorldConversionOptions {
+    std::size_t worker_count = 0;
+    std::size_t max_in_flight_chunks = 0;
+    std::size_t soft_memory_budget_bytes = 450u * 1024u * 1024u;
+    bool allow_temporary_spool = true;
+    bool collect_statistics = false;
+    std::filesystem::path temporary_directory{};
+    std::size_t temporary_file_limit_bytes = 0;
+    bool profiling = false;
+    ConversionCallbacks callbacks{};
 };
 
 Result<void> convert_to_world(const IStructure& structure, WorldTarget& world, SubChunkPos start, ConversionCallbacks callbacks = {});
+Result<void> convert_to_world(
+    const IStructure& structure,
+    WorldTarget& world,
+    SubChunkPos start,
+    const WorldConversionOptions& options);
 
 } // namespace water_structure

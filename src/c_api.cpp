@@ -10,6 +10,7 @@
 #include <chrono>
 #include <filesystem>
 #include <memory>
+#include <limits>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -152,6 +153,40 @@ WATER_STRUCTURE_API uint32_t ws_abi_version(void)
     return 1;
 }
 
+WATER_STRUCTURE_API uint32_t ws_format_count(void)
+{
+    return static_cast<uint32_t>(water_structure::FormatRegistry::formats().size());
+}
+
+WATER_STRUCTURE_API const char* ws_format_name(uint8_t format_id)
+{
+    const auto& formats = water_structure::FormatRegistry::formats();
+    const auto found = std::find_if(formats.begin(), formats.end(),
+        [format_id](const auto& value) {
+            return static_cast<uint8_t>(value.id) == format_id;
+        });
+    return found == formats.end() ? "" : found->name.c_str();
+}
+
+WATER_STRUCTURE_API uint32_t ws_format_capabilities(uint8_t format_id)
+{
+    const auto& formats = water_structure::FormatRegistry::formats();
+    const auto found = std::find_if(formats.begin(), formats.end(),
+        [format_id](const auto& value) {
+            return static_cast<uint8_t>(value.id) == format_id;
+        });
+    if (found == formats.end()) return 0;
+    uint32_t flags = 0;
+    if (found->reader_implemented) flags |= WS_CAP_FILE_READER;
+    if (found->writer_implemented) flags |= WS_CAP_FILE_WRITER;
+    if (found->structure_to_world_implemented) flags |= WS_CAP_STRUCTURE_TO_WORLD;
+    if (found->world_to_structure_implemented) flags |= WS_CAP_WORLD_TO_STRUCTURE;
+    if (found->streaming_reader_implemented) flags |= WS_CAP_STREAMING_READER;
+    if (found->streaming_writer_implemented) flags |= WS_CAP_STREAMING_WRITER;
+    if (found->lossy_round_trip) flags |= WS_CAP_LOSSY_ROUND_TRIP;
+    return flags;
+}
+
 WATER_STRUCTURE_API ws_context* ws_context_create(const char* assets_directory_utf8)
 {
     try {
@@ -255,6 +290,10 @@ static int ws_convert_impl(
     uint64_t thread_count,
     int clear_air,
     int chunk_partition,
+    uint64_t soft_memory_budget_bytes,
+    uint64_t max_in_flight_tasks,
+    uint64_t max_in_flight_chunks,
+    int allow_temporary_spool,
     ws_progress_callback callback,
     void* user_data)
 {
@@ -268,8 +307,24 @@ static int ws_convert_impl(
             set_error(context, "unknown target format: " + std::string(target_format));
             return 0;
         }
+        const auto worker_limit = static_cast<std::size_t>(
+            std::min<std::uint64_t>(thread_count,
+                std::numeric_limits<std::size_t>::max()));
+        const auto chunk_limit = static_cast<std::size_t>(
+            std::min<std::uint64_t>(max_in_flight_chunks,
+                std::numeric_limits<std::size_t>::max()));
+        const auto memory_limit = soft_memory_budget_bytes == 0
+            ? 450u * 1024u * 1024u
+            : static_cast<std::size_t>(std::min<std::uint64_t>(
+                soft_memory_budget_bytes, std::numeric_limits<std::size_t>::max()));
         auto opened = water_structure::FormatRegistry::open(
-            water_structure::utf8_path(input_path_utf8), context->registry);
+            water_structure::utf8_path(input_path_utf8), context->registry,
+            {
+                .worker_count = worker_limit,
+                .max_in_flight_chunks = chunk_limit,
+                .soft_memory_budget_bytes = memory_limit,
+                .allow_temporary_spool = allow_temporary_spool != 0
+            });
         if (!opened) {
             set_error(context, opened.error());
             return 0;
@@ -278,9 +333,27 @@ static int ws_convert_impl(
         progress.start(WS_PROGRESS_READ, 1);
         progress.finish(WS_PROGRESS_READ);
         water_structure::ConversionOptions options;
-        options.thread_count = static_cast<std::size_t>(thread_count);
+        options.worker_count = worker_limit;
+        options.thread_count = worker_limit;
+        options.max_in_flight_tasks = static_cast<std::size_t>(
+            std::min<std::uint64_t>(max_in_flight_tasks,
+                std::numeric_limits<std::size_t>::max()));
         options.clear_air = clear_air != 0;
         options.mcfunction_chunk_partition = chunk_partition != 0;
+        if (soft_memory_budget_bytes != 0) {
+            options.soft_memory_budget_bytes = memory_limit;
+        }
+        options.max_in_flight_chunks = static_cast<std::size_t>(
+            std::min<std::uint64_t>(max_in_flight_chunks,
+                std::numeric_limits<std::size_t>::max()));
+        // Existing writers expose a task-window limiter. Until a reader has
+        // a separate chunk-stream queue, make the public chunk budget useful
+        // for those writers as well while preserving an explicitly supplied
+        // task limit's precedence.
+        if (options.max_in_flight_tasks == 0) {
+            options.max_in_flight_tasks = options.max_in_flight_chunks;
+        }
+        options.allow_temporary_spool = allow_temporary_spool != 0;
         if (callback != nullptr) {
             options.callbacks.start = [&progress](std::size_t total) {
                 progress.start(WS_PROGRESS_ENCODE, total);
@@ -317,7 +390,7 @@ WATER_STRUCTURE_API int ws_convert(
 {
     return ws_convert_impl(
         context, input_path_utf8, target_format, output_path_utf8,
-        thread_count, 1, 0, nullptr, nullptr);
+        thread_count, 1, 0, 0, 0, 0, 1, nullptr, nullptr);
 }
 
 WATER_STRUCTURE_API int ws_convert_ex(
@@ -330,7 +403,7 @@ WATER_STRUCTURE_API int ws_convert_ex(
 {
     return ws_convert_impl(
         context, input_path_utf8, target_format, output_path_utf8,
-        thread_count, clear_air, 0, nullptr, nullptr);
+        thread_count, clear_air, 0, 0, 0, 0, 1, nullptr, nullptr);
 }
 
 WATER_STRUCTURE_API int ws_convert_ex2(
@@ -344,7 +417,27 @@ WATER_STRUCTURE_API int ws_convert_ex2(
 {
     return ws_convert_impl(
         context, input_path_utf8, target_format, output_path_utf8,
-        thread_count, clear_air, chunk_partition, nullptr, nullptr);
+        thread_count, clear_air, chunk_partition, 0, 0, 0, 1, nullptr, nullptr);
+}
+
+WATER_STRUCTURE_API int ws_convert_ex3(
+    ws_context* context,
+    const char* input_path_utf8,
+    const char* target_format,
+    const char* output_path_utf8,
+    uint64_t thread_count,
+    int clear_air,
+    int chunk_partition,
+    uint64_t soft_memory_budget_bytes,
+    uint64_t max_in_flight_tasks,
+    uint64_t max_in_flight_chunks,
+    int allow_temporary_spool)
+{
+    return ws_convert_impl(
+        context, input_path_utf8, target_format, output_path_utf8,
+        thread_count, clear_air, chunk_partition,
+        soft_memory_budget_bytes, max_in_flight_tasks, max_in_flight_chunks,
+        allow_temporary_spool, nullptr, nullptr);
 }
 
 WATER_STRUCTURE_API int ws_convert_with_progress(
@@ -358,7 +451,7 @@ WATER_STRUCTURE_API int ws_convert_with_progress(
 {
     return ws_convert_impl(
         context, input_path_utf8, target_format, output_path_utf8,
-        thread_count, 1, 0, callback, user_data);
+        thread_count, 1, 0, 0, 0, 0, 1, callback, user_data);
 }
 
 WATER_STRUCTURE_API int ws_convert_with_progress_ex(
@@ -373,7 +466,7 @@ WATER_STRUCTURE_API int ws_convert_with_progress_ex(
 {
     return ws_convert_impl(
         context, input_path_utf8, target_format, output_path_utf8,
-        thread_count, clear_air, 0, callback, user_data);
+        thread_count, clear_air, 0, 0, 0, 0, 1, callback, user_data);
 }
 
 WATER_STRUCTURE_API int ws_convert_with_progress_ex2(
@@ -389,7 +482,30 @@ WATER_STRUCTURE_API int ws_convert_with_progress_ex2(
 {
     return ws_convert_impl(
         context, input_path_utf8, target_format, output_path_utf8,
-        thread_count, clear_air, chunk_partition, callback, user_data);
+        thread_count, clear_air, chunk_partition, 0, 0, 0, 1,
+        callback, user_data);
+}
+
+WATER_STRUCTURE_API int ws_convert_with_progress_ex3(
+    ws_context* context,
+    const char* input_path_utf8,
+    const char* target_format,
+    const char* output_path_utf8,
+    uint64_t thread_count,
+    int clear_air,
+    int chunk_partition,
+    uint64_t soft_memory_budget_bytes,
+    uint64_t max_in_flight_tasks,
+    uint64_t max_in_flight_chunks,
+    int allow_temporary_spool,
+    ws_progress_callback callback,
+    void* user_data)
+{
+    return ws_convert_impl(
+        context, input_path_utf8, target_format, output_path_utf8,
+        thread_count, clear_air, chunk_partition,
+        soft_memory_budget_bytes, max_in_flight_tasks, max_in_flight_chunks,
+        allow_temporary_spool, callback, user_data);
 }
 
 static int ws_to_world_impl(
@@ -399,6 +515,10 @@ static int ws_to_world_impl(
     int32_t start_x,
     int32_t start_y,
     int32_t start_z,
+    uint64_t worker_count,
+    uint64_t soft_memory_budget_bytes,
+    uint64_t max_in_flight_chunks,
+    int allow_temporary_spool,
     ws_progress_callback callback,
     void* user_data)
 {
@@ -410,7 +530,16 @@ static int ws_to_world_impl(
             water_structure::utf8_path(input_path_utf8), context->registry,
             {
                 .streaming_world_import = true,
-                .direct_schem_world_stream = true
+                .direct_schem_world_stream = true,
+                .worker_count = static_cast<std::size_t>(std::min<std::uint64_t>(
+                    worker_count, std::numeric_limits<std::size_t>::max())),
+                .max_in_flight_chunks = static_cast<std::size_t>(std::min<std::uint64_t>(
+                    max_in_flight_chunks, std::numeric_limits<std::size_t>::max())),
+                .soft_memory_budget_bytes = soft_memory_budget_bytes == 0
+                    ? 450u * 1024u * 1024u
+                    : static_cast<std::size_t>(std::min<std::uint64_t>(
+                        soft_memory_budget_bytes, std::numeric_limits<std::size_t>::max())),
+                .allow_temporary_spool = allow_temporary_spool != 0
             });
         if (!opened) {
             set_error(context, opened.error());
@@ -420,12 +549,24 @@ static int ws_to_world_impl(
         progress.start(WS_PROGRESS_READ, 1);
         progress.finish(WS_PROGRESS_READ);
         auto world = water_structure::BedrockWorldAdapter::open(
-            water_structure::utf8_path(world_path_utf8));
+            water_structure::utf8_path(world_path_utf8),
+            water_structure::WorldOpenOptions{
+                .allow_temporary_spool = allow_temporary_spool != 0
+            });
         if (!world) {
             set_error(context, world.error());
             return 0;
         }
         water_structure::ConversionCallbacks callbacks;
+        callbacks.worker_count = static_cast<std::size_t>(std::min<std::uint64_t>(
+            worker_count, std::numeric_limits<std::size_t>::max()));
+        callbacks.max_in_flight_chunks = static_cast<std::size_t>(std::min<std::uint64_t>(
+            max_in_flight_chunks, std::numeric_limits<std::size_t>::max()));
+        callbacks.soft_memory_budget_bytes = soft_memory_budget_bytes == 0
+            ? 450u * 1024u * 1024u
+            : static_cast<std::size_t>(std::min<std::uint64_t>(
+                soft_memory_budget_bytes, std::numeric_limits<std::size_t>::max()));
+        callbacks.allow_temporary_spool = allow_temporary_spool != 0;
         if (callback != nullptr) {
             callbacks.start = [&progress](std::size_t total) {
                 progress.start(WS_PROGRESS_WRITE, total);
@@ -437,7 +578,10 @@ static int ws_to_world_impl(
         auto converted = opened.value()->write_to_world(
             world.value(), { start_x, start_y, start_z }, std::move(callbacks));
         if (!converted) {
-            set_error(context, converted.error());
+            auto message = converted.error();
+            const auto discarded = world.value().discard();
+            if (!discarded) message += "; discard failed: " + discarded.error();
+            set_error(context, std::move(message));
             return 0;
         }
         auto closed = world.value().close();
@@ -467,7 +611,7 @@ WATER_STRUCTURE_API int ws_to_world(
 {
     return ws_to_world_impl(
         context, input_path_utf8, world_path_utf8,
-        start_x, start_y, start_z, nullptr, nullptr);
+        start_x, start_y, start_z, 0, 0, 0, 1, nullptr, nullptr);
 }
 
 WATER_STRUCTURE_API int ws_to_world_with_progress(
@@ -482,7 +626,43 @@ WATER_STRUCTURE_API int ws_to_world_with_progress(
 {
     return ws_to_world_impl(
         context, input_path_utf8, world_path_utf8,
-        start_x, start_y, start_z, callback, user_data);
+        start_x, start_y, start_z, 0, 0, 0, 1, callback, user_data);
+}
+
+WATER_STRUCTURE_API int ws_to_world_ex3(
+    ws_context* context,
+    const char* input_path_utf8,
+    const char* world_path_utf8,
+    int32_t start_x,
+    int32_t start_y,
+    int32_t start_z,
+    uint64_t worker_count,
+    uint64_t soft_memory_budget_bytes,
+    uint64_t max_in_flight_chunks,
+    int allow_temporary_spool)
+{
+    return ws_to_world_impl(context, input_path_utf8, world_path_utf8,
+        start_x, start_y, start_z, worker_count, soft_memory_budget_bytes,
+        max_in_flight_chunks, allow_temporary_spool, nullptr, nullptr);
+}
+
+WATER_STRUCTURE_API int ws_to_world_with_progress_ex3(
+    ws_context* context,
+    const char* input_path_utf8,
+    const char* world_path_utf8,
+    int32_t start_x,
+    int32_t start_y,
+    int32_t start_z,
+    uint64_t worker_count,
+    uint64_t soft_memory_budget_bytes,
+    uint64_t max_in_flight_chunks,
+    int allow_temporary_spool,
+    ws_progress_callback callback,
+    void* user_data)
+{
+    return ws_to_world_impl(context, input_path_utf8, world_path_utf8,
+        start_x, start_y, start_z, worker_count, soft_memory_budget_bytes,
+        max_in_flight_chunks, allow_temporary_spool, callback, user_data);
 }
 
 } // extern "C"

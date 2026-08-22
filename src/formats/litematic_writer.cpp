@@ -111,12 +111,34 @@ nbt::tag_compound palette_entry(const BlockState& state)
 Result<void> write_litematic(
     const IStructure& structure,
     RuntimeRegistry& registry,
-    const std::filesystem::path& output_path)
+    const std::filesystem::path& output_path,
+    const ConversionOptions& options)
 {
     const auto size = structure.size();
     if (size.width <= 0 || size.height <= 0 || size.length <= 0 ||
         size.volume() <= 0 || size.volume() > std::numeric_limits<std::int32_t>::max()) {
         return Result<void>::failure("Litematic 输出尺寸无效或体积超过 int32");
+    }
+    const auto budget = options.soft_memory_budget_bytes;
+    if (budget < 64u * 1024u) {
+        return Result<void>::failure("Litematic writer soft_memory_budget 至少需要 64 KiB");
+    }
+    const auto chunk_count = static_cast<std::uint64_t>(size.chunk_x_count()) *
+        static_cast<std::uint64_t>(size.chunk_z_count());
+    if (options.max_in_flight_chunks != 0 &&
+        chunk_count > options.max_in_flight_chunks) {
+        return Result<void>::failure(
+            "Litematic writer 需要读取完整 chunk 集合，超过 max_in_flight_chunks");
+    }
+    const auto estimated_subchunks = static_cast<std::uint64_t>((size.height + 15) / 16);
+    const auto estimated_chunk_bytes = std::max<std::uint64_t>(64u * 1024u,
+        estimated_subchunks * 4096u * sizeof(std::uint32_t) + 8u * 1024u);
+    const auto bits_upper_bound = std::uint64_t{32};
+    const auto packed_upper_bound =
+        (static_cast<std::uint64_t>(size.volume()) * bits_upper_bound + 63) / 64 * sizeof(std::int64_t);
+    if (chunk_count * estimated_chunk_bytes + packed_upper_bound > budget) {
+        return Result<void>::failure(
+            "Litematic writer 需要的 chunk/packed 窗口超过 soft_memory_budget");
     }
     std::vector<ChunkPos> positions;
     positions.reserve(static_cast<std::size_t>(size.chunk_x_count()) * size.chunk_z_count());

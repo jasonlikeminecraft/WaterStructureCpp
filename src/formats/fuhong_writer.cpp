@@ -276,7 +276,8 @@ Result<void> write_fuhong(
     const IStructure& structure,
     RuntimeRegistry& registry,
     StructureId format,
-    const std::filesystem::path& output_path)
+    const std::filesystem::path& output_path,
+    const ConversionOptions& options)
 {
     if (format != StructureId::FuHongV4 && format != StructureId::FuHongV5) {
         return Result<void>::failure("FuHong writer 收到不支持的版本");
@@ -285,35 +286,46 @@ Result<void> write_fuhong(
     if (size.width <= 0 || size.height <= 0 || size.length <= 0 || size.volume() <= 0) {
         return Result<void>::failure("FuHong 输出尺寸无效");
     }
+    const auto budget = options.soft_memory_budget_bytes;
+    if (budget < 64u * 1024u) {
+        return Result<void>::failure("FuHong writer soft_memory_budget 至少需要 64 KiB");
+    }
+    // FuHong's JSON protocol stores coordinate arrays for every non-air block
+    // and therefore cannot be made genuinely streaming without changing the
+    // wire format.  Reject conversions whose unavoidable group payload would
+    // exceed the requested budget instead of silently growing the heap.
+    if (auto non_air = structure.count_non_air_blocks(); non_air &&
+        non_air.value() > budget / 32u) {
+        return Result<void>::failure(
+            "FuHong writer 的 JSON 坐标数组超过 soft_memory_budget；当前协议不支持安全 spool");
+    }
     try {
-        std::vector<ChunkPos> positions;
-        for (int chunk_x = 0; chunk_x < size.chunk_x_count(); ++chunk_x) {
-            for (int chunk_z = 0; chunk_z < size.chunk_z_count(); ++chunk_z) {
-                positions.push_back({ chunk_x, chunk_z });
-            }
-        }
-        auto entities = structure.get_chunk_nbt(positions);
-        if (!entities) throw std::runtime_error("生成 FuHong NBT 失败: " + entities.error());
-        std::unordered_map<BlockPos, std::unique_ptr<nbt::tag_compound>, BlockPosHash> entity_by_pos;
-        for (const auto& [chunk, values] : entities.value()) {
-            for (const auto& entity : values) {
-                if (entity.payload.empty()) continue;
-                const std::string bytes(entity.payload.begin(), entity.payload.end());
-                std::istringstream input(bytes, std::ios::binary);
-                auto [_, compound] = nbt::io::read_compound(input, endian::little);
-                entity_by_pos.emplace(BlockPos{
-                    chunk.x * 16 + entity.pos.x,
-                    entity.pos.y - kOverworldMinY,
-                    chunk.z * 16 + entity.pos.z }, std::move(compound));
-            }
-        }
-
         std::vector<std::string> palette{ "minecraft:air" };
         std::unordered_map<std::string, std::int32_t> palette_indices{ { "minecraft:air", 0 } };
         std::unordered_map<std::uint32_t, PaletteValue> resolved;
         std::map<std::pair<std::string, std::int32_t>, Group> groups;
-        for (const auto chunk_position : positions) {
+        for (int chunk_x = 0; chunk_x < size.chunk_x_count(); ++chunk_x) {
+            for (int chunk_z = 0; chunk_z < size.chunk_z_count(); ++chunk_z) {
+            const ChunkPos chunk_position{ chunk_x, chunk_z };
             const std::array<ChunkPos, 1> request{ chunk_position };
+            auto entities = structure.get_chunk_nbt(request);
+            if (!entities) throw std::runtime_error("生成 FuHong NBT 失败: " + entities.error());
+            std::unordered_map<BlockPos, std::unique_ptr<nbt::tag_compound>, BlockPosHash>
+                entity_by_pos;
+            if (const auto found_entities = entities.value().find(chunk_position);
+                found_entities != entities.value().end()) {
+                entity_by_pos.reserve(found_entities->second.size());
+                for (const auto& entity : found_entities->second) {
+                    if (entity.payload.empty()) continue;
+                    const std::string bytes(entity.payload.begin(), entity.payload.end());
+                    std::istringstream input(bytes, std::ios::binary);
+                    auto [_, compound] = nbt::io::read_compound(input, endian::little);
+                    entity_by_pos.emplace(BlockPos{
+                        chunk_position.x * 16 + entity.pos.x,
+                        entity.pos.y - kOverworldMinY,
+                        chunk_position.z * 16 + entity.pos.z }, std::move(compound));
+                }
+            }
             auto chunks = structure.get_chunks_layer0(request);
             if (!chunks) throw std::runtime_error("生成 FuHong chunk 失败: " + chunks.error());
             const auto chunk_it = chunks.value().find(chunk_position);
@@ -347,6 +359,7 @@ Result<void> write_fuhong(
                         }
                     }
                 }
+            }
             }
         }
         if (groups.empty()) return Result<void>::failure("FuHong 未导出任何方块");

@@ -20,9 +20,11 @@
 #include <map>
 #include <optional>
 #include <sstream>
+#include <streambuf>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -32,12 +34,6 @@ namespace {
 constexpr std::string_view kFuHongV5Key = "FuHongBuild";
 constexpr std::size_t kStreamChunk = 64 * 1024;
 constexpr std::size_t kMaxDecodedBytes = 2ull * 1024 * 1024 * 1024;
-
-struct PendingBlock {
-    BlockPos world{};
-    std::uint32_t runtime_id = 0;
-    std::optional<NbtPayload> nbt;
-};
 
 struct Bounds {
     bool populated = false;
@@ -134,17 +130,6 @@ std::int32_t checked_add(std::int32_t left, std::int32_t right, std::string_view
         throw std::runtime_error(std::string(field) + " exceeds int32");
     }
     return static_cast<std::int32_t>(result);
-}
-
-std::vector<std::int32_t> coordinates(const nlohmann::json& value, std::string_view field)
-{
-    if (!value.is_array()) throw std::runtime_error(std::string(field) + " is not an array");
-    std::vector<std::int32_t> result;
-    result.reserve(value.size());
-    for (std::size_t index = 0; index < value.size(); ++index) {
-        result.push_back(i32(value[index], std::string(field) + "[" + std::to_string(index) + "]"));
-    }
-    return result;
 }
 
 std::int32_t first_coordinate(const nlohmann::json& value, std::string_view field)
@@ -383,112 +368,258 @@ std::unique_ptr<nbt::tag_compound> extra_nbt(
     return {};
 }
 
-std::vector<std::uint8_t> inflate_zlib(const std::filesystem::path& path)
-{
-    std::ifstream input(path, std::ios::binary);
-    if (!input) throw std::runtime_error("cannot open FuHongV5 file: " + path.string());
-    z_stream stream{};
-    if (inflateInit(&stream) != Z_OK) throw std::runtime_error("initialize FuHongV5 zlib failed");
-    struct Guard { z_stream* stream; ~Guard() { inflateEnd(stream); } } guard{ &stream };
-    std::array<std::uint8_t, kStreamChunk> compressed{};
-    std::array<std::uint8_t, kStreamChunk> decoded{};
-    std::vector<std::uint8_t> output;
-    int status = Z_OK;
-    while (status != Z_STREAM_END) {
-        if (stream.avail_in == 0) {
-            input.read(reinterpret_cast<char*>(compressed.data()),
-                static_cast<std::streamsize>(compressed.size()));
-            const auto count = input.gcount();
-            if (count <= 0) {
-                throw std::runtime_error("FuHongV5 zlib stream truncated at compressed offset " +
-                    std::to_string(stream.total_in));
+// V5 used to materialize compressed input, inflated ciphertext and decrypted
+// JSON at the same time.  These two stream buffers retain only 64 KiB windows;
+// nlohmann consumes the decrypted bytes directly from the outer stream.
+class FuHongV5InflateBuffer final : public std::streambuf {
+public:
+    explicit FuHongV5InflateBuffer(const std::filesystem::path& path)
+        : mInput(path, std::ios::binary)
+    {
+        if (!mInput) throw std::runtime_error("cannot open FuHongV5 file: " + path.string());
+        if (inflateInit(&mStream) != Z_OK) {
+            throw std::runtime_error("initialize FuHongV5 zlib failed");
+        }
+        mInitialized = true;
+        setg(mDecoded.data(), mDecoded.data(), mDecoded.data());
+    }
+
+    ~FuHongV5InflateBuffer() override
+    {
+        if (mInitialized) inflateEnd(&mStream);
+    }
+
+protected:
+    int_type underflow() override
+    {
+        if (gptr() != nullptr && gptr() < egptr()) {
+            return traits_type::to_int_type(*gptr());
+        }
+        if (mFinished) return traits_type::eof();
+
+        while (true) {
+            if (mStream.avail_in == 0 && !mInputEof) {
+                mInput.read(reinterpret_cast<char*>(mCompressed.data()),
+                    static_cast<std::streamsize>(mCompressed.size()));
+                const auto count = mInput.gcount();
+                if (count > 0) {
+                    mStream.next_in = mCompressed.data();
+                    mStream.avail_in = static_cast<uInt>(count);
+                } else {
+                    if (mInput.bad()) {
+                        throw std::runtime_error(
+                            "FuHongV5 zlib read failed at compressed offset " +
+                            std::to_string(mStream.total_in));
+                    }
+                    mInputEof = true;
+                }
             }
-            stream.next_in = compressed.data();
-            stream.avail_in = static_cast<uInt>(count);
-        }
-        stream.next_out = decoded.data();
-        stream.avail_out = static_cast<uInt>(decoded.size());
-        status = inflate(&stream, Z_NO_FLUSH);
-        if (status != Z_OK && status != Z_STREAM_END) {
-            throw std::runtime_error("FuHongV5 zlib decode failed at compressed offset " +
-                std::to_string(stream.total_in));
-        }
-        const auto produced = decoded.size() - stream.avail_out;
-        if (output.size() > kMaxDecodedBytes - produced) {
-            throw std::runtime_error("FuHongV5 decoded payload exceeds 2 GiB");
-        }
-        output.insert(output.end(), decoded.begin(),
-            decoded.begin() + static_cast<std::ptrdiff_t>(produced));
-    }
-    return output;
-}
 
-std::pair<std::uint32_t, std::size_t> decode_utf8(
-    std::span<const std::uint8_t> data, std::size_t offset)
-{
-    const auto first = data[offset];
-    std::size_t length = 0;
-    std::uint32_t value = 0;
-    if (first < 0x80) { length = 1; value = first; }
-    else if ((first & 0xe0) == 0xc0) { length = 2; value = first & 0x1f; }
-    else if ((first & 0xf0) == 0xe0) { length = 3; value = first & 0x0f; }
-    else if ((first & 0xf8) == 0xf0) { length = 4; value = first & 0x07; }
-    else throw std::runtime_error("FuHongV5 invalid UTF-8 at decoded offset " + std::to_string(offset));
-    if (length > data.size() - offset) {
-        throw std::runtime_error("FuHongV5 UTF-8 truncated at decoded offset " + std::to_string(offset));
-    }
-    for (std::size_t index = 1; index < length; ++index) {
-        const auto next = data[offset + index];
-        if ((next & 0xc0) != 0x80) {
-            throw std::runtime_error("FuHongV5 invalid UTF-8 at decoded offset " + std::to_string(offset));
+            mStream.next_out = reinterpret_cast<Bytef*>(mDecoded.data());
+            mStream.avail_out = static_cast<uInt>(mDecoded.size());
+            const auto status = inflate(&mStream, Z_NO_FLUSH);
+            if (status != Z_OK && status != Z_STREAM_END) {
+                throw std::runtime_error(
+                    "FuHongV5 zlib decode failed at compressed offset " +
+                    std::to_string(mStream.total_in));
+            }
+            const auto produced = mDecoded.size() - mStream.avail_out;
+            if (mDecodedBytes > kMaxDecodedBytes - produced) {
+                throw std::runtime_error("FuHongV5 decoded payload exceeds 2 GiB");
+            }
+            mDecodedBytes += produced;
+            if (status == Z_STREAM_END) mFinished = true;
+            if (mInputEof && !mFinished && produced == 0) {
+                throw std::runtime_error(
+                    "FuHongV5 zlib stream truncated at compressed offset " +
+                    std::to_string(mStream.total_in));
+            }
+            if (produced != 0) {
+                setg(mDecoded.data(), mDecoded.data(), mDecoded.data() + produced);
+                return traits_type::to_int_type(*gptr());
+            }
+            if (mFinished) return traits_type::eof();
         }
-        value = (value << 6) | (next & 0x3f);
     }
-    const auto minimum = std::array<std::uint32_t, 5>{ 0, 0, 0x80, 0x800, 0x10000 };
-    if (value < minimum[length] || value > 0x10ffff || (value >= 0xd800 && value <= 0xdfff)) {
-        throw std::runtime_error("FuHongV5 invalid UTF-8 rune at decoded offset " + std::to_string(offset));
-    }
-    return { value, length };
-}
 
-void append_utf8(std::string& output, std::uint32_t value)
-{
-    if (value <= 0x7f) output.push_back(static_cast<char>(value));
-    else if (value <= 0x7ff) {
-        output.push_back(static_cast<char>(0xc0 | (value >> 6)));
-        output.push_back(static_cast<char>(0x80 | (value & 0x3f)));
-    } else if (value <= 0xffff) {
-        output.push_back(static_cast<char>(0xe0 | (value >> 12)));
-        output.push_back(static_cast<char>(0x80 | ((value >> 6) & 0x3f)));
-        output.push_back(static_cast<char>(0x80 | (value & 0x3f)));
-    } else {
-        output.push_back(static_cast<char>(0xf0 | (value >> 18)));
-        output.push_back(static_cast<char>(0x80 | ((value >> 12) & 0x3f)));
-        output.push_back(static_cast<char>(0x80 | ((value >> 6) & 0x3f)));
-        output.push_back(static_cast<char>(0x80 | (value & 0x3f)));
-    }
-}
+private:
+    std::ifstream mInput;
+    z_stream mStream{};
+    bool mInitialized = false;
+    bool mInputEof = false;
+    bool mFinished = false;
+    std::size_t mDecodedBytes = 0;
+    std::array<Bytef, kStreamChunk> mCompressed{};
+    std::array<char, kStreamChunk> mDecoded{};
+};
 
-std::string decode_v5(std::span<const std::uint8_t> encrypted)
-{
-    if (encrypted.empty()) throw std::runtime_error("FuHongV5 payload is empty");
-    std::string result;
-    result.reserve(encrypted.size());
-    std::size_t offset = 0;
-    std::size_t rune_index = 0;
-    while (offset < encrypted.size()) {
-        auto [value, length] = decode_utf8(encrypted, offset);
-        const auto shifted = static_cast<std::int64_t>(value) - static_cast<std::int64_t>(rune_index % 3);
-        const auto plain = shifted ^ static_cast<unsigned char>(kFuHongV5Key[rune_index % kFuHongV5Key.size()]);
-        if (plain < 0 || plain > 0x10ffff || (plain >= 0xd800 && plain <= 0xdfff)) {
-            throw std::runtime_error("FuHongV5 invalid decrypted rune at rune index " +
-                std::to_string(rune_index));
+class FuHongV5DecryptBuffer final : public std::streambuf {
+public:
+    explicit FuHongV5DecryptBuffer(std::streambuf& encrypted) : mEncrypted(encrypted)
+    {
+        setg(mPlain.data(), mPlain.data(), mPlain.data());
+    }
+
+protected:
+    int_type underflow() override
+    {
+        if (gptr() != nullptr && gptr() < egptr()) {
+            return traits_type::to_int_type(*gptr());
         }
-        append_utf8(result, static_cast<std::uint32_t>(plain));
-        offset += length;
-        ++rune_index;
+        if (mFinished) return traits_type::eof();
+
+        std::size_t produced = 0;
+        while (produced + 4 <= mPlain.size()) {
+            const auto first = read_byte();
+            if (!first) {
+                if (mRuneIndex == 0) {
+                    throw std::runtime_error("FuHongV5 payload is empty");
+                }
+                mFinished = true;
+                break;
+            }
+            const auto rune_offset = mEncryptedOffset - 1;
+            std::size_t length = 0;
+            std::uint32_t value = 0;
+            if (*first < 0x80) { length = 1; value = *first; }
+            else if ((*first & 0xe0) == 0xc0) { length = 2; value = *first & 0x1f; }
+            else if ((*first & 0xf0) == 0xe0) { length = 3; value = *first & 0x0f; }
+            else if ((*first & 0xf8) == 0xf0) { length = 4; value = *first & 0x07; }
+            else {
+                throw std::runtime_error(
+                    "FuHongV5 invalid UTF-8 at decoded offset " +
+                    std::to_string(rune_offset));
+            }
+            for (std::size_t index = 1; index < length; ++index) {
+                const auto next = read_byte();
+                if (!next) {
+                    throw std::runtime_error(
+                        "FuHongV5 UTF-8 truncated at decoded offset " +
+                        std::to_string(rune_offset));
+                }
+                if ((*next & 0xc0) != 0x80) {
+                    throw std::runtime_error(
+                        "FuHongV5 invalid UTF-8 at decoded offset " +
+                        std::to_string(rune_offset));
+                }
+                value = (value << 6) | (*next & 0x3f);
+            }
+            constexpr std::array<std::uint32_t, 5> minimum{
+                0, 0, 0x80, 0x800, 0x10000
+            };
+            if (value < minimum[length] || value > 0x10ffff ||
+                (value >= 0xd800 && value <= 0xdfff)) {
+                throw std::runtime_error(
+                    "FuHongV5 invalid UTF-8 rune at decoded offset " +
+                    std::to_string(rune_offset));
+            }
+
+            const auto shifted = static_cast<std::int64_t>(value) -
+                static_cast<std::int64_t>(mRuneIndex % 3);
+            const auto plain = shifted ^ static_cast<unsigned char>(
+                kFuHongV5Key[mRuneIndex % kFuHongV5Key.size()]);
+            if (plain < 0 || plain > 0x10ffff ||
+                (plain >= 0xd800 && plain <= 0xdfff)) {
+                throw std::runtime_error(
+                    "FuHongV5 invalid decrypted rune at rune index " +
+                    std::to_string(mRuneIndex));
+            }
+            produced += append_utf8(
+                mPlain.data() + produced, static_cast<std::uint32_t>(plain));
+            ++mRuneIndex;
+        }
+
+        if (produced == 0) return traits_type::eof();
+        setg(mPlain.data(), mPlain.data(), mPlain.data() + produced);
+        return traits_type::to_int_type(*gptr());
     }
-    return result;
+
+private:
+    std::optional<std::uint8_t> read_byte()
+    {
+        if (mEncryptedCursor == mEncryptedSize) {
+            const auto count = mEncrypted.sgetn(
+                reinterpret_cast<char*>(mEncryptedChunk.data()),
+                static_cast<std::streamsize>(mEncryptedChunk.size()));
+            if (count <= 0) return std::nullopt;
+            mEncryptedCursor = 0;
+            mEncryptedSize = static_cast<std::size_t>(count);
+        }
+        ++mEncryptedOffset;
+        return mEncryptedChunk[mEncryptedCursor++];
+    }
+
+    static std::size_t append_utf8(char* output, std::uint32_t value)
+    {
+        if (value <= 0x7f) {
+            output[0] = static_cast<char>(value);
+            return 1;
+        }
+        if (value <= 0x7ff) {
+            output[0] = static_cast<char>(0xc0 | (value >> 6));
+            output[1] = static_cast<char>(0x80 | (value & 0x3f));
+            return 2;
+        }
+        if (value <= 0xffff) {
+            output[0] = static_cast<char>(0xe0 | (value >> 12));
+            output[1] = static_cast<char>(0x80 | ((value >> 6) & 0x3f));
+            output[2] = static_cast<char>(0x80 | (value & 0x3f));
+            return 3;
+        }
+        output[0] = static_cast<char>(0xf0 | (value >> 18));
+        output[1] = static_cast<char>(0x80 | ((value >> 12) & 0x3f));
+        output[2] = static_cast<char>(0x80 | ((value >> 6) & 0x3f));
+        output[3] = static_cast<char>(0x80 | (value & 0x3f));
+        return 4;
+    }
+
+    std::streambuf& mEncrypted;
+    bool mFinished = false;
+    std::size_t mEncryptedOffset = 0;
+    std::size_t mRuneIndex = 0;
+    std::size_t mEncryptedCursor = 0;
+    std::size_t mEncryptedSize = 0;
+    std::array<std::uint8_t, kStreamChunk> mEncryptedChunk{};
+    std::array<char, kStreamChunk> mPlain{};
+};
+
+class FuHongV5InputStream final : public std::istream {
+public:
+    explicit FuHongV5InputStream(const std::filesystem::path& path)
+        : std::istream(nullptr), mInflated(path), mDecrypted(mInflated)
+    {
+        rdbuf(&mDecrypted);
+        clear();
+        exceptions(std::ios::badbit);
+    }
+
+private:
+    FuHongV5InflateBuffer mInflated;
+    FuHongV5DecryptBuffer mDecrypted;
+};
+
+template <typename Callback>
+void parse_json_pass(const std::filesystem::path& path, StructureId version,
+                     Callback&& callback)
+{
+    if (version == StructureId::FuHongV5) {
+        FuHongV5InputStream input(path);
+        const auto discarded = nlohmann::json::parse(
+            input, std::forward<Callback>(callback));
+        (void)discarded;
+        return;
+    }
+    std::ifstream input(path, std::ios::binary);
+    if (!input) {
+        throw std::runtime_error(
+            "cannot open " + std::string(version == StructureId::FuHongV1 ? "FuHongV1" :
+                version == StructureId::FuHongV2 ? "FuHongV2" :
+                version == StructureId::FuHongV3 ? "FuHongV3" : "FuHongV4") +
+            " file: " + path.string());
+    }
+    const auto discarded = nlohmann::json::parse(
+        input, std::forward<Callback>(callback));
+    (void)discarded;
 }
 
 } // namespace
@@ -600,78 +731,118 @@ Result<void> FuHongStructure::read(const std::filesystem::path& path)
     mPaletteCache.clear();
     mNonAirBlocks = 0;
     try {
-        nlohmann::json root;
-        if (mVersion == StructureId::FuHongV5) {
-            const auto encrypted = inflate_zlib(path);
-            root = nlohmann::json::parse(decode_v5(encrypted));
-        } else {
-            std::ifstream input(path, std::ios::binary);
-            if (!input) throw std::runtime_error("cannot open " + std::string(name()) + " file: " + path.string());
-            root = nlohmann::json::parse(input);
-        }
-
-        std::map<BlockPos, PendingBlock, std::less<>> blocks;
         Bounds bounds;
+        std::size_t materialized_blocks = 0;
 
         if (mVersion == StructureId::FuHongV1) {
-            if (!root.is_array() || root.empty()) throw std::runtime_error("root is not a non-empty array");
-            for (std::size_t index = 0; index < root.size(); ++index) {
-                try {
-                    const auto& raw = root[index];
-                    if (!raw.is_object()) throw std::runtime_error("block is not an object");
-                    const auto block_name = trim(raw.value("name", std::string{}));
-                    if (block_name.empty()) throw std::runtime_error("block name is empty");
-                    if (!raw.contains("x") || !raw.contains("y") || !raw.contains("z")) {
-                        throw std::runtime_error("block coordinates are missing");
+            // The first SAX pass determines the origin.  The second pass writes
+            // directly into SparseBlockStore, so there is never a second full
+            // coordinate->block map beside the final sparse representation.
+            const auto parse_v1 = [&](bool materialize) {
+                bool root_is_array = false;
+                std::size_t block_index = 0;
+                const auto consume = [&](const nlohmann::json& raw) {
+                    const auto index = block_index++;
+                    try {
+                        if (!raw.is_object()) {
+                            throw std::runtime_error("block is not an object");
+                        }
+                        const auto block_name = trim(raw.value("name", std::string{}));
+                        if (block_name.empty()) {
+                            throw std::runtime_error("block name is empty");
+                        }
+                        if (!raw.contains("x") || !raw.contains("y") ||
+                            !raw.contains("z")) {
+                            throw std::runtime_error("block coordinates are missing");
+                        }
+                        const auto aux = raw.contains("aux") && !raw["aux"].is_null()
+                            ? integer(raw["aux"], "aux") : 0;
+                        const BlockPos world{ first_coordinate(raw["x"], "x"),
+                            first_coordinate(raw["y"], "y"),
+                            first_coordinate(raw["z"], "z") };
+                        if (materialize) {
+                            mStore.put(local_position(world, bounds.minimum),
+                                runtime_id(block_name, aux));
+                            ++materialized_blocks;
+                        } else {
+                            bounds.add(world);
+                        }
+                    } catch (const std::exception& error) {
+                        throw std::runtime_error("block index " + std::to_string(index) +
+                            ": " + error.what());
                     }
-                    const auto aux = raw.contains("aux") && !raw["aux"].is_null()
-                        ? integer(raw["aux"], "aux") : 0;
-                    const BlockPos world{ first_coordinate(raw["x"], "x"),
-                        first_coordinate(raw["y"], "y"), first_coordinate(raw["z"], "z") };
-                    blocks[world] = { world, runtime_id(block_name, aux), std::nullopt };
-                    bounds.add(world);
-                } catch (const std::exception& error) {
-                    throw std::runtime_error("block index " + std::to_string(index) + ": " + error.what());
+                };
+                const auto callback = [&](int depth, nlohmann::json::parse_event_t event,
+                                          nlohmann::json& parsed) -> bool {
+                    if (depth == 0) {
+                        if (event == nlohmann::json::parse_event_t::array_start) {
+                            root_is_array = true;
+                            return true;
+                        }
+                        return false;
+                    }
+                    if (!root_is_array) return false;
+                    if (depth == 1) {
+                        if (event == nlohmann::json::parse_event_t::object_start ||
+                            event == nlohmann::json::parse_event_t::array_start) {
+                            return true;
+                        }
+                        if (event == nlohmann::json::parse_event_t::object_end ||
+                            event == nlohmann::json::parse_event_t::array_end ||
+                            event == nlohmann::json::parse_event_t::value) {
+                            consume(parsed);
+                            return false;
+                        }
+                    }
+                    return true;
+                };
+                parse_json_pass(path, mVersion, callback);
+                if (!root_is_array || block_index == 0) {
+                    throw std::runtime_error("root is not a non-empty array");
                 }
-            }
+            };
+
+            parse_v1(false);
+            if (!bounds.populated) throw std::runtime_error("structure has no valid blocks");
+            mStore.set_size(bounds.size(name()));
+            parse_v1(true);
         } else if (mVersion == StructureId::FuHongV2) {
-            if (!root.is_object() || !root.contains("FuHongBuild_FinalFormat") ||
-                !root["FuHongBuild_FinalFormat"].is_array() || root["FuHongBuild_FinalFormat"].empty()) {
-                throw std::runtime_error("FuHongBuild_FinalFormat is not a non-empty array");
-            }
-            const auto& chunks = root["FuHongBuild_FinalFormat"];
-            for (std::size_t chunk_index = 0; chunk_index < chunks.size(); ++chunk_index) {
-                try {
-                    const auto entries = chunks[chunk_index].find("block");
-                    if (entries == chunks[chunk_index].end() || !entries->is_array()) {
-                        throw std::runtime_error("block list is missing");
-                    }
-                    for (std::size_t entry_index = 0; entry_index < entries->size(); ++entry_index) {
-                        const auto& entry = (*entries)[entry_index];
-                        if (!entry.is_object() || !entry.contains("n")) continue;
-                        try {
+            const auto parse_v2 = [&](bool materialize) {
+                bool root_is_object = false;
+                bool target_seen = false;
+                bool target_is_array = false;
+                bool in_target = false;
+                bool in_chunk = false;
+                bool in_block_list = false;
+                bool chunk_has_block_list = false;
+                std::string root_key;
+                std::string chunk_key;
+                std::size_t chunk_index = 0;
+                std::size_t entry_index = 0;
+
+                const auto consume_entry = [&](const nlohmann::json& entry) {
+                    const auto current_entry = entry_index++;
+                    if (!entry.is_object() || !entry.contains("n")) return;
+                    try {
                             const auto block_name = trim(json_string(entry["n"]));
                             if (block_name.empty()) throw std::runtime_error("block name is empty");
-                            const auto xs = coordinates(entry.at("x"), "x");
-                            const auto ys = coordinates(entry.at("y"), "y");
-                            const auto zs = coordinates(entry.at("z"), "z");
+                            const auto& xs = entry.at("x");
+                            const auto& ys = entry.at("y");
+                            const auto& zs = entry.at("z");
+                            if (!xs.is_array()) throw std::runtime_error("x is not an array");
+                            if (!ys.is_array()) throw std::runtime_error("y is not an array");
+                            if (!zs.is_array()) throw std::runtime_error("z is not an array");
                             if (xs.size() != ys.size() || xs.size() != zs.size()) {
                                 throw std::runtime_error("coordinate array lengths differ");
                             }
-                            std::vector<std::int64_t> aux_values(xs.size(), 0);
-                            if (const auto aux = entry.find("a"); aux != entry.end() && !aux->is_null()) {
-                                if (aux->is_array()) {
-                                    std::int64_t last = 0;
-                                    for (std::size_t i = 0; i < xs.size(); ++i) {
-                                        if (i < aux->size()) {
-                                            try { last = integer((*aux)[i], "a"); } catch (...) { last = 0; }
-                                        }
-                                        aux_values[i] = last;
-                                    }
-                                } else {
-                                    try { std::ranges::fill(aux_values, integer(*aux, "a")); } catch (...) {}
+                            if (!materialize) {
+                                for (std::size_t i = 0; i < xs.size(); ++i) {
+                                    bounds.add({ i32(xs[i], "x"), i32(ys[i], "y"),
+                                        i32(zs[i], "z") });
                                 }
+                                return;
                             }
+
                             std::map<std::string, std::string> states;
                             if (const auto raw_states = entry.find("state"); raw_states != entry.end() && raw_states->is_array()) {
                                 for (const auto& raw_state : *raw_states) {
@@ -682,42 +853,51 @@ Result<void> FuHongStructure::read(const std::filesystem::path& path)
                                     }
                                 }
                             }
-                            std::vector<std::unique_ptr<nbt::tag_compound>> command_values(xs.size());
-                            if (const auto command = entry.find("c"); command != entry.end() && command->is_object()) {
-                                const auto select = [&](std::string_view field, std::size_t index) -> nlohmann::json {
-                                    const auto found = command->find(std::string(field));
-                                    if (found == command->end() || !found->is_array() || found->empty()) return nullptr;
-                                    return (*found)[std::min(index, found->size() - 1)];
-                                };
-                                for (std::size_t i = 0; i < xs.size(); ++i) {
-                                    command_values[i] = command_nbt(nlohmann::json::array({
-                                        select("c", i), select("t", i), select("a", i), select("n", i) }));
-                                }
+                            const auto aux = entry.find("a");
+                            std::int64_t scalar_aux = 0;
+                            if (aux != entry.end() && !aux->is_null() && !aux->is_array()) {
+                                try { scalar_aux = integer(*aux, "a"); } catch (...) {}
                             }
-                            std::vector<std::unique_ptr<nbt::tag_compound>> container_values(xs.size());
-                            if (const auto data = entry.find("d"); data != entry.end() && data->is_array()) {
-                                for (std::size_t i = 0; i < xs.size() && i < data->size(); ++i) {
+                            std::int64_t array_aux = 0;
+                            const auto command = entry.find("c");
+                            const auto data = entry.find("d");
+                            for (std::size_t i = 0; i < xs.size(); ++i) {
+                                const BlockPos world{ i32(xs[i], "x"), i32(ys[i], "y"),
+                                    i32(zs[i], "z") };
+                                auto effective_aux = scalar_aux;
+                                if (aux != entry.end() && aux->is_array()) {
+                                    if (i < aux->size()) {
+                                        try { array_aux = integer((*aux)[i], "a"); }
+                                        catch (...) { array_aux = 0; }
+                                    }
+                                    effective_aux = array_aux;
+                                }
+                                std::unique_ptr<nbt::tag_compound> entity;
+                                if (command != entry.end() && command->is_object()) {
+                                    const auto select = [&](std::string_view field) -> nlohmann::json {
+                                        const auto found = command->find(std::string(field));
+                                        if (found == command->end() || !found->is_array() || found->empty()) return nullptr;
+                                        return (*found)[std::min(i, found->size() - 1)];
+                                    };
+                                    entity = command_nbt(nlohmann::json::array({
+                                        select("c"), select("t"), select("a"), select("n") }));
+                                }
+                                std::unique_ptr<nbt::tag_compound> container;
+                                if (data != entry.end() && data->is_array() && i < data->size()) {
                                     const auto& value = (*data)[i];
-                                    if (!value.is_object()) continue;
-                                    if (const auto encoded = value.find("e"); encoded != value.end() && encoded->is_string()) {
-                                        const auto parsed = parse_mianyang_nbt(encoded->get<std::string>());
-                                        if (parsed && !parsed.value().empty()) container_values[i] = decode_compound(parsed.value());
-                                    } else if (const auto items = value.find("d"); items != value.end()) {
-                                        container_values[i] = container_nbt_v2(block_name, *items);
+                                    if (value.is_object()) {
+                                        if (const auto encoded = value.find("e"); encoded != value.end() && encoded->is_string()) {
+                                            const auto parsed = parse_mianyang_nbt(encoded->get<std::string>());
+                                            if (parsed && !parsed.value().empty()) container = decode_compound(parsed.value());
+                                        } else if (const auto items = value.find("d"); items != value.end()) {
+                                            container = container_nbt_v2(block_name, *items);
+                                        }
                                     }
                                 }
-                            }
-                            for (std::size_t i = 0; i < xs.size(); ++i) {
-                                const BlockPos world{ xs[i], ys[i], zs[i] };
-                                auto& pending = blocks[world];
-                                pending.world = world;
-                                pending.runtime_id = runtime_id(block_name, aux_values[i], states);
-                                std::unique_ptr<nbt::tag_compound> entity;
-                                if (command_values[i]) entity = std::move(command_values[i]);
-                                if (container_values[i]) {
-                                    if (!entity) entity = std::move(container_values[i]);
+                                if (container) {
+                                    if (!entity) entity = std::move(container);
                                     else {
-                                        for (const auto& [key, tag] : *container_values[i]) {
+                                        for (const auto& [key, tag] : *container) {
                                             (*entity)[key] = nbt::value(tag);
                                         }
                                     }
@@ -735,88 +915,550 @@ Result<void> FuHongStructure::read(const std::filesystem::path& path)
                                         entity->at("CustomName").as<nbt::tag_string>().get() == "") {
                                         entity->erase("CustomName");
                                     }
-                                    pending.nbt = serialize_nbt(*entity);
                                 }
-                                bounds.add(world);
+                                const auto local = local_position(world, bounds.minimum);
+                                mStore.put(local,
+                                    runtime_id(block_name, effective_aux, states));
+                                if (entity) mStore.put_entity(local, serialize_nbt(*entity));
+                                ++materialized_blocks;
                             }
                         } catch (const std::exception& error) {
-                            throw std::runtime_error("entry index " + std::to_string(entry_index) + ": " + error.what());
+                            throw std::runtime_error("entry index " +
+                                std::to_string(current_entry) + ": " + error.what());
+                        }
+                };
+
+                const auto callback = [&](int depth, nlohmann::json::parse_event_t event,
+                                          nlohmann::json& parsed) -> bool {
+                    if (depth == 0) {
+                        if (event == nlohmann::json::parse_event_t::object_start) {
+                            root_is_object = true;
+                            return true;
+                        }
+                        return false;
+                    }
+                    if (!root_is_object) return false;
+                    if (depth == 1) {
+                        if (event == nlohmann::json::parse_event_t::key) {
+                            root_key = parsed.get<std::string>();
+                            return true;
+                        }
+                        if (root_key == "FuHongBuild_FinalFormat") {
+                            target_seen = true;
+                            if (event == nlohmann::json::parse_event_t::array_start) {
+                                target_is_array = true;
+                                in_target = true;
+                                return true;
+                            }
+                            if (event == nlohmann::json::parse_event_t::array_end) {
+                                in_target = false;
+                            }
+                        }
+                        return false;
+                    }
+                    if (!in_target) return false;
+                    if (depth == 2) {
+                        if (event == nlohmann::json::parse_event_t::object_start) {
+                            in_chunk = true;
+                            in_block_list = false;
+                            chunk_has_block_list = false;
+                            chunk_key.clear();
+                            entry_index = 0;
+                            return true;
+                        }
+                        if (event == nlohmann::json::parse_event_t::object_end) {
+                            if (!chunk_has_block_list) {
+                                throw std::runtime_error("chunk index " +
+                                    std::to_string(chunk_index) + ": block list is missing");
+                            }
+                            in_chunk = false;
+                            ++chunk_index;
+                            return false;
+                        }
+                        throw std::runtime_error("chunk index " +
+                            std::to_string(chunk_index) + ": block list is missing");
+                    }
+                    if (!in_chunk) return false;
+                    if (depth == 3) {
+                        if (event == nlohmann::json::parse_event_t::key) {
+                            chunk_key = parsed.get<std::string>();
+                            return true;
+                        }
+                        if (chunk_key == "block") {
+                            if (event == nlohmann::json::parse_event_t::array_start) {
+                                chunk_has_block_list = true;
+                                in_block_list = true;
+                                return true;
+                            }
+                            if (event == nlohmann::json::parse_event_t::array_end) {
+                                in_block_list = false;
+                                return false;
+                            }
+                            throw std::runtime_error("chunk index " +
+                                std::to_string(chunk_index) + ": block list is missing");
+                        }
+                        return false;
+                    }
+                    if (in_block_list && depth == 4) {
+                        if (event == nlohmann::json::parse_event_t::object_start ||
+                            event == nlohmann::json::parse_event_t::array_start) {
+                            return true;
+                        }
+                        if (event == nlohmann::json::parse_event_t::object_end ||
+                            event == nlohmann::json::parse_event_t::array_end ||
+                            event == nlohmann::json::parse_event_t::value) {
+                            consume_entry(parsed);
+                            return false;
                         }
                     }
-                } catch (const std::exception& error) {
-                    throw std::runtime_error("chunk index " + std::to_string(chunk_index) + ": " + error.what());
+                    return true;
+                };
+
+                parse_json_pass(path, mVersion, callback);
+                if (!root_is_object || !target_seen || !target_is_array ||
+                    chunk_index == 0) {
+                    throw std::runtime_error(
+                        "FuHongBuild_FinalFormat is not a non-empty array");
                 }
-            }
+            };
+
+            parse_v2(false);
+            if (!bounds.populated) throw std::runtime_error("structure has no valid blocks");
+            mStore.set_size(bounds.size(name()));
+            parse_v2(true);
         } else {
-            if (!root.is_object() || !root.contains("BlocksList") || !root["BlocksList"].is_array() ||
-                root["BlocksList"].empty()) throw std::runtime_error("BlocksList is not a non-empty array");
-            if (!root.contains("FuHongBuild") || !root["FuHongBuild"].is_array()) {
+            // Palette, per-chunk origins and global bounds are collected in a
+            // detached-entry pass.  A fresh pass then materializes blocks.  V5
+            // simply rebuilds its bounded inflate/decrypt pipeline; no spool or
+            // whole decrypted payload is needed even when root fields reorder.
+            std::vector<std::string> palette;
+            std::vector<BlockPos> chunk_origins;
+            bool root_is_object = false;
+            bool palette_seen = false;
+            bool palette_is_array = false;
+            bool build_seen = false;
+            bool build_is_array = false;
+            bool in_palette = false;
+            bool in_build = false;
+            bool in_chunk = false;
+            bool in_block_list = false;
+            bool chunk_has_block_list = false;
+            bool has_start_x = false;
+            bool has_start_z = false;
+            std::int32_t start_x = 0;
+            std::int32_t start_z = 0;
+            Bounds relative_bounds;
+            std::size_t minimum_x_entry = 0;
+            std::size_t maximum_x_entry = 0;
+            std::size_t minimum_z_entry = 0;
+            std::size_t maximum_z_entry = 0;
+            std::string root_key;
+            std::string chunk_key;
+            std::size_t chunk_index = 0;
+            std::size_t entry_index = 0;
+
+            const auto add_relative = [&](BlockPos position, std::size_t source_entry) {
+                if (!relative_bounds.populated) {
+                    relative_bounds.add(position);
+                    minimum_x_entry = maximum_x_entry = source_entry;
+                    minimum_z_entry = maximum_z_entry = source_entry;
+                    return;
+                }
+                if (position.x < relative_bounds.minimum.x) minimum_x_entry = source_entry;
+                if (position.x > relative_bounds.maximum.x) maximum_x_entry = source_entry;
+                if (position.z < relative_bounds.minimum.z) minimum_z_entry = source_entry;
+                if (position.z > relative_bounds.maximum.z) maximum_z_entry = source_entry;
+                relative_bounds.add(position);
+            };
+
+            const auto consume_bounds_tuple = [&](const nlohmann::json& tuple) {
+                const auto current_entry = entry_index++;
+                try {
+                    if (!tuple.is_array() || tuple.size() < 5) {
+                        throw std::runtime_error("tuple is invalid");
+                    }
+                    if (tuple[0].is_string()) return;
+                    (void)integer(tuple[0], "palette index");
+                    (void)integer(tuple[1], "aux");
+                    const auto& xs = tuple[2];
+                    const auto& ys = tuple[3];
+                    const auto& zs = tuple[4];
+                    if (!xs.is_array()) throw std::runtime_error("xs is not an array");
+                    if (!ys.is_array()) throw std::runtime_error("ys is not an array");
+                    if (!zs.is_array()) throw std::runtime_error("zs is not an array");
+                    if (xs.size() != ys.size() || xs.size() != zs.size()) {
+                        throw std::runtime_error("coordinate array lengths differ");
+                    }
+                    for (std::size_t i = 0; i < xs.size(); ++i) {
+                        add_relative({ i32(xs[i], "xs"), i32(ys[i], "ys"),
+                            i32(zs[i], "zs") }, current_entry);
+                    }
+                } catch (const std::exception& error) {
+                    throw std::runtime_error("entry index " +
+                        std::to_string(current_entry) + ": " + error.what());
+                }
+            };
+
+            const auto finish_chunk = [&] {
+                try {
+                    if (!chunk_has_block_list) {
+                        throw std::runtime_error("block list is missing");
+                    }
+                    if (mVersion == StructureId::FuHongV3 && !has_start_x) {
+                        throw std::runtime_error("startX is missing");
+                    }
+                    if (mVersion == StructureId::FuHongV3 && !has_start_z) {
+                        throw std::runtime_error("startZ is missing");
+                    }
+                    const BlockPos origin{
+                        mVersion == StructureId::FuHongV3 ? start_x : 0,
+                        0,
+                        mVersion == StructureId::FuHongV3 ? start_z : 0
+                    };
+                    chunk_origins.push_back(origin);
+                    if (relative_bounds.populated) {
+                        BlockPos minimum{};
+                        BlockPos maximum{};
+                        try {
+                            minimum.x = checked_add(origin.x,
+                                relative_bounds.minimum.x, "x");
+                        } catch (const std::exception& error) {
+                            throw std::runtime_error("entry index " +
+                                std::to_string(minimum_x_entry) + ": " + error.what());
+                        }
+                        try {
+                            maximum.x = checked_add(origin.x,
+                                relative_bounds.maximum.x, "x");
+                        } catch (const std::exception& error) {
+                            throw std::runtime_error("entry index " +
+                                std::to_string(maximum_x_entry) + ": " + error.what());
+                        }
+                        try {
+                            minimum.z = checked_add(origin.z,
+                                relative_bounds.minimum.z, "z");
+                        } catch (const std::exception& error) {
+                            throw std::runtime_error("entry index " +
+                                std::to_string(minimum_z_entry) + ": " + error.what());
+                        }
+                        try {
+                            maximum.z = checked_add(origin.z,
+                                relative_bounds.maximum.z, "z");
+                        } catch (const std::exception& error) {
+                            throw std::runtime_error("entry index " +
+                                std::to_string(maximum_z_entry) + ": " + error.what());
+                        }
+                        minimum.y = relative_bounds.minimum.y;
+                        maximum.y = relative_bounds.maximum.y;
+                        bounds.add(minimum);
+                        bounds.add(maximum);
+                    }
+                } catch (const std::exception& error) {
+                    throw std::runtime_error("chunk index " +
+                        std::to_string(chunk_index) + ": " + error.what());
+                }
+                ++chunk_index;
+            };
+
+            const auto metadata_callback = [&](int depth,
+                                               nlohmann::json::parse_event_t event,
+                                               nlohmann::json& parsed) -> bool {
+                if (depth == 0) {
+                    if (event == nlohmann::json::parse_event_t::object_start) {
+                        root_is_object = true;
+                        return true;
+                    }
+                    return false;
+                }
+                if (!root_is_object) return false;
+                if (depth == 1) {
+                    if (event == nlohmann::json::parse_event_t::key) {
+                        root_key = parsed.get<std::string>();
+                        return true;
+                    }
+                    if (root_key == "BlocksList") {
+                        palette_seen = true;
+                        if (event == nlohmann::json::parse_event_t::array_start) {
+                            palette_is_array = true;
+                            in_palette = true;
+                            return true;
+                        }
+                        if (event == nlohmann::json::parse_event_t::array_end) {
+                            in_palette = false;
+                        }
+                        return false;
+                    }
+                    if (root_key == "FuHongBuild") {
+                        build_seen = true;
+                        if (event == nlohmann::json::parse_event_t::array_start) {
+                            build_is_array = true;
+                            in_build = true;
+                            return true;
+                        }
+                        if (event == nlohmann::json::parse_event_t::array_end) {
+                            in_build = false;
+                        }
+                        return false;
+                    }
+                    return false;
+                }
+                if (in_palette && depth == 2) {
+                    if (event == nlohmann::json::parse_event_t::value) {
+                        if (!parsed.is_string()) {
+                            throw std::runtime_error("BlocksList entry " +
+                                std::to_string(palette.size()) + " is not a string");
+                        }
+                        palette.push_back(parsed.get<std::string>());
+                        return false;
+                    }
+                    if (event == nlohmann::json::parse_event_t::object_start ||
+                        event == nlohmann::json::parse_event_t::array_start) {
+                        throw std::runtime_error("BlocksList entry " +
+                            std::to_string(palette.size()) + " is not a string");
+                    }
+                }
+                if (!in_build) return false;
+                if (depth == 2) {
+                    if (event == nlohmann::json::parse_event_t::object_start) {
+                        in_chunk = true;
+                        in_block_list = false;
+                        chunk_has_block_list = false;
+                        has_start_x = false;
+                        has_start_z = false;
+                        start_x = 0;
+                        start_z = 0;
+                        relative_bounds = {};
+                        chunk_key.clear();
+                        entry_index = 0;
+                        return true;
+                    }
+                    if (event == nlohmann::json::parse_event_t::object_end) {
+                        finish_chunk();
+                        in_chunk = false;
+                        return false;
+                    }
+                    throw std::runtime_error("chunk index " +
+                        std::to_string(chunk_index) + ": block list is missing");
+                }
+                if (!in_chunk) return false;
+                if (depth == 3) {
+                    if (event == nlohmann::json::parse_event_t::key) {
+                        chunk_key = parsed.get<std::string>();
+                        return true;
+                    }
+                    if (chunk_key == "block") {
+                        if (event == nlohmann::json::parse_event_t::array_start) {
+                            chunk_has_block_list = true;
+                            in_block_list = true;
+                            return true;
+                        }
+                        if (event == nlohmann::json::parse_event_t::array_end) {
+                            in_block_list = false;
+                            return false;
+                        }
+                        throw std::runtime_error("chunk index " +
+                            std::to_string(chunk_index) + ": block list is missing");
+                    }
+                    if (mVersion == StructureId::FuHongV3 &&
+                        (chunk_key == "startX" || chunk_key == "startZ")) {
+                        if (event != nlohmann::json::parse_event_t::value) {
+                            throw std::runtime_error(chunk_key + " is not an integer");
+                        }
+                        if (chunk_key == "startX") {
+                            start_x = i32(parsed, "startX");
+                            has_start_x = true;
+                        } else {
+                            start_z = i32(parsed, "startZ");
+                            has_start_z = true;
+                        }
+                    }
+                    return false;
+                }
+                if (in_block_list && depth == 4) {
+                    if (event == nlohmann::json::parse_event_t::object_start ||
+                        event == nlohmann::json::parse_event_t::array_start) {
+                        return true;
+                    }
+                    if (event == nlohmann::json::parse_event_t::object_end ||
+                        event == nlohmann::json::parse_event_t::array_end ||
+                        event == nlohmann::json::parse_event_t::value) {
+                        consume_bounds_tuple(parsed);
+                        return false;
+                    }
+                }
+                return true;
+            };
+
+            parse_json_pass(path, mVersion, metadata_callback);
+            if (!root_is_object || !palette_seen || !palette_is_array || palette.empty()) {
+                throw std::runtime_error("BlocksList is not a non-empty array");
+            }
+            if (!build_seen || !build_is_array) {
                 throw std::runtime_error("FuHongBuild is not an array");
             }
-            const auto palette = root["BlocksList"].get<std::vector<std::string>>();
-            const auto& chunks = root["FuHongBuild"];
-            for (std::size_t chunk_index = 0; chunk_index < chunks.size(); ++chunk_index) {
-                try {
-                    const auto& chunk = chunks[chunk_index];
-                    const auto start_x = mVersion == StructureId::FuHongV3 ? i32(chunk.at("startX"), "startX") : 0;
-                    const auto start_z = mVersion == StructureId::FuHongV3 ? i32(chunk.at("startZ"), "startZ") : 0;
-                    const auto entries = chunk.find("block");
-                    if (entries == chunk.end() || !entries->is_array()) throw std::runtime_error("block list is missing");
-                    for (std::size_t entry_index = 0; entry_index < entries->size(); ++entry_index) {
+            if (!bounds.populated) throw std::runtime_error("structure has no valid blocks");
+            mStore.set_size(bounds.size(name()));
+
+            root_is_object = false;
+            root_key.clear();
+            chunk_key.clear();
+            in_build = false;
+            in_chunk = false;
+            in_block_list = false;
+            chunk_has_block_list = false;
+            chunk_index = 0;
+            entry_index = 0;
+            std::unordered_set<BlockPos, BlockPosHash> entity_positions;
+
+            const auto consume_tuple = [&](const nlohmann::json& tuple) {
+                const auto current_entry = entry_index++;
                         try {
-                            const auto& tuple = (*entries)[entry_index];
                             if (!tuple.is_array() || tuple.size() < 5) throw std::runtime_error("tuple is invalid");
-                            if (tuple[0].is_string()) continue;
+                            if (tuple[0].is_string()) return;
                             const auto palette_index = integer(tuple[0], "palette index");
                             if (palette_index < 0 || static_cast<std::size_t>(palette_index) >= palette.size()) {
                                 throw std::runtime_error("palette index " + std::to_string(palette_index) + " is out of range");
                             }
                             const auto aux = integer(tuple[1], "aux");
-                            const auto xs = coordinates(tuple[2], "xs");
-                            const auto ys = coordinates(tuple[3], "ys");
-                            const auto zs = coordinates(tuple[4], "zs");
+                            const auto& xs = tuple[2];
+                            const auto& ys = tuple[3];
+                            const auto& zs = tuple[4];
+                            if (!xs.is_array()) throw std::runtime_error("xs is not an array");
+                            if (!ys.is_array()) throw std::runtime_error("ys is not an array");
+                            if (!zs.is_array()) throw std::runtime_error("zs is not an array");
                             if (xs.size() != ys.size() || xs.size() != zs.size()) {
                                 throw std::runtime_error("coordinate array lengths differ");
                             }
                             const auto& block_name = palette[static_cast<std::size_t>(palette_index)];
                             const auto runtime = runtime_id(block_name, aux);
+                            const auto origin = chunk_origins.at(chunk_index);
                             for (std::size_t i = 0; i < xs.size(); ++i) {
-                                const BlockPos world{ checked_add(start_x, xs[i], "x"), ys[i],
-                                    checked_add(start_z, zs[i], "z") };
+                                const BlockPos world{
+                                    checked_add(origin.x, i32(xs[i], "xs"), "x"),
+                                    i32(ys[i], "ys"),
+                                    checked_add(origin.z, i32(zs[i], "zs"), "z")
+                                };
                                 std::optional<NbtPayload> entity;
                                 if (tuple.size() >= 6 && tuple[5].is_array() && i < tuple[5].size()) {
                                     if (auto compound = extra_nbt(block_name, tuple[5][i])) {
                                         entity = serialize_nbt(*compound);
                                     }
                                 }
-                                if (auto existing = blocks.find(world); existing != blocks.end()) {
-                                    existing->second.runtime_id = runtime;
-                                    if (!existing->second.nbt && entity) existing->second.nbt = std::move(entity);
-                                } else {
-                                    blocks.emplace(world, PendingBlock{ world, runtime, std::move(entity) });
+                                const auto local = local_position(world, bounds.minimum);
+                                mStore.put(local, runtime);
+                                if (entity && entity_positions.insert(local).second) {
+                                    mStore.put_entity(local, std::move(*entity));
                                 }
-                                bounds.add(world);
+                                ++materialized_blocks;
                             }
                         } catch (const std::exception& error) {
-                            throw std::runtime_error("entry index " + std::to_string(entry_index) + ": " + error.what());
+                            throw std::runtime_error("entry index " +
+                                std::to_string(current_entry) + ": " + error.what());
                         }
+            };
+
+            const auto payload_callback = [&](int depth,
+                                              nlohmann::json::parse_event_t event,
+                                              nlohmann::json& parsed) -> bool {
+                if (depth == 0) {
+                    if (event == nlohmann::json::parse_event_t::object_start) {
+                        root_is_object = true;
+                        return true;
                     }
-                } catch (const std::exception& error) {
-                    throw std::runtime_error("chunk index " + std::to_string(chunk_index) + ": " + error.what());
+                    return false;
                 }
+                if (!root_is_object) return false;
+                if (depth == 1) {
+                    if (event == nlohmann::json::parse_event_t::key) {
+                        root_key = parsed.get<std::string>();
+                        return true;
+                    }
+                    if (root_key == "FuHongBuild" &&
+                        event == nlohmann::json::parse_event_t::array_start) {
+                        in_build = true;
+                        return true;
+                    }
+                    if (root_key == "FuHongBuild" &&
+                        event == nlohmann::json::parse_event_t::array_end) {
+                        in_build = false;
+                    }
+                    return false;
+                }
+                if (!in_build) return false;
+                if (depth == 2) {
+                    if (event == nlohmann::json::parse_event_t::object_start) {
+                        if (chunk_index >= chunk_origins.size()) {
+                            throw std::runtime_error("FuHongBuild changed between parse passes");
+                        }
+                        in_chunk = true;
+                        in_block_list = false;
+                        chunk_has_block_list = false;
+                        chunk_key.clear();
+                        entry_index = 0;
+                        return true;
+                    }
+                    if (event == nlohmann::json::parse_event_t::object_end) {
+                        if (!chunk_has_block_list) {
+                            throw std::runtime_error("chunk index " +
+                                std::to_string(chunk_index) + ": block list is missing");
+                        }
+                        ++chunk_index;
+                        in_chunk = false;
+                        return false;
+                    }
+                    throw std::runtime_error("chunk index " +
+                        std::to_string(chunk_index) + ": block list is missing");
+                }
+                if (!in_chunk) return false;
+                if (depth == 3) {
+                    if (event == nlohmann::json::parse_event_t::key) {
+                        chunk_key = parsed.get<std::string>();
+                        return true;
+                    }
+                    if (chunk_key == "block") {
+                        if (event == nlohmann::json::parse_event_t::array_start) {
+                            chunk_has_block_list = true;
+                            in_block_list = true;
+                            return true;
+                        }
+                        if (event == nlohmann::json::parse_event_t::array_end) {
+                            in_block_list = false;
+                            return false;
+                        }
+                        throw std::runtime_error("chunk index " +
+                            std::to_string(chunk_index) + ": block list is missing");
+                    }
+                    return false;
+                }
+                if (in_block_list && depth == 4) {
+                    if (event == nlohmann::json::parse_event_t::object_start ||
+                        event == nlohmann::json::parse_event_t::array_start) {
+                        return true;
+                    }
+                    if (event == nlohmann::json::parse_event_t::object_end ||
+                        event == nlohmann::json::parse_event_t::array_end ||
+                        event == nlohmann::json::parse_event_t::value) {
+                        consume_tuple(parsed);
+                        return false;
+                    }
+                }
+                return true;
+            };
+
+            parse_json_pass(path, mVersion, payload_callback);
+            if (chunk_index != chunk_origins.size()) {
+                throw std::runtime_error("FuHongBuild changed between parse passes");
             }
         }
 
-        if (blocks.empty() || mPaletteCache.empty()) throw std::runtime_error("structure has no valid blocks");
-        mStore.set_size(bounds.size(name()));
-        for (auto& [world, block] : blocks) {
-            const auto local = local_position(world, bounds.minimum);
-            mStore.put(local, block.runtime_id);
-            if (block.nbt) mStore.put_entity(local, std::move(*block.nbt));
-            if (block.runtime_id != mRegistry.air_runtime_id()) ++mNonAirBlocks;
+        if (materialized_blocks == 0 || mPaletteCache.empty()) {
+            throw std::runtime_error("structure has no valid blocks");
         }
+        mNonAirBlocks = mStore.count_non_air();
         return Result<void>::success();
     } catch (const std::exception& error) {
+        mStore.clear();
+        mPaletteCache.clear();
+        mNonAirBlocks = 0;
         return Result<void>::failure("parse " + std::string(name()) + " failed: " + error.what());
     }
 }

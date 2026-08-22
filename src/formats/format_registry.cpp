@@ -33,8 +33,12 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cctype>
+#include <chrono>
 #include <fstream>
+#include <limits>
+#include <optional>
 #include <sstream>
 #include <nlohmann/json.hpp>
 
@@ -63,14 +67,18 @@ public:
 
     Result<ChunkMap> get_chunks(std::span<const ChunkPos> positions) const override
     {
+        const auto started = std::chrono::steady_clock::now();
         auto result = mSource.get_chunks(positions);
+        record_chunk_time(std::chrono::steady_clock::now() - started);
         if (result && mCallbacks.progress) advance(positions.size());
         return result;
     }
 
     Result<ChunkMap> get_chunks_layer0(std::span<const ChunkPos> positions) const override
     {
+        const auto started = std::chrono::steady_clock::now();
         auto result = mSource.get_chunks_layer0(positions);
+        record_chunk_time(std::chrono::steady_clock::now() - started);
         if (result && mCallbacks.progress) advance(positions.size());
         return result;
     }
@@ -79,18 +87,31 @@ public:
         std::span<const ChunkPos> positions,
         const ChunkVisitor& visitor) const override
     {
-        std::size_t visited = 0;
+        std::atomic<std::size_t> visited{0};
+        std::atomic<std::uint64_t> callback_nanoseconds{0};
+        const auto started = std::chrono::steady_clock::now();
         auto result = mSource.visit_chunks(positions,
             [&](ChunkPos position, const ChunkData& chunk) -> Result<void> {
+                const auto callback_started = std::chrono::steady_clock::now();
                 auto result = visitor(position, chunk);
                 if (result) {
-                    ++visited;
+                    visited.fetch_add(1, std::memory_order_relaxed);
                     if (mCallbacks.progress) advance();
                 }
+                callback_nanoseconds.fetch_add(nanoseconds(
+                    std::chrono::steady_clock::now() - callback_started),
+                    std::memory_order_relaxed);
                 return result;
             });
-        if (result && mCallbacks.progress && visited < positions.size()) {
-            advance(positions.size() - visited);
+        const auto total_nanoseconds = nanoseconds(
+            std::chrono::steady_clock::now() - started);
+        const auto callbacks = callback_nanoseconds.load(std::memory_order_relaxed);
+        mChunkNanoseconds.fetch_add(
+            total_nanoseconds > callbacks ? total_nanoseconds - callbacks : 0,
+            std::memory_order_relaxed);
+        const auto visited_count = visited.load(std::memory_order_relaxed);
+        if (result && mCallbacks.progress && visited_count < positions.size()) {
+            advance(positions.size() - visited_count);
         }
         return result;
     }
@@ -99,7 +120,24 @@ public:
         std::span<const ChunkPos> positions,
         const ChunkNbtVisitor& visitor) const override
     {
-        return mSource.visit_chunk_nbt(positions, visitor);
+        std::atomic<std::uint64_t> callback_nanoseconds{0};
+        const auto started = std::chrono::steady_clock::now();
+        auto result = mSource.visit_chunk_nbt(positions,
+            [&](ChunkPos position, std::span<const BlockEntity> entities) {
+                const auto callback_started = std::chrono::steady_clock::now();
+                auto visited = visitor(position, entities);
+                callback_nanoseconds.fetch_add(nanoseconds(
+                    std::chrono::steady_clock::now() - callback_started),
+                    std::memory_order_relaxed);
+                return visited;
+            });
+        const auto total_nanoseconds = nanoseconds(
+            std::chrono::steady_clock::now() - started);
+        const auto callbacks = callback_nanoseconds.load(std::memory_order_relaxed);
+        mNbtNanoseconds.fetch_add(
+            total_nanoseconds > callbacks ? total_nanoseconds - callbacks : 0,
+            std::memory_order_relaxed);
+        return result;
     }
 
     void release_cached_chunks() const noexcept override
@@ -111,18 +149,31 @@ public:
         std::span<const ChunkPos> positions,
         const ChunkPaletteVisitor& visitor) const override
     {
-        std::size_t visited = 0;
+        std::atomic<std::size_t> visited{0};
+        std::atomic<std::uint64_t> callback_nanoseconds{0};
+        const auto started = std::chrono::steady_clock::now();
         auto result = mSource.visit_chunk_palettes(positions,
             [&](ChunkPos position, std::span<const SubChunkPaletteData> palettes) -> Result<void> {
+                const auto callback_started = std::chrono::steady_clock::now();
                 auto result = visitor(position, palettes);
                 if (result) {
-                    ++visited;
+                    visited.fetch_add(1, std::memory_order_relaxed);
                     if (mCallbacks.progress) advance();
                 }
+                callback_nanoseconds.fetch_add(nanoseconds(
+                    std::chrono::steady_clock::now() - callback_started),
+                    std::memory_order_relaxed);
                 return result;
             });
-        if (result && mCallbacks.progress && visited < positions.size()) {
-            advance(positions.size() - visited);
+        const auto total_nanoseconds = nanoseconds(
+            std::chrono::steady_clock::now() - started);
+        const auto callbacks = callback_nanoseconds.load(std::memory_order_relaxed);
+        mChunkNanoseconds.fetch_add(
+            total_nanoseconds > callbacks ? total_nanoseconds - callbacks : 0,
+            std::memory_order_relaxed);
+        const auto visited_count = visited.load(std::memory_order_relaxed);
+        if (result && mCallbacks.progress && visited_count < positions.size()) {
+            advance(positions.size() - visited_count);
         }
         return result;
     }
@@ -134,7 +185,11 @@ public:
 
     Result<NbtChunkMap> get_chunk_nbt(std::span<const ChunkPos> positions) const override
     {
-        return mSource.get_chunk_nbt(positions);
+        const auto started = std::chrono::steady_clock::now();
+        auto result = mSource.get_chunk_nbt(positions);
+        mNbtNanoseconds.fetch_add(nanoseconds(
+            std::chrono::steady_clock::now() - started), std::memory_order_relaxed);
+        return result;
     }
 
     Result<std::size_t> count_non_air_blocks() const override
@@ -164,7 +219,28 @@ public:
         if (mCallbacks.start) mCallbacks.start(total);
     }
 
+    std::uint64_t chunk_materialization_ms() const noexcept
+    {
+        return mChunkNanoseconds.load(std::memory_order_relaxed) / 1'000'000u;
+    }
+
+    std::uint64_t nbt_entity_decode_ms() const noexcept
+    {
+        return mNbtNanoseconds.load(std::memory_order_relaxed) / 1'000'000u;
+    }
+
 private:
+    static std::uint64_t nanoseconds(std::chrono::steady_clock::duration value) noexcept
+    {
+        const auto measured = std::chrono::duration_cast<std::chrono::nanoseconds>(value).count();
+        return measured > 0 ? static_cast<std::uint64_t>(measured) : 0;
+    }
+
+    void record_chunk_time(std::chrono::steady_clock::duration value) const noexcept
+    {
+        mChunkNanoseconds.fetch_add(nanoseconds(value), std::memory_order_relaxed);
+    }
+
     void advance(std::size_t count) const
     {
         for (std::size_t index = 0; index < count; ++index) advance();
@@ -177,6 +253,8 @@ private:
 
     const IStructure& mSource;
     ConversionCallbacks mCallbacks;
+    mutable std::atomic<std::uint64_t> mChunkNanoseconds{0};
+    mutable std::atomic<std::uint64_t> mNbtNanoseconds{0};
 };
 
 const std::vector<FormatInfo> kFormats = {
@@ -245,6 +323,53 @@ const std::vector<FormatInfo> kFormats = {
         { "MessagePack:[[block_data,block_actor_data]]" } }
 };
 
+// Keep the legacy capability columns intact for old clients, but expose an
+// audited, directionally explicit view through FormatRegistry::formats(). A
+// world-to-structure conversion uses the verified MCWorld reader followed by
+// the target's file writer; direct_world_import_implemented separately tracks
+// the older per-reader read_from_world virtual.
+const std::vector<FormatInfo>& format_table()
+{
+    static const auto audited = [] {
+        auto values = kFormats;
+        for (auto& value : values) {
+            value.world_to_structure_implemented = value.writer_implemented;
+            value.structure_to_world_implemented =
+                value.reader_implemented &&
+                (value.world_import_implemented || value.id == StructureId::MCWorld);
+            value.direct_world_import_implemented = false;
+
+            // A one-chunk visit_chunks fallback only bounds the adapter's
+            // return value; it does not make a reader whose read() retains the
+            // complete NBT/JSON/MessagePack tree a streaming reader. Advertise
+            // only native, source-side bounded implementations here.
+            value.streaming_reader_implemented =
+                value.id == StructureId::MCWorld ||
+                value.id == StructureId::SchemV1 ||
+                value.id == StructureId::SchemV2 ||
+                value.id == StructureId::BDX ||
+                value.id == StructureId::Construction;
+            value.streaming_writer_implemented =
+                value.id == StructureId::SchemV1 ||
+                value.id == StructureId::SchemV2 ||
+                value.id == StructureId::BDX ||
+                value.id == StructureId::IBImport ||
+                value.id == StructureId::MCFunction;
+
+            value.auto_detectable =
+                value.id != StructureId::SchemV2 &&
+                value.id != StructureId::MianYangV2;
+            value.read_projection_lossy = false;
+            value.write_projection_lossy = value.writer_implemented &&
+                value.id != StructureId::MCStructure;
+            value.lossy_round_trip = value.read_projection_lossy ||
+                value.write_projection_lossy;
+        }
+        return values;
+    }();
+    return audited;
+}
+
 std::string lower(std::string value)
 {
     std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
@@ -253,11 +378,391 @@ std::string lower(std::string value)
     return value;
 }
 
+enum class JsonProbeType : std::uint8_t {
+    None,
+    Null,
+    Boolean,
+    Integer,
+    Float,
+    String,
+    Array,
+    Object
+};
+
+constexpr bool json_probe_number(JsonProbeType type) noexcept
+{
+    return type == JsonProbeType::Integer || type == JsonProbeType::Float;
+}
+
+struct JsonRootElementProbe {
+    JsonProbeType type = JsonProbeType::None;
+    bool has_name = false;
+    bool name_is_string = false;
+    bool has_aux = false;
+    bool has_x = false;
+    bool x_is_integer = false;
+    bool has_y = false;
+    bool y_is_integer = false;
+    bool has_z = false;
+    bool z_is_integer = false;
+    bool has_list = false;
+    bool has_start = false;
+    bool has_end = false;
+    bool has_xcha = false;
+    bool has_ep = false;
+
+    void record(std::string_view key, JsonProbeType value_type) noexcept
+    {
+        if (key == "name") {
+            has_name = true;
+            name_is_string = value_type == JsonProbeType::String;
+        } else if (key == "aux") {
+            has_aux = true;
+        } else if (key == "x") {
+            has_x = true;
+            x_is_integer = value_type == JsonProbeType::Integer;
+        } else if (key == "y") {
+            has_y = true;
+            y_is_integer = value_type == JsonProbeType::Integer;
+        } else if (key == "z") {
+            has_z = true;
+            z_is_integer = value_type == JsonProbeType::Integer;
+        } else if (key == "list") {
+            has_list = true;
+        } else if (key == "start") {
+            has_start = true;
+        } else if (key == "end") {
+            has_end = true;
+        } else if (key == "xcha") {
+            has_xcha = true;
+        } else if (key == "ep") {
+            has_ep = true;
+        }
+    }
+
+    bool runaway_shape() const noexcept
+    {
+        return type == JsonProbeType::Object && has_name && name_is_string &&
+            has_x && x_is_integer && has_y && y_is_integer &&
+            has_z && z_is_integer;
+    }
+};
+
+// Detection must not build a second full JSON DOM before the selected reader
+// runs.  This SAX probe retains only the top-level keys and a rolling pair of
+// root-array element shapes, which is sufficient to preserve the registry's
+// Go-compatible trial order while keeping memory independent of block count.
+class JsonFormatProbe final : public nlohmann::json_sax<nlohmann::json> {
+public:
+    bool null() override { return value(JsonProbeType::Null); }
+    bool boolean(bool) override { return value(JsonProbeType::Boolean); }
+    bool number_integer(number_integer_t) override { return value(JsonProbeType::Integer); }
+    bool number_unsigned(number_unsigned_t) override { return value(JsonProbeType::Integer); }
+    bool number_float(number_float_t, const string_t&) override
+    {
+        return value(JsonProbeType::Float);
+    }
+    bool string(string_t& input) override
+    {
+        return value(JsonProbeType::String, input);
+    }
+    bool binary(binary_t&) override { return value(JsonProbeType::String); }
+
+    bool start_object(std::size_t) override
+    {
+        if (mFrames.size() >= 256) return false;
+        if (!begin_container(JsonProbeType::Object)) return false;
+        mFrames.push_back({ JsonProbeType::Object, {} });
+        return true;
+    }
+
+    bool key(string_t& input) override
+    {
+        if (mFrames.empty() || mFrames.back().type != JsonProbeType::Object) return false;
+        mFrames.back().key = input;
+        return true;
+    }
+
+    bool end_object() override { return end_container(JsonProbeType::Object); }
+
+    bool start_array(std::size_t) override
+    {
+        if (mFrames.size() >= 256) return false;
+        if (!begin_container(JsonProbeType::Array)) return false;
+        mFrames.push_back({ JsonProbeType::Array, {} });
+        return true;
+    }
+
+    bool end_array() override { return end_container(JsonProbeType::Array); }
+
+    bool parse_error(
+        std::size_t,
+        const std::string&,
+        const nlohmann::detail::exception&) override
+    {
+        return false;
+    }
+
+    std::optional<StructureId> detected() const noexcept
+    {
+        if (mRootType == JsonProbeType::Object) {
+            if (mVersionIsTimeBuilder) return StructureId::TimeBuilderV1;
+            if (mHasFuHongFinal) return StructureId::FuHongV2;
+            if (mHasFuHongBuild) {
+                return mHasBlockCalculationPos ? StructureId::FuHongV3 : StructureId::FuHongV4;
+            }
+            if (mHasChunkedBlocks && mHasNamespaces) return StructureId::MianYangV1;
+            if (mHasTotalBlocks) return StructureId::QingXuV1;
+            if (mHasBlock && mHasVersion) return StructureId::TimeBuilderV1;
+            if ((mHasSize || mHasDimensions) && mHasStructure) {
+                return StructureId::CovStructure;
+            }
+            return std::nullopt;
+        }
+        if (mRootType != JsonProbeType::Array || mRootCount == 0) return std::nullopt;
+        if (mFirst.type == JsonProbeType::Array && mLast.type == JsonProbeType::Array) {
+            return StructureId::GangBanV6;
+        }
+        if (mRootCount >= 2 && json_probe_number(mFirst.type) &&
+            mHasPenultimate && mPenultimate.type == JsonProbeType::Object &&
+            mPenultimate.has_ep && mLast.type == JsonProbeType::Array) {
+            return StructureId::GangBanV5;
+        }
+        if (mFirst.type == JsonProbeType::Object) {
+            if (mAllRunAway) return StructureId::RunAway;
+            if (mFirst.has_name && mFirst.has_aux && mFirst.has_x &&
+                mFirst.has_y && mFirst.has_z) {
+                return StructureId::FuHongV1;
+            }
+            if (mRootCount >= 2 && mLast.type == JsonProbeType::Object && mLast.has_list) {
+                return mHasPenultimate && mPenultimate.type == JsonProbeType::Object &&
+                    mPenultimate.has_start && mPenultimate.has_end
+                    ? StructureId::GangBanV1 : StructureId::GangBanV2;
+            }
+            if (mRootCount >= 2 && mFirst.has_xcha) {
+                if (mSecond.type == JsonProbeType::String) return StructureId::GangBanV3;
+                if (mSecond.type == JsonProbeType::Array) return StructureId::GangBanV4;
+            }
+        }
+        return std::nullopt;
+    }
+
+private:
+    struct Frame {
+        JsonProbeType type = JsonProbeType::None;
+        std::string key;
+    };
+
+    bool begin_container(JsonProbeType type)
+    {
+        if (mFrames.empty()) {
+            if (mRootType != JsonProbeType::None) return false;
+            mRootType = type;
+            return true;
+        }
+        return begin_value(type, {});
+    }
+
+    bool end_container(JsonProbeType type)
+    {
+        if (mFrames.empty() || mFrames.back().type != type) return false;
+        const bool finishes_root_element =
+            mRootType == JsonProbeType::Array && mFrames.size() == 2;
+        mFrames.pop_back();
+        if (finishes_root_element) finish_root_element();
+        return true;
+    }
+
+    bool value(JsonProbeType type, std::string_view text = {})
+    {
+        if (mFrames.empty()) {
+            if (mRootType != JsonProbeType::None) return false;
+            mRootType = type;
+            return true;
+        }
+        if (!begin_value(type, text)) return false;
+        if (mRootType == JsonProbeType::Array && mFrames.size() == 1) {
+            finish_root_element();
+        }
+        return true;
+    }
+
+    bool begin_value(JsonProbeType type, std::string_view text)
+    {
+        auto& parent = mFrames.back();
+        if (mRootType == JsonProbeType::Array && mFrames.size() == 1 &&
+            parent.type == JsonProbeType::Array) {
+            if (mRootElementActive) return false;
+            mCurrent = {};
+            mCurrent.type = type;
+            mRootElementActive = true;
+            return true;
+        }
+        if (parent.type != JsonProbeType::Object) return true;
+        const auto key = std::move(parent.key);
+        parent.key.clear();
+        if (mRootType == JsonProbeType::Object && mFrames.size() == 1) {
+            record_root_key(key, type, text);
+        } else if (mRootType == JsonProbeType::Array && mFrames.size() == 2 &&
+                   mFrames.front().type == JsonProbeType::Array && mRootElementActive) {
+            mCurrent.record(key, type);
+        }
+        return true;
+    }
+
+    void record_root_key(
+        std::string_view key,
+        JsonProbeType type,
+        std::string_view text) noexcept
+    {
+        if (key == "version") {
+            mHasVersion = true;
+            mVersionIsTimeBuilder = type == JsonProbeType::String && text == "TimeBuilder";
+        } else if (key == "FuHongBuild_FinalFormat") {
+            mHasFuHongFinal = true;
+        } else if (key == "FuHongBuild") {
+            mHasFuHongBuild = true;
+        } else if (key == "BlockCalculationPos") {
+            mHasBlockCalculationPos = true;
+        } else if (key == "chunkedBlocks") {
+            mHasChunkedBlocks = true;
+        } else if (key == "namespaces") {
+            mHasNamespaces = true;
+        } else if (key == "totalBlocks") {
+            mHasTotalBlocks = true;
+        } else if (key == "block") {
+            mHasBlock = true;
+        } else if (key == "size") {
+            mHasSize = true;
+        } else if (key == "dimensions") {
+            mHasDimensions = true;
+        } else if (key == "structure") {
+            mHasStructure = true;
+        }
+    }
+
+    void finish_root_element() noexcept
+    {
+        if (!mRootElementActive) return;
+        if (mRootCount == 0) {
+            mFirst = mCurrent;
+            mAllRunAway = mCurrent.runaway_shape();
+        } else {
+            mAllRunAway = mAllRunAway && mCurrent.runaway_shape();
+        }
+        if (mRootCount == 1) mSecond = mCurrent;
+        mPenultimate = mLast;
+        mHasPenultimate = mRootCount != 0;
+        mLast = mCurrent;
+        if (mRootCount != std::numeric_limits<std::size_t>::max()) ++mRootCount;
+        mCurrent = {};
+        mRootElementActive = false;
+    }
+
+    std::vector<Frame> mFrames;
+    JsonProbeType mRootType = JsonProbeType::None;
+    JsonRootElementProbe mCurrent;
+    JsonRootElementProbe mFirst;
+    JsonRootElementProbe mSecond;
+    JsonRootElementProbe mPenultimate;
+    JsonRootElementProbe mLast;
+    std::size_t mRootCount = 0;
+    bool mRootElementActive = false;
+    bool mHasPenultimate = false;
+    bool mAllRunAway = false;
+    bool mHasVersion = false;
+    bool mVersionIsTimeBuilder = false;
+    bool mHasFuHongFinal = false;
+    bool mHasFuHongBuild = false;
+    bool mHasBlockCalculationPos = false;
+    bool mHasChunkedBlocks = false;
+    bool mHasNamespaces = false;
+    bool mHasTotalBlocks = false;
+    bool mHasBlock = false;
+    bool mHasSize = false;
+    bool mHasDimensions = false;
+    bool mHasStructure = false;
+};
+
 } // namespace
 
 const std::vector<FormatInfo>& FormatRegistry::formats()
 {
-    return kFormats;
+    return format_table();
+}
+
+Result<ConversionCapability> FormatRegistry::capability(
+    StructureId source,
+    StructureId target,
+    ConversionDirection direction)
+{
+    const auto& formats = format_table();
+    const auto source_it = std::find_if(formats.begin(), formats.end(),
+        [source](const auto& value) { return value.id == source; });
+    const auto target_it = std::find_if(formats.begin(), formats.end(),
+        [target](const auto& value) { return value.id == target; });
+    if (source_it == formats.end() || target_it == formats.end()) {
+        return Result<ConversionCapability>::failure(
+            "capability error: unknown source or target format");
+    }
+
+    ConversionCapability result;
+    result.source = source;
+    result.target = target;
+    result.direction = direction;
+    switch (direction) {
+    case ConversionDirection::FileToFile:
+        result.supported = source_it->reader_implemented && target_it->writer_implemented;
+        if (!source_it->reader_implemented) {
+            result.reason = "source format has no verified reader";
+        } else if (!target_it->writer_implemented) {
+            result.reason = "target format has no verified writer";
+        }
+        if (result.supported) {
+            result.streaming = source_it->streaming_reader_implemented &&
+                target_it->streaming_writer_implemented;
+            if (source_it->read_projection_lossy) {
+                result.loss_reasons.push_back("source reader uses a lossy projection");
+            }
+            if (target_it->write_projection_lossy) {
+                result.loss_reasons.push_back("target writer omits unsupported states, actors, or metadata");
+            }
+        }
+        break;
+    case ConversionDirection::StructureToWorld:
+        result.supported = source_it->structure_to_world_implemented &&
+            target == StructureId::MCWorld;
+        if (target != StructureId::MCWorld) {
+            result.reason = "structure-to-world target must be MCWorld";
+        } else if (!source_it->structure_to_world_implemented) {
+            result.reason = "source format has no verified world writer";
+        }
+        if (result.supported) {
+            result.streaming = source_it->streaming_reader_implemented;
+            if (source_it->read_projection_lossy) {
+                result.loss_reasons.push_back("source reader uses a lossy projection");
+            }
+        }
+        break;
+    case ConversionDirection::WorldToStructure:
+        result.supported = source == StructureId::MCWorld &&
+            target_it->world_to_structure_implemented;
+        if (source != StructureId::MCWorld) {
+            result.reason = "world-to-structure source must be MCWorld";
+        } else if (!target_it->world_to_structure_implemented) {
+            result.reason = "target format has no verified world-to-file writer";
+        }
+        if (result.supported) {
+            result.streaming = source_it->streaming_reader_implemented &&
+                target_it->streaming_writer_implemented;
+            if (target_it->write_projection_lossy) {
+                result.loss_reasons.push_back("target writer omits unsupported states, actors, or metadata");
+            }
+        }
+        break;
+    }
+    result.lossy = !result.loss_reasons.empty();
+    return Result<ConversionCapability>::success(std::move(result));
 }
 
 Result<FormatInfo> FormatRegistry::detect(const std::filesystem::path& path)
@@ -272,7 +777,7 @@ Result<FormatInfo> FormatRegistry::detect(const std::filesystem::path& path)
     const auto ext = lower(path.extension().string());
 
     auto by_id = [](StructureId id) -> FormatInfo {
-        return *std::find_if(kFormats.begin(), kFormats.end(), [id](const auto& value) {
+        return *std::find_if(format_table().begin(), format_table().end(), [id](const auto& value) {
             return value.id == id;
         });
     };
@@ -306,6 +811,10 @@ Result<FormatInfo> FormatRegistry::detect(const std::filesystem::path& path)
     if (static_cast<unsigned char>(header[0]) == 0x78 && ext == ".fhbuild") {
         return Result<FormatInfo>::success(by_id(StructureId::FuHongV5));
     }
+    // TIBI payloads commonly start with 0x0a (the same marker used by
+    // MCStructure).  Give the explicit extension precedence so a valid .tibi
+    // file is not misclassified before its reader gets a chance to validate it.
+    if (ext == ".tibi") return Result<FormatInfo>::success(by_id(StructureId::TIBI));
     if (ext == ".np") return Result<FormatInfo>::success(by_id(StructureId::NexusNP));
     if (ext == ".bds") return Result<FormatInfo>::success(by_id(StructureId::BDS));
     if (static_cast<unsigned char>(header[0]) == 0x0a) {
@@ -313,65 +822,22 @@ Result<FormatInfo> FormatRegistry::detect(const std::filesystem::path& path)
     }
 
     // JSON formats share extensions, so use the same field-based order as Go's
-    // registry before falling back to the extension table.
+    // registry before falling back to the extension table. The probe is SAX
+    // based so detection does not retain a second complete copy of a large
+    // vendor structure immediately before its reader is opened.
     if (ext == ".json" || ext == ".building" || ext == ".buildingx" ||
         ext == ".reb" || ext == ".covstructure") {
         std::ifstream json_input(path, std::ios::binary);
-        nlohmann::json document;
-        try {
-            json_input >> document;
-            if (document.is_object()) {
-                if (document.value("version", std::string{}) == "TimeBuilder") return Result<FormatInfo>::success(by_id(StructureId::TimeBuilderV1));
-                if (document.contains("FuHongBuild_FinalFormat")) return Result<FormatInfo>::success(by_id(StructureId::FuHongV2));
-                if (document.contains("FuHongBuild")) {
-                    return Result<FormatInfo>::success(by_id(document.contains("BlockCalculationPos") ? StructureId::FuHongV3 : StructureId::FuHongV4));
-                }
-                if (document.contains("chunkedBlocks") && document.contains("namespaces")) return Result<FormatInfo>::success(by_id(StructureId::MianYangV1));
-                if (document.contains("totalBlocks")) return Result<FormatInfo>::success(by_id(StructureId::QingXuV1));
-                if (document.contains("block") && document.contains("version")) return Result<FormatInfo>::success(by_id(StructureId::TimeBuilderV1));
-                if ((document.contains("size") || document.contains("dimensions")) &&
-                    document.contains("structure")) return Result<FormatInfo>::success(by_id(StructureId::CovStructure));
-            } else if (document.is_array() && !document.empty()) {
-                if (document.front().is_array() && document.back().is_array()) {
-                    return Result<FormatInfo>::success(by_id(StructureId::GangBanV6));
-                }
-                if (document.size() >= 2 && document.front().is_number() &&
-                    document[document.size() - 2].is_object() &&
-                    document[document.size() - 2].contains("ep") && document.back().is_array()) {
-                    return Result<FormatInfo>::success(by_id(StructureId::GangBanV5));
-                }
-                if (document.front().is_object()) {
-                    if (std::ranges::all_of(document, [](const auto& entry) {
-                        return entry.is_object() && entry.contains("name") &&
-                            entry.contains("x") && entry.contains("y") && entry.contains("z") &&
-                            entry["name"].is_string() && entry["x"].is_number_integer() &&
-                            entry["y"].is_number_integer() && entry["z"].is_number_integer();
-                    })) {
-                        return Result<FormatInfo>::success(by_id(StructureId::RunAway));
-                    }
-                    if (document.front().contains("name") && document.front().contains("aux") &&
-                        document.front().contains("x") && document.front().contains("y") &&
-                        document.front().contains("z")) {
-                        return Result<FormatInfo>::success(by_id(StructureId::FuHongV1));
-                    }
-                    if (document.size() >= 2 && document.back().is_object() && document.back().contains("list")) {
-                        const auto& penultimate = document[document.size() - 2];
-                        return Result<FormatInfo>::success(by_id(
-                            penultimate.is_object() && penultimate.contains("start") && penultimate.contains("end")
-                                ? StructureId::GangBanV1 : StructureId::GangBanV2));
-                    }
-                    if (document.size() >= 2 && document.front().contains("xcha")) {
-                        if (document[1].is_string()) return Result<FormatInfo>::success(by_id(StructureId::GangBanV3));
-                        if (document[1].is_array()) return Result<FormatInfo>::success(by_id(StructureId::GangBanV4));
-                    }
-                }
+        JsonFormatProbe probe;
+        if (json_input && nlohmann::json::sax_parse(json_input, &probe)) {
+            if (const auto detected = probe.detected()) {
+                return Result<FormatInfo>::success(by_id(*detected));
             }
-        } catch (...) {
-            // Extension fallback below retains the Go registry's eventual error.
         }
+        // Extension fallback below retains the Go registry's eventual error.
     }
 
-    for (const auto& format : kFormats) {
+    for (const auto& format : format_table()) {
         if (std::find(format.extensions.begin(), format.extensions.end(), ext) != format.extensions.end()) {
             return Result<FormatInfo>::success(format);
         }
@@ -408,6 +874,10 @@ Result<std::unique_ptr<IStructure>> FormatRegistry::open_as(
     if (format == StructureId::BDX) {
         auto reader = std::make_unique<BdxStructure>(registry);
         reader->set_streaming_world_import(options.streaming_world_import);
+        reader->set_streaming_options(
+            options.allow_temporary_spool,
+            options.temporary_directory,
+            options.temporary_file_limit_bytes);
         auto parsed = reader->read(path);
         if (!parsed) return Result<std::unique_ptr<IStructure>>::failure(parsed.error());
         return Result<std::unique_ptr<IStructure>>::success(std::move(reader));
@@ -515,8 +985,12 @@ Result<std::unique_ptr<IStructure>> FormatRegistry::open_as(
     }
     if (format == StructureId::SchemV1 || format == StructureId::SchemV2) {
         std::string first_error;
-        for (const auto format : { StructureId::SchemV1, StructureId::SchemV2 }) {
-            auto reader = std::make_unique<SchemStructure>(registry, format);
+        const std::array attempts{
+            format,
+            format == StructureId::SchemV1 ? StructureId::SchemV2 : StructureId::SchemV1
+        };
+        for (const auto attempted_format : attempts) {
+            auto reader = std::make_unique<SchemStructure>(registry, attempted_format);
             reader->set_streaming_world_import(options.streaming_world_import);
             reader->set_direct_world_stream(options.direct_schem_world_stream);
             auto parsed = reader->read(path);
@@ -539,6 +1013,10 @@ Result<std::unique_ptr<IStructure>> FormatRegistry::open_as(
     }
     if (format == StructureId::MCWorld) {
         auto reader = std::make_unique<McWorldStructure>(registry);
+        reader->set_archive_options(
+            options.allow_temporary_spool,
+            options.temporary_directory,
+            options.temporary_file_limit_bytes);
         auto parsed = reader->read(path);
         if (!parsed) {
             return Result<std::unique_ptr<IStructure>>::failure(parsed.error());
@@ -555,6 +1033,11 @@ Result<std::unique_ptr<IStructure>> FormatRegistry::open_as(
     }
     if (format == StructureId::TIBI) {
         auto reader = std::make_unique<TibiReader>(registry);
+        reader->set_streaming_options(
+            options.soft_memory_budget_bytes,
+            options.allow_temporary_spool,
+            options.temporary_directory,
+            options.temporary_file_limit_bytes);
         auto parsed = reader->read(path);
         if (!parsed) return Result<std::unique_ptr<IStructure>>::failure(parsed.error());
         return Result<std::unique_ptr<IStructure>>::success(std::move(reader));
@@ -571,53 +1054,111 @@ Result<void> FormatRegistry::write(
     RuntimeRegistry& registry,
     const ConversionOptions& options)
 {
+    const auto started = std::chrono::steady_clock::now();
+    ConversionStats stats;
+    stats.source_format = structure.id();
+    stats.target_format = format;
+    const auto source_size = structure.size();
+    const auto source_chunk_x = static_cast<std::size_t>(
+        std::max<std::int32_t>(0, source_size.chunk_x_count()));
+    const auto source_chunk_z = static_cast<std::size_t>(
+        std::max<std::int32_t>(0, source_size.chunk_z_count()));
+    if (source_chunk_x != 0 &&
+        source_chunk_z > std::numeric_limits<std::size_t>::max() / source_chunk_x) {
+        return Result<void>::failure("source chunk count overflows size_t");
+    }
+    stats.source_chunks = source_chunk_x * source_chunk_z;
+    const bool report_statistics = options.collect_statistics ||
+        static_cast<bool>(options.callbacks.statistics);
+    ProgressStructure* measured_input = nullptr;
+    const auto finish = [&](Result<void> result) -> Result<void> {
+        stats.success = result.ok();
+        if (!result) {
+            stats.error_stage = "encode/write";
+            stats.error_location = result.error();
+        }
+        stats.completed_chunks = result.ok() ? stats.source_chunks : 0;
+        if (report_statistics) {
+            stats.elapsed_ms = static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - started).count());
+            if (measured_input != nullptr) {
+                stats.chunk_materialization_ms +=
+                    measured_input->chunk_materialization_ms();
+                stats.nbt_entity_decode_ms += measured_input->nbt_entity_decode_ms();
+                const auto source_ms = stats.chunk_materialization_ms >
+                        std::numeric_limits<std::uint64_t>::max() - stats.nbt_entity_decode_ms
+                    ? std::numeric_limits<std::uint64_t>::max()
+                    : stats.chunk_materialization_ms + stats.nbt_entity_decode_ms;
+                stats.encode_compress_ms += stats.elapsed_ms > source_ms
+                    ? stats.elapsed_ms - source_ms : 0;
+            }
+            if (result.ok()) {
+                // Counting is deliberately opt-in: several readers compute
+                // this lazily and a benchmark should not pay for it twice.
+                auto count = structure.count_non_air_blocks();
+                if (count) stats.non_air_blocks = count.value();
+            }
+            if (const auto* bdx = dynamic_cast<const BdxStructure*>(&structure)) {
+                stats.temporary_spool_bytes = static_cast<std::uint64_t>(
+                    bdx->temporary_spool_bytes());
+            }
+            if (options.callbacks.statistics) {
+                try {
+                    options.callbacks.statistics(stats);
+                } catch (...) {
+                    // Telemetry is diagnostic and must not alter writer
+                    // success/failure or unwind through the C API.
+                }
+            }
+        }
+        return result;
+    };
     std::unique_ptr<ProgressStructure> progress_structure;
     const IStructure* input = &structure;
-    if (options.callbacks.start || options.callbacks.progress) {
+    if (report_statistics || options.callbacks.start || options.callbacks.progress) {
         progress_structure = std::make_unique<ProgressStructure>(structure, options.callbacks);
-        const auto size = structure.size();
-        const auto total = static_cast<std::size_t>(size.chunk_x_count()) *
-            static_cast<std::size_t>(size.chunk_z_count());
-        progress_structure->set_total(total);
+        progress_structure->set_total(stats.source_chunks);
+        measured_input = progress_structure.get();
         input = progress_structure.get();
     }
     if (format == StructureId::MCStructure) {
-        return write_mcstructure(*input, registry, path);
+        return finish(write_mcstructure(*input, registry, path, options));
     }
     if (format == StructureId::BDX) {
-        return write_bdx(*input, registry, path);
+        return finish(write_bdx(*input, registry, path, options));
     }
     if (format == StructureId::AxiomBP) {
-        return write_axiom_bp(*input, registry, path);
+        return finish(write_axiom_bp(*input, registry, path, options));
     }
     if (format == StructureId::SchemV1 || format == StructureId::SchemV2) {
-        return write_schem(*input, registry, format, path);
+        return finish(write_schem(*input, registry, format, path, options));
     }
     if (format == StructureId::Litematic) {
-        return write_litematic(*input, registry, path);
+        return finish(write_litematic(*input, registry, path, options));
     }
     if (format == StructureId::Schematic) {
-        return write_schematic(*input, registry, path);
+        return finish(write_schematic(*input, registry, path, options));
     }
     if (format == StructureId::IBImport) {
-        return write_ibimport(*input, registry, path, options);
+        return finish(write_ibimport(*input, registry, path, options));
     }
     if (format == StructureId::FuHongV4 || format == StructureId::FuHongV5) {
-        return write_fuhong(*input, registry, format, path);
+        return finish(write_fuhong(*input, registry, format, path, options));
     }
     if (format == StructureId::MCFunction) {
-        return write_mcfunction(*input, registry, path, options);
+        return finish(write_mcfunction(*input, registry, path, options));
     }
-    return Result<void>::failure(
-        "capability error: 目标格式 " + to_string(format) + " 没有已验证的 writer");
+    return finish(Result<void>::failure(
+        "capability error: 目标格式 " + to_string(format) + " 没有已验证的 writer"));
 }
 
 std::string to_string(StructureId id)
 {
-    const auto it = std::find_if(kFormats.begin(), kFormats.end(), [id](const auto& value) {
+    const auto it = std::find_if(format_table().begin(), format_table().end(), [id](const auto& value) {
         return value.id == id;
     });
-    return it == kFormats.end() ? "Unknown" : it->name;
+    return it == format_table().end() ? "Unknown" : it->name;
 }
 
 } // namespace water_structure

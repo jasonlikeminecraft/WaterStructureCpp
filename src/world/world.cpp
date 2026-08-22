@@ -1,4 +1,5 @@
 #include <WaterStructure/world.hpp>
+#include <WaterStructure/chunk_stream.hpp>
 #include <WaterStructure/coordinates.hpp>
 
 #include "archive.hpp"
@@ -17,6 +18,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <charconv>
 #include <chrono>
 #include <cctype>
@@ -44,7 +46,7 @@ constexpr std::int32_t kMinSubChunkY = kOverworldMinY / 16;
 constexpr std::int32_t kMaxSubChunkY = 19;
 using Clock = std::chrono::steady_clock;
 
-std::size_t world_encode_worker_count(std::size_t chunk_count)
+std::size_t world_encode_worker_count(std::size_t chunk_count, std::size_t requested)
 {
     if (chunk_count < 2) return 1;
     // Encoding is CPU-heavy, while the following LevelDB commit is a single
@@ -52,9 +54,10 @@ std::size_t world_encode_worker_count(std::size_t chunk_count)
     // encoding without competing excessively for memory bandwidth. The
     // setting is intentionally process-local so callers that already own a
     // larger scheduler can tune it without changing the public ABI.
-    std::size_t configured = 2;
-    if (const auto* text = std::getenv("WATER_STRUCTURE_WORLD_ENCODE_THREADS");
-        text && *text) {
+    std::size_t configured = requested == 0 ? 2 : requested;
+    const auto* text = requested == 0
+        ? std::getenv("WATER_STRUCTURE_WORLD_ENCODE_THREADS") : nullptr;
+    if (text && *text) {
         std::size_t parsed = 0;
         const auto* end = text + std::char_traits<char>::length(text);
         const auto [next, error] = std::from_chars(text, end, parsed);
@@ -112,16 +115,37 @@ std::filesystem::path locate_world_root(const std::filesystem::path& extracted)
     return {};
 }
 
-std::filesystem::path make_temporary_world_directory()
+std::filesystem::path make_temporary_world_directory(
+    const std::filesystem::path& configured_root = {})
 {
 #if defined(_WIN32)
     const auto process_id = static_cast<std::uint64_t>(GetCurrentProcessId());
 #else
     const auto process_id = static_cast<std::uint64_t>(getpid());
 #endif
+    static std::atomic<std::uint64_t> sequence{0};
     const auto unique = std::to_string(process_id) + "-" +
-        std::to_string(std::chrono::high_resolution_clock::now().time_since_epoch().count());
-    return std::filesystem::temp_directory_path() / "WaterStructureCpp" / unique;
+        std::to_string(std::chrono::high_resolution_clock::now().time_since_epoch().count()) + "-" +
+        std::to_string(sequence.fetch_add(1, std::memory_order_relaxed));
+    const auto root = configured_root.empty()
+        ? std::filesystem::temp_directory_path()
+        : configured_root;
+    return root / "WaterStructureCpp" / unique;
+}
+
+std::filesystem::path make_temporary_archive_path(const std::filesystem::path& target)
+{
+#if defined(_WIN32)
+    const auto process_id = static_cast<std::uint64_t>(GetCurrentProcessId());
+#else
+    const auto process_id = static_cast<std::uint64_t>(getpid());
+#endif
+    static std::atomic<std::uint64_t> sequence{0};
+    auto path = target;
+    path += ".water_structure_tmp-" + std::to_string(process_id) + "-" +
+        std::to_string(std::chrono::high_resolution_clock::now().time_since_epoch().count()) + "-" +
+        std::to_string(sequence.fetch_add(1, std::memory_order_relaxed));
+    return path;
 }
 
 Result<void> copy_world_directory(
@@ -155,6 +179,17 @@ Result<BedrockWorldAdapter> BedrockWorldAdapter::open(
     const std::filesystem::path& directory,
     bool write_back_archive)
 {
+    return open(directory, WorldOpenOptions{
+        .write_back_archive = write_back_archive
+    });
+}
+
+Result<BedrockWorldAdapter> BedrockWorldAdapter::open(
+    const std::filesystem::path& directory,
+    const WorldOpenOptions& options)
+{
+    const auto unpack_start = Clock::now();
+    std::uint64_t unpack_ms = 0;
     std::filesystem::path world_directory = directory;
     std::filesystem::path temporary_directory;
     std::filesystem::path archive_path;
@@ -167,13 +202,21 @@ Result<BedrockWorldAdapter> BedrockWorldAdapter::open(
         if (!archive_extension) {
             return Result<BedrockWorldAdapter>::failure("世界文件扩展名不是 .mcworld 或 .zip");
         }
-        temporary_directory = make_temporary_world_directory();
-        const auto extracted = archive::extract_zip(directory, temporary_directory);
+        if (!options.allow_temporary_spool) {
+            return Result<BedrockWorldAdapter>::failure(
+                "capability error: .mcworld 输入需要受控临时目录，但 allow_temporary_spool=false");
+        }
+        temporary_directory = make_temporary_world_directory(options.temporary_directory);
+        const auto extracted = archive::extract_zip(
+            directory, temporary_directory, options.temporary_file_limit_bytes);
         if (!extracted) {
             std::error_code cleanup_error;
             std::filesystem::remove_all(temporary_directory, cleanup_error);
             return Result<BedrockWorldAdapter>::failure(extracted.error());
         }
+        unpack_ms = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                Clock::now() - unpack_start).count());
         world_directory = locate_world_root(temporary_directory);
         if (world_directory.empty()) {
             std::error_code cleanup_error;
@@ -186,7 +229,11 @@ Result<BedrockWorldAdapter> BedrockWorldAdapter::open(
         // world in a private directory first, then close() packs it and
         // atomically moves the archive into place. This keeps LevelDB away
         // from the final archive path and preserves streaming writes.
-        temporary_directory = make_temporary_world_directory();
+        if (!options.allow_temporary_spool) {
+            return Result<BedrockWorldAdapter>::failure(
+                "capability error: .mcworld 输出需要受控临时目录，但 allow_temporary_spool=false");
+        }
+        temporary_directory = make_temporary_world_directory(options.temporary_directory);
         world_directory = temporary_directory;
         archive_path = std::filesystem::absolute(directory);
         std::error_code parent_error;
@@ -195,8 +242,12 @@ Result<BedrockWorldAdapter> BedrockWorldAdapter::open(
             return Result<BedrockWorldAdapter>::failure(
                 "创建 .mcworld 输出目录失败: " + parent_error.message());
         }
-    } else if (std::filesystem::is_directory(directory) && !write_back_archive) {
-        temporary_directory = make_temporary_world_directory();
+    } else if (std::filesystem::is_directory(directory) && !options.write_back_archive) {
+        if (!options.allow_temporary_spool) {
+            return Result<BedrockWorldAdapter>::failure(
+                "capability error: 只读目录世界需要受控副本，但 allow_temporary_spool=false");
+        }
+        temporary_directory = make_temporary_world_directory(options.temporary_directory);
         const auto copied = copy_world_directory(directory, temporary_directory);
         if (!copied) {
             std::error_code cleanup_error;
@@ -218,65 +269,175 @@ Result<BedrockWorldAdapter> BedrockWorldAdapter::open(
     result.mDirectory = world_directory;
     result.mArchivePath = std::move(archive_path);
     result.mTemporaryDirectory = std::move(temporary_directory);
-    result.mWriteBackArchive = write_back_archive;
+    result.mWriteBackArchive = options.write_back_archive;
+    result.mTemporaryFileLimitBytes = options.temporary_file_limit_bytes;
+    result.mIoStats.mcworld_unpack_ms = unpack_ms;
     result.mWorld.emplace(std::move(opened.value));
     return Result<BedrockWorldAdapter>::success(std::move(result));
 }
 
 BedrockWorldAdapter::~BedrockWorldAdapter()
 {
-    (void)close();
+    // Never call deferred user code from a destructor. A callback may capture
+    // locals declared after the adapter and those references are no longer
+    // valid by the time automatic destruction reaches us. Explicit close()
+    // remains the commit/statistics boundary for callers that need final
+    // LevelDB-close and archive-pack timings.
+    mDeferredStats.reset();
+    mDeferredStatisticsCallback = {};
+    try {
+        if (mDiscardOnClose) (void)discard();
+        else (void)close();
+    } catch (...) {
+        // Destruction is a last-resort resource boundary and must never
+        // terminate the process. Explicit close()/discard() report errors.
+    }
+}
+
+Result<void> BedrockWorldAdapter::cleanup_temporary_artifacts()
+{
+    std::string error;
+    if (!mPendingArchivePath.empty()) {
+        std::error_code remove_error;
+        std::filesystem::remove(mPendingArchivePath, remove_error);
+        if (remove_error) {
+            error = "清理临时 .mcworld 失败: " + remove_error.message();
+        } else {
+            mPendingArchivePath.clear();
+        }
+    }
+    if (!mTemporaryDirectory.empty()) {
+        std::error_code cleanup_error;
+        std::filesystem::remove_all(mTemporaryDirectory, cleanup_error);
+        if (cleanup_error) {
+            if (!error.empty()) error += "; ";
+            error += "清理世界临时目录失败: " + cleanup_error.message();
+        } else {
+            mTemporaryDirectory.clear();
+        }
+    }
+    return error.empty()
+        ? Result<void>::success()
+        : Result<void>::failure(std::move(error));
+}
+
+Result<void> BedrockWorldAdapter::discard()
+{
+    mDiscardOnClose = false;
+    mEncodePool.reset();
+    mEncodePoolWorkers = 0;
+    std::string error;
+    if (mWorld) {
+        const auto close_start = Clock::now();
+        auto closed = mWorld->close();
+        mIoStats.leveldb_close_ms += static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                Clock::now() - close_start).count());
+        mWorld.reset();
+        if (!closed) error = "关闭丢弃世界失败: " + closed.error;
+    }
+    // Clearing the commit destination before cleanup makes repeated close()
+    // calls cleanup-only even if a locked temporary file cannot be removed on
+    // the first attempt. The original/final archive is never touched here.
+    mArchivePath.clear();
+    mWriteBackArchive = false;
+    auto cleaned = cleanup_temporary_artifacts();
+    if (!cleaned) {
+        if (!error.empty()) error += "; ";
+        error += cleaned.error();
+    }
+    emit_deferred_statistics(false, error.empty() ? "conversion aborted" : "discard cleanup");
+    return error.empty()
+        ? Result<void>::success()
+        : Result<void>::failure(std::move(error));
 }
 
 Result<void> BedrockWorldAdapter::close()
 {
+    if (mDiscardOnClose) return discard();
     // All save_chunks() calls join their encoding futures before returning,
     // so releasing the reusable pool here is safe and avoids keeping worker
     // threads alive during archive packing.
     mEncodePool.reset();
     mEncodePoolWorkers = 0;
     if (!mWorld) {
+        auto cleaned = cleanup_temporary_artifacts();
+        if (!cleaned) {
+            emit_deferred_statistics(false, "mcworld cleanup");
+            return cleaned;
+        }
+        emit_deferred_statistics(true);
         return Result<void>::success();
     }
+    const auto close_start = Clock::now();
     auto result = mWorld->close();
+    mIoStats.leveldb_close_ms += static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            Clock::now() - close_start).count());
     mWorld.reset();
     if (!result) {
-        return Result<void>::failure(result.error);
+        mArchivePath.clear();
+        mWriteBackArchive = false;
+        const auto cleaned = cleanup_temporary_artifacts();
+        emit_deferred_statistics(false, "leveldb close");
+        auto error = result.error;
+        if (!cleaned) error += "; " + cleaned.error();
+        return Result<void>::failure(std::move(error));
     }
     if (!mArchivePath.empty() && mWriteBackArchive) {
-        auto temporary_archive = mArchivePath;
-        temporary_archive += ".water_structure_tmp";
-        const auto packed = archive::create_zip(mDirectory, temporary_archive);
-        if (!packed) return packed;
+        const auto pack_start = Clock::now();
+        mPendingArchivePath = make_temporary_archive_path(mArchivePath);
+        const auto packed = archive::create_zip(
+            mDirectory, mPendingArchivePath, mTemporaryFileLimitBytes);
+        mIoStats.mcworld_pack_ms += static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                Clock::now() - pack_start).count());
+        if (!packed) {
+            mArchivePath.clear();
+            mWriteBackArchive = false;
+            const auto cleaned = cleanup_temporary_artifacts();
+            emit_deferred_statistics(false, "mcworld pack");
+            auto error = packed.error();
+            if (!cleaned) error += "; " + cleaned.error();
+            return Result<void>::failure(std::move(error));
+        }
 #if defined(_WIN32)
-        if (!MoveFileExW(temporary_archive.c_str(), mArchivePath.c_str(),
+        if (!MoveFileExW(mPendingArchivePath.c_str(), mArchivePath.c_str(),
                 MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
             const auto error = GetLastError();
-            return Result<void>::failure("替换 .mcworld 失败，Win32 error=" + std::to_string(error));
+            mArchivePath.clear();
+            mWriteBackArchive = false;
+            const auto cleaned = cleanup_temporary_artifacts();
+            emit_deferred_statistics(false, "mcworld replace");
+            auto message = "替换 .mcworld 失败，Win32 error=" + std::to_string(error);
+            if (!cleaned) message += "; " + cleaned.error();
+            return Result<void>::failure(std::move(message));
         }
 #else
         std::error_code replace_error;
-        std::filesystem::rename(temporary_archive, mArchivePath, replace_error);
+        std::filesystem::rename(mPendingArchivePath, mArchivePath, replace_error);
         if (replace_error) {
-            return Result<void>::failure(
-                "替换 .mcworld 失败: " + replace_error.message());
+            mArchivePath.clear();
+            mWriteBackArchive = false;
+            const auto cleaned = cleanup_temporary_artifacts();
+            emit_deferred_statistics(false, "mcworld replace");
+            auto message = "替换 .mcworld 失败: " + replace_error.message();
+            if (!cleaned) message += "; " + cleaned.error();
+            return Result<void>::failure(std::move(message));
         }
 #endif
-        std::error_code cleanup_error;
-        std::filesystem::remove_all(mTemporaryDirectory, cleanup_error);
-        if (cleanup_error) {
-            return Result<void>::failure("清理解压目录失败: " + cleanup_error.message());
-        }
+        mPendingArchivePath.clear();
         mArchivePath.clear();
-        mTemporaryDirectory.clear();
+        mWriteBackArchive = false;
     }
-    if (!mTemporaryDirectory.empty()) {
-        std::error_code cleanup_error;
-        std::filesystem::remove_all(mTemporaryDirectory, cleanup_error);
-        if (cleanup_error) return Result<void>::failure("清理解压目录失败: " + cleanup_error.message());
-        mArchivePath.clear();
-        mTemporaryDirectory.clear();
+    mArchivePath.clear();
+    mWriteBackArchive = false;
+    const auto cleaned = cleanup_temporary_artifacts();
+    if (!cleaned) {
+        emit_deferred_statistics(false, "mcworld cleanup");
+        return cleaned;
     }
+    emit_deferred_statistics(true);
     return Result<void>::success();
 }
 
@@ -538,7 +699,7 @@ Result<std::vector<EncodedSubChunkData>> BedrockWorldAdapter::encode_chunks(
         return Result<std::vector<EncodedSubChunkData>>::success(std::move(result));
     };
 
-    const auto worker_count = world_encode_worker_count(chunks.size());
+    const auto worker_count = world_encode_worker_count(chunks.size(), mConfiguredWorkerCount);
     if (worker_count == 1) return encode_range(0, chunks.size());
 
     // Keep the pool on the world adapter. Schem and other row-oriented
@@ -735,25 +896,85 @@ Result<void> BedrockWorldAdapter::save_chunks(std::span<const ChunkWrite> chunks
 {
     const bool detail_profile =
         std::getenv("WATER_STRUCTURE_PROFILE_DETAIL") != nullptr;
-    const auto encode_start = detail_profile ? Clock::now() : Clock::time_point{};
+    const auto encode_start = Clock::now();
     auto encoded = encode_chunks(chunks);
     if (!encoded) return Result<void>::failure(encoded.error());
     auto payloads = std::move(encoded).value();
-    const auto encode_ms = detail_profile
-        ? std::chrono::duration<double, std::milli>(Clock::now() - encode_start).count()
-        : 0.0;
+    const auto encode_ms = std::chrono::duration<double, std::milli>(
+        Clock::now() - encode_start).count();
     const auto payload_count = payloads.size();
-    const auto save_start = detail_profile ? Clock::now() : Clock::time_point{};
+    std::uint64_t payload_bytes = 0;
+    for (const auto& payload : payloads) payload_bytes += payload.payload.size();
+    const auto save_start = Clock::now();
     auto saved = save_subchunk_payloads(std::move(payloads));
+    const auto leveldb_ms = std::chrono::duration<double, std::milli>(
+        Clock::now() - save_start).count();
+    mIoStats.encode_compress_ms += static_cast<std::uint64_t>(std::max(0.0, encode_ms));
+    mIoStats.leveldb_write_ms += static_cast<std::uint64_t>(std::max(0.0, leveldb_ms));
+    mIoStats.compressed_output_bytes += payload_bytes;
+    ++mIoStats.leveldb_batches;
     if (detail_profile) {
-        const auto leveldb_ms = std::chrono::duration<double, std::milli>(
-            Clock::now() - save_start).count();
         std::cerr << "world_save_chunks_profile chunks=" << chunks.size()
                   << " subchunks=" << payload_count
                   << " encode_ms=" << encode_ms
                   << " leveldb_ms=" << leveldb_ms << '\n';
     }
     return saved;
+}
+
+WorldIoStats BedrockWorldAdapter::take_io_stats() noexcept
+{
+    auto result = mIoStats;
+    mIoStats = {};
+    return result;
+}
+
+void BedrockWorldAdapter::defer_statistics(
+    ConversionStats stats,
+    std::function<void(const ConversionStats&)> callback) noexcept
+{
+    // A target is normally closed after one conversion. If a caller performs
+    // consecutive writes, complete the earlier pipeline snapshot before
+    // replacing it; the final write still receives close/archive timings.
+    try {
+        if (mDeferredStats) emit_deferred_statistics(true);
+        mDeferredStats = std::move(stats);
+        mDeferredStatisticsCallback = std::move(callback);
+    } catch (...) {
+        mDeferredStats.reset();
+        mDeferredStatisticsCallback = {};
+    }
+}
+
+void BedrockWorldAdapter::emit_deferred_statistics(
+    bool success,
+    std::string_view error_stage) noexcept
+{
+    try {
+        if (!mDeferredStats) return;
+        const auto io = take_io_stats();
+        auto stats = std::move(*mDeferredStats);
+        mDeferredStats.reset();
+        stats.encode_compress_ms += io.encode_compress_ms;
+        stats.leveldb_write_ms += io.leveldb_write_ms;
+        stats.leveldb_close_ms += io.leveldb_close_ms;
+        stats.mcworld_unpack_ms += io.mcworld_unpack_ms;
+        stats.mcworld_pack_ms += io.mcworld_pack_ms;
+        stats.compressed_output_bytes += io.compressed_output_bytes;
+        stats.leveldb_batches += io.leveldb_batches;
+        stats.temporary_spool_bytes += io.temporary_spool_bytes;
+        stats.elapsed_ms += io.leveldb_close_ms + io.mcworld_pack_ms;
+        stats.success = success;
+        if (!success && stats.error_stage.empty()) stats.error_stage = std::string(error_stage);
+        auto callback = std::move(mDeferredStatisticsCallback);
+        mDeferredStatisticsCallback = {};
+        if (!callback) return;
+        callback(stats);
+    } catch (...) {
+        mDeferredStats.reset();
+        mDeferredStatisticsCallback = {};
+        // Telemetry must not change conversion or close semantics.
+    }
 }
 
 Result<void> BedrockWorldAdapter::save_chunk_nbt(ChunkPos pos, std::span<const BlockEntity> entities)
@@ -795,134 +1016,291 @@ Result<void> BedrockWorldAdapter::save_chunk_nbt(ChunkPos pos, std::span<const B
     return Result<void>::success();
 }
 
+namespace {
+
+class WorldChunkSink final : public ChunkSink {
+public:
+    WorldChunkSink(
+        WorldTarget& world,
+        SubChunkPos start,
+        std::size_t batch_capacity,
+        ConversionCallbacks callbacks,
+        ConversionStats& stats)
+        : mWorld(world),
+          mStart(start),
+          mBatchCapacity(std::max<std::size_t>(batch_capacity, 1)),
+          mCallbacks(std::move(callbacks)),
+          mStats(stats)
+    {
+        mPositions.reserve(mBatchCapacity);
+        mChunks.reserve(mBatchCapacity);
+        mEntities.reserve(mBatchCapacity);
+    }
+
+    Result<void> push(StreamChunk&& source) override
+    {
+        const ChunkPos target_position{
+            source.position.x + mStart.x,
+            source.position.z + mStart.z
+        };
+        ChunkData shifted;
+        shifted.layout = source.blocks.layout;
+        const auto sub_y_offset = mStart.y - kMinSubChunkY;
+        for (auto& [local_sub_y, sub_chunk] : source.blocks.sub_chunks) {
+            const auto target_sub_y = local_sub_y + sub_y_offset;
+            if (target_sub_y < kMinSubChunkY || target_sub_y > kMaxSubChunkY) {
+                mStats.error_location = "chunk=(" + std::to_string(target_position.x) + "," +
+                    std::to_string(target_position.z) + "),subY=" + std::to_string(target_sub_y);
+                mStats.error_chunk = target_position;
+                mStats.has_error_chunk = true;
+                return Result<void>::failure(
+                    "目标 subchunk 超出 Overworld 高度范围: " + mStats.error_location);
+            }
+            shifted.sub_chunks.emplace(target_sub_y, std::move(sub_chunk));
+        }
+
+        for (auto& entity : source.entities) {
+            entity.pos.x += target_position.x * 16;
+            entity.pos.y += mStart.y * 16 - kOverworldMinY;
+            entity.pos.z += target_position.z * 16;
+        }
+        mPositions.push_back(target_position);
+        mChunks.push_back(std::move(shifted));
+        mEntities.push_back(std::move(source.entities));
+        ++mReceived;
+        if (mChunks.size() >= mBatchCapacity) return flush();
+        return Result<void>::success();
+    }
+
+    Result<void> finish() override { return flush(); }
+
+    std::size_t received() const noexcept { return mReceived; }
+    double save_chunks_ms() const noexcept { return mSaveChunksMs; }
+    double save_entities_ms() const noexcept { return mSaveEntitiesMs; }
+
+private:
+    Result<void> flush()
+    {
+        if (mChunks.empty()) return Result<void>::success();
+        std::vector<ChunkWrite> writes;
+        writes.reserve(mChunks.size());
+        for (std::size_t index = 0; index < mChunks.size(); ++index) {
+            writes.push_back({ mPositions[index], &mChunks[index] });
+        }
+
+        const auto save_start = Clock::now();
+        auto saved = mWorld.save_chunks(writes);
+        const auto saved_ms = std::chrono::duration<double, std::milli>(
+            Clock::now() - save_start).count();
+        mSaveChunksMs += saved_ms;
+        if (dynamic_cast<BedrockWorldAdapter*>(&mWorld) == nullptr) {
+            mStats.leveldb_write_ms += static_cast<std::uint64_t>(std::max(0.0, saved_ms));
+            ++mStats.leveldb_batches;
+        }
+        if (!saved) {
+            mStats.error_chunk = mPositions.front();
+            mStats.has_error_chunk = true;
+            mStats.error_location = "chunk=(" + std::to_string(mPositions.front().x) + "," +
+                std::to_string(mPositions.front().z) + ")";
+            return Result<void>::failure("批量保存区块 " + mStats.error_location + " 失败: " + saved.error());
+        }
+
+        for (std::size_t index = 0; index < mEntities.size(); ++index) {
+            if (mEntities[index].empty()) continue;
+            const auto entity_start = Clock::now();
+            auto entity_saved = mWorld.save_chunk_nbt(mPositions[index], mEntities[index]);
+            mSaveEntitiesMs += std::chrono::duration<double, std::milli>(
+                Clock::now() - entity_start).count();
+            if (!entity_saved) {
+                mStats.error_chunk = mPositions[index];
+                mStats.has_error_chunk = true;
+                mStats.error_location = "chunk=(" + std::to_string(mPositions[index].x) + "," +
+                    std::to_string(mPositions[index].z) + ")";
+                return Result<void>::failure(
+                    "保存区块 NBT " + mStats.error_location + " 失败: " + entity_saved.error());
+            }
+        }
+
+        mStats.completed_chunks += mChunks.size();
+        if (mCallbacks.progress) {
+            for (std::size_t index = 0; index < mChunks.size(); ++index) mCallbacks.progress();
+        }
+        mPositions.clear();
+        mChunks.clear();
+        mEntities.clear();
+        return Result<void>::success();
+    }
+
+    WorldTarget& mWorld;
+    SubChunkPos mStart{};
+    std::size_t mBatchCapacity = 1;
+    ConversionCallbacks mCallbacks;
+    ConversionStats& mStats;
+    std::vector<ChunkPos> mPositions;
+    std::vector<ChunkData> mChunks;
+    std::vector<std::vector<BlockEntity>> mEntities;
+    std::size_t mReceived = 0;
+    double mSaveChunksMs = 0.0;
+    double mSaveEntitiesMs = 0.0;
+};
+
+} // namespace
+
 Result<void> convert_to_world(const IStructure& structure, WorldTarget& world, SubChunkPos start, ConversionCallbacks callbacks)
 {
-    const bool profile = std::getenv("WATER_STRUCTURE_PROFILE") != nullptr;
-    double visit_chunks_ms = 0.0;
-    double save_chunks_ms = 0.0;
-    double visit_entities_ms = 0.0;
-    double save_entities_ms = 0.0;
+    WorldConversionOptions options;
+    options.worker_count = callbacks.worker_count;
+    options.max_in_flight_chunks = callbacks.max_in_flight_chunks;
+    options.soft_memory_budget_bytes = callbacks.soft_memory_budget_bytes;
+    options.allow_temporary_spool = callbacks.allow_temporary_spool;
+    options.collect_statistics = callbacks.collect_statistics;
+    options.temporary_directory = callbacks.temporary_directory;
+    options.temporary_file_limit_bytes = callbacks.temporary_file_limit_bytes;
+    options.profiling = callbacks.profiling;
+    options.callbacks = std::move(callbacks);
+    return convert_to_world(structure, world, start, options);
+}
+
+void BedrockWorldAdapter::configure_conversion(const WorldConversionOptions& options) noexcept
+{
+    mConfiguredWorkerCount = options.worker_count;
+    mConfiguredMaxInFlightChunks = options.max_in_flight_chunks;
+    mConfiguredSoftMemoryBudget = options.soft_memory_budget_bytes;
+    if (options.temporary_file_limit_bytes != 0) {
+        mTemporaryFileLimitBytes = options.temporary_file_limit_bytes;
+    }
+}
+
+Result<void> convert_to_world(
+    const IStructure& structure,
+    WorldTarget& world,
+    SubChunkPos start,
+    const WorldConversionOptions& options)
+{
+    const auto total_start = Clock::now();
     const auto elapsed_ms = [](const auto begin) {
         return std::chrono::duration<double, std::milli>(Clock::now() - begin).count();
     };
+    ConversionStats stats;
+    stats.source_format = structure.id();
+    stats.target_format = StructureId::MCWorld;
+    const auto finish = [&](Result<void> result, std::string_view stage = {}) -> Result<void> {
+        auto* adapter = dynamic_cast<BedrockWorldAdapter*>(&world);
+        if (adapter && !result) adapter->mDiscardOnClose = true;
+        if (adapter && options.callbacks.statistics) {
+            const auto io = adapter->take_io_stats();
+            stats.encode_compress_ms += io.encode_compress_ms;
+            stats.leveldb_write_ms += io.leveldb_write_ms;
+            stats.leveldb_close_ms += io.leveldb_close_ms;
+            stats.mcworld_unpack_ms += io.mcworld_unpack_ms;
+            stats.mcworld_pack_ms += io.mcworld_pack_ms;
+            stats.compressed_output_bytes += io.compressed_output_bytes;
+            stats.leveldb_batches += io.leveldb_batches;
+            stats.temporary_spool_bytes += io.temporary_spool_bytes;
+        }
+        stats.success = result.ok();
+        if (!result && stats.error_stage.empty()) stats.error_stage = std::string(stage);
+        stats.elapsed_ms = static_cast<std::uint64_t>(elapsed_ms(total_start));
+        if (options.callbacks.statistics) {
+            // close()/archive packing occurs after this function returns. A
+            // successful Bedrock conversion therefore publishes its final
+            // snapshot from BedrockWorldAdapter::close().
+            if (adapter && result.ok()) {
+                adapter->defer_statistics(stats, options.callbacks.statistics);
+            } else {
+                try {
+                    options.callbacks.statistics(stats);
+                } catch (...) {
+                    // Statistics are diagnostic only and must not replace the
+                    // conversion error (or turn success into failure).
+                }
+            }
+        }
+        return result;
+    };
+    const auto& callbacks = options.callbacks;
+    if (auto* adapter = dynamic_cast<BedrockWorldAdapter*>(&world)) {
+        adapter->configure_conversion(options);
+    }
+    const bool profile = std::getenv("WATER_STRUCTURE_PROFILE") != nullptr;
+    double visit_chunks_ms = 0.0;
+    double save_chunks_ms = 0.0;
+    double save_entities_ms = 0.0;
     const auto structure_size = structure.size();
-    const auto total_chunks = static_cast<std::size_t>(structure_size.chunk_x_count()) * structure_size.chunk_z_count();
+    if (structure_size.width <= 0 || structure_size.height <= 0 ||
+        structure_size.length <= 0) {
+        return finish(Result<void>::failure(
+            "结构尺寸必须为正数"), "size");
+    }
+    const auto chunk_x_count = structure_size.chunk_x_count();
+    const auto chunk_z_count = structure_size.chunk_z_count();
+    if (chunk_x_count <= 0 || chunk_z_count <= 0) {
+        return finish(Result<void>::failure(
+            "结构 chunk 尺寸无效"), "size");
+    }
+    const auto x_chunks = static_cast<std::size_t>(chunk_x_count);
+    const auto z_chunks = static_cast<std::size_t>(chunk_z_count);
+    if (z_chunks > std::numeric_limits<std::size_t>::max() / x_chunks) {
+        return finish(Result<void>::failure(
+            "结构 chunk 数量溢出"), "size");
+    }
+    const auto total_chunks = x_chunks * z_chunks;
+    stats.source_chunks = total_chunks;
     if (callbacks.start) {
         callbacks.start(total_chunks);
     }
 
-    std::vector<ChunkPos> positions;
-    positions.reserve(total_chunks);
-    for (std::int32_t z = 0; z < structure_size.chunk_z_count(); ++z) {
-        for (std::int32_t x = 0; x < structure_size.chunk_x_count(); ++x) {
-            positions.push_back({ x, z });
-        }
-    }
-
-    const std::size_t batch_size =
+    const std::size_t format_default_batch_size =
         (structure.id() == StructureId::SchemV1 || structure.id() == StructureId::SchemV2)
         ? static_cast<std::size_t>(structure_size.chunk_x_count())
         : structure.id() == StructureId::MCFunction
         ? 8
         : 64;
-    for (std::size_t begin = 0; begin < positions.size(); begin += batch_size) {
-        const auto end = std::min(begin + batch_size, positions.size());
-        const auto batch = std::span<const ChunkPos>(positions).subspan(begin, end - begin);
-        std::size_t visited_chunk_count = 0;
-        std::vector<ChunkPos> target_positions;
-        std::vector<ChunkData> shifted_chunks;
-        target_positions.reserve(batch.size());
-        shifted_chunks.reserve(batch.size());
-        const auto visit_chunks_start = Clock::now();
-        auto visited_chunks = structure.visit_chunks(batch,
-            [&](ChunkPos local_pos, const ChunkData& chunk) -> Result<void> {
-            ++visited_chunk_count;
-            const ChunkPos target_pos{ local_pos.x + start.x, local_pos.z + start.z };
-            ChunkData shifted;
-            const auto sub_y_offset = start.y - kMinSubChunkY;
-            for (const auto& [local_sub_y, sub_chunk] : chunk.sub_chunks) {
-                const auto target_sub_y = local_sub_y + sub_y_offset;
-                if (target_sub_y < kMinSubChunkY || target_sub_y > kMaxSubChunkY) {
-                    return Result<void>::failure(
-                        "目标 subchunk 超出 Overworld 高度范围: chunk=(" + std::to_string(target_pos.x) + ", " +
-                        std::to_string(target_pos.z) + "), subY=" + std::to_string(target_sub_y)
-                    );
-                }
-                shifted.sub_chunks.emplace(target_sub_y, sub_chunk);
-            }
-            target_positions.push_back(target_pos);
-            shifted_chunks.push_back(std::move(shifted));
-            return Result<void>::success();
-        });
-        if (!visited_chunks) return visited_chunks;
-        std::vector<ChunkWrite> writes;
-        writes.reserve(shifted_chunks.size());
-        for (std::size_t index = 0; index < shifted_chunks.size(); ++index) {
-            writes.push_back({ target_positions[index], &shifted_chunks[index] });
-        }
-        if (!writes.empty()) {
-            const auto save_start = Clock::now();
-            auto saved = world.save_chunks(writes);
-            save_chunks_ms += elapsed_ms(save_start);
-            if (!saved) {
-                const auto first = target_positions.front();
-                const auto last = target_positions.back();
-                return Result<void>::failure(
-                    "批量保存区块 (" + std::to_string(first.x) + ", " + std::to_string(first.z) +
-                    ")..(" + std::to_string(last.x) + ", " + std::to_string(last.z) + ") 失败: " +
-                    saved.error());
-            }
-        }
-        if (callbacks.progress) {
-            for (std::size_t completed = 0; completed < visited_chunk_count; ++completed) {
-                callbacks.progress();
-            }
-        }
-        visit_chunks_ms += elapsed_ms(visit_chunks_start);
-        if (callbacks.progress && visited_chunk_count < batch.size()) {
-            for (std::size_t missing = visited_chunk_count; missing < batch.size(); ++missing) {
-                callbacks.progress();
-            }
-        }
-
-        const auto visit_entities_start = Clock::now();
-        auto visited_entities = structure.visit_chunk_nbt(batch,
-            [&](ChunkPos local_pos, std::span<const BlockEntity> values) -> Result<void> {
-            if (values.empty()) return Result<void>::success();
-            const ChunkPos target_pos{ local_pos.x + start.x, local_pos.z + start.z };
-            std::vector<BlockEntity> shifted_values(values.begin(), values.end());
-            for (auto& entity : shifted_values) {
-                entity.pos.x += target_pos.x * 16;
-                entity.pos.y += start.y * 16 - kOverworldMinY;
-                entity.pos.z += target_pos.z * 16;
-            }
-            const auto save_start = Clock::now();
-            auto saved = world.save_chunk_nbt(
-                target_pos,
-                shifted_values
-            );
-            save_entities_ms += elapsed_ms(save_start);
-            if (!saved) {
-                return Result<void>::failure(
-                    "保存区块 NBT (" + std::to_string(target_pos.x) + ", " + std::to_string(target_pos.z) + ") 失败: " +
-                    saved.error()
-                );
-            }
-            return Result<void>::success();
-        });
-        visit_entities_ms += elapsed_ms(visit_entities_start);
-        if (!visited_entities) return visited_entities;
-        structure.release_cached_chunks();
+    // Source materialization, the bounded queue, the sink batch, parallel BWO
+    // payloads and LevelDB's WriteBatch can overlap. Charge the complete
+    // pipeline rather than one ChunkData instance; this is deliberately
+    // conservative so the default 450 MiB soft budget leaves headroom below
+    // the external 500 MiB hard test limit for registry/NBT/allocator state.
+    constexpr std::size_t kConservativeBytesPerChunk = 6u * 1024u * 1024u;
+    const auto budget_chunks = std::max<std::size_t>(1,
+        options.soft_memory_budget_bytes / kConservativeBytesPerChunk);
+    const auto explicit_chunks = options.max_in_flight_chunks == 0
+        ? format_default_batch_size : options.max_in_flight_chunks;
+    const auto batch_size = std::max<std::size_t>(1,
+        std::min({ format_default_batch_size, explicit_chunks, budget_chunks }));
+    stats.chunk_window_peak = batch_size;
+    WorldChunkSink sink(world, start, batch_size, callbacks, stats);
+    auto stream = ChunkStream::from_structure_grid(
+        structure, structure_size, batch_size);
+    const auto pipeline_start = Clock::now();
+    auto pumped = stream.pump(sink, {
+        .worker_count = options.worker_count == 0 ? 1 : options.worker_count,
+        .max_in_flight_chunks = batch_size,
+        .soft_memory_budget_bytes = options.soft_memory_budget_bytes
+    });
+    const auto pipeline_ms = elapsed_ms(pipeline_start);
+    save_chunks_ms = sink.save_chunks_ms();
+    save_entities_ms = sink.save_entities_ms();
+    visit_chunks_ms = std::max(0.0, pipeline_ms - save_chunks_ms - save_entities_ms);
+    stats.chunk_materialization_ms += static_cast<std::uint64_t>(visit_chunks_ms);
+    if (!pumped) {
+        auto stage = std::string_view{"chunk stream"};
+        if (stats.has_error_chunk) stage = "world sink";
+        return finish(std::move(pumped), stage);
     }
+    const auto missing = total_chunks > sink.received() ? total_chunks - sink.received() : 0;
+    if (callbacks.progress) {
+        for (std::size_t index = 0; index < missing; ++index) callbacks.progress();
+    }
+    stats.completed_chunks = total_chunks;
     if (profile) {
         std::cerr << "world_conversion_profile visit_chunks_ms=" << visit_chunks_ms
                   << " save_chunks_ms=" << save_chunks_ms
-                  << " visit_without_save_ms=" << (visit_chunks_ms - save_chunks_ms)
-                  << " visit_entities_ms=" << visit_entities_ms
+                  << " pipeline_wall_ms=" << pipeline_ms
                   << " save_entities_ms=" << save_entities_ms
                   << '\n';
     }
-    return Result<void>::success();
+    return finish(Result<void>::success());
 }
 
 } // namespace water_structure

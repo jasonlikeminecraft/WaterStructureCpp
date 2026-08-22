@@ -58,7 +58,7 @@ python -c "import water_structure as ws; print(ws.version(), ws.abi_version())"
 `version()` 是捆绑的原生库版本，`abi_version()` 是 C ABI 版本。当前 ABI 为 `1`；
 Python 包和原生库 ABI 不匹配时会直接导入失败。
 
-## 2. 四个核心接口
+## 2. 核心接口
 
 | 接口 | 用途 | 是否产生输出文件 |
 | --- | --- | --- |
@@ -66,6 +66,7 @@ Python 包和原生库 ABI 不匹配时会直接导入失败。
 | `Context.inspect(path)` | 获取尺寸、偏移和非空气数量 | 否 |
 | `Context.convert(input, format, output)` | 转为一个已实现 writer 的结构格式 | 是 |
 | `Context.to_world(input, world)` | 写入 Bedrock 目录世界或 `.mcworld` | 是 |
+| `formats()` | 读取逐方向 capability matrix | 否 |
 
 输入格式始终自动识别；输出格式必须明确指定。扩展名不会替你决定 `SchemV1` 还是
 `SchemV2`。
@@ -84,6 +85,24 @@ with Context() as ctx:
 
 不要让多个 Python 线程同时调用同一个 Context。需要并发隔离时，每个线程或进程
 创建自己的 Context；大型转换通常受磁盘与内存带宽限制，并发任务过多反而更慢。
+
+可以在提交批处理前检查目标方向是否真正实现：
+
+```python
+from water_structure import formats
+
+for capability in formats():
+    print(
+        capability.name,
+        "reader=", capability.file_reader,
+        "writer=", capability.file_writer,
+        "to-world=", capability.structure_to_world,
+        "from-world=", capability.world_to_structure,
+    )
+```
+
+capability 是按方向审计的；有 reader 不等于能写同格式，有 file writer 也不等于结果
+是完全无损 round-trip。`lossy_round_trip=True` 表示存在已声明的有损投影。
 
 ## 3. 第一次转换
 
@@ -257,6 +276,30 @@ ctx.convert(source, "MCFunction", output, threads=2)  # 显式两个编码线程
 线程数只控制支持并行编码的阶段，不会让所有解析器和压缩步骤自动变成 N 线程。
 大型转换常受磁盘、LevelDB、压缩或内存带宽限制，超过 2 个编码线程不保证更快。
 
+### 流式内存与队列选项
+
+```python
+ctx.convert(
+    source,
+    "SchemV2",
+    output,
+    memory_budget_mib=450,
+    max_in_flight_tasks=0,
+    max_in_flight_chunks=0,
+    allow_temporary_spool=True,
+)
+```
+
+- `memory_budget_mib` 是原生流式队列和缓存的软预算，允许范围为 64～8192 MiB；它不是
+  操作系统级硬上限。
+- 两个 `max_in_flight_*` 为 `0` 时使用原生保守默认值；显式值允许范围为 0～4096。
+- `allow_temporary_spool=False` 会禁止需要受控临时文件的优化或兼容路径，某些超大或
+  必须回看输入的格式可能因此失败。
+
+若必须保证整个进程不超过 500 MiB，应在进程外同时使用项目的 `limited_runner`；不要
+把 `memory_budget_mib=500` 当成硬限制，因为动态库、runtime registry、Python 和压缩库
+本身也会占内存。
+
 SchemV1/V2 写入世界时会走直接 gzip 流路径，跳过完整 BlockData 临时文件；即使
 `Palette` 位于 `BlockData`/`Data` 后面，也只做不落盘的元数据扫描。超过 `uint16`
 palette 容量等特殊输入自动回退到索引临时文件路径。
@@ -264,7 +307,14 @@ palette 容量等特殊输入自动回退到索引临时文件路径。
 ## 6. `to_world()`：写入 Bedrock 世界
 
 ```python
-ctx.to_world(input_path, world_path, start=(0, -4, 0))
+ctx.to_world(
+    input_path,
+    world_path,
+    start=(0, -4, 0),
+    threads=0,
+    memory_budget_mib=450,
+    max_in_flight_chunks=0,
+)
 ```
 
 `start` 是 `(chunk_x, subchunk_y, chunk_z)`，不是方块坐标。默认 Y 为 `-4`，对应
@@ -445,6 +495,10 @@ python -c "import sys; print(sys.executable)"
 wheel 内 `.dll`/`.so`/`.dylib` 是否被安全软件删除。源码调试时还要检查
 `WATER_STRUCTURE_LIBRARY`。
 
+Windows 官方 wheel 使用 `ctypes` 加载稳定 C ABI 的 `water_structure_shared.dll`，
+不需要 CPython 专用 `.pyd`。因此同一个 `py3-none-win_amd64` wheel 可以用于所有满足
+`Requires-Python` 的 CPython 版本；把普通 DLL 仅改扩展名为 `.pyd` 不会增加兼容性。
+
 ### `No matching distribution found`
 
 PyPI 没有与当前平台标签匹配的 wheel。更新 pip 后重试；仍失败则需要使用对应平台的
@@ -462,18 +516,26 @@ V1 和 V2 共用扩展名但协议不同。输出必须显式选择 `SchemV1` �
 ## 12. API 速查
 
 ```python
-from water_structure import Context, Error, Progress, StructureInfo, version, abi_version
+from water_structure import (
+    Context, Error, FormatCapabilities, Progress, StructureInfo,
+    abi_version, formats, version,
+)
 
 version() -> str
 abi_version() -> int
+formats() -> tuple[FormatCapabilities, ...]
 
 Context(assets_directory=None)
 Context.close() -> None
 Context.format(path, *, streaming_world_import=False) -> str
 Context.inspect(path, *, streaming_world_import=False) -> StructureInfo
 Context.convert(input_path, target_format, output_path, *, threads=0,
-                clear_air=True, chunk_partition=False, progress=None) -> None
-Context.to_world(input_path, world_path, *, start=(0, -4, 0), progress=None) -> None
+                clear_air=True, chunk_partition=False, memory_budget_mib=450,
+                max_in_flight_tasks=0, max_in_flight_chunks=0,
+                allow_temporary_spool=True, progress=None) -> None
+Context.to_world(input_path, world_path, *, start=(0, -4, 0), threads=0,
+                 memory_budget_mib=450, max_in_flight_chunks=0,
+                 allow_temporary_spool=True, progress=None) -> None
 ```
 
 包内提供 `py.typed` 和 `.pyi`，类型检查器可以识别公开 API。
@@ -495,4 +557,28 @@ Windows 也可使用：
 ```
 
 构建脚本不指定线程数，由 xmake 使用默认并行度。生成的 wheel 在 `dist/python/`；
-先在干净虚拟环境中安装并运行 smoke test，再上传 PyPI。
+原生构建输出隔离在 `build/python-native/`，不会误选 `build/python-wheel/` 中的旧 DLL。
+脚本会校验二进制类型、wheel 平台标签、类型文件、原生库和 assets 是否确实被打包。
+
+交叉构建必须同时给出已经编译好的动态库和真实平台标签，例如 Android：
+
+```bash
+python python/build_wheel.py \
+  --skip-native-build \
+  --native-library build/android/arm64-v8a/release/libwater_structure_shared.so \
+  --platform-tag android_24_arm64_v8a \
+  --output dist/termux
+```
+
+`--platform-tag` 只改变标签，不会转换二进制或修复动态依赖。准备公开 Linux wheel 时应在
+目标 manylinux 容器内构建并用 `auditwheel` 检查/修复；macOS 发布前相应检查 deployment
+target、架构和外部 dylib。不要把普通 Ubuntu 构建直接重命名为 manylinux。
+
+先在干净虚拟环境中安装并运行 smoke test，再上传 PyPI。Windows 发布脚本使用独立的
+`dist/python-upload/`，只上传本次构建的 wheel，不会把 `dist/python/` 中所有历史版本
+一起交给 twine：
+
+```powershell
+.\python\publish.ps1 -TestPyPI  # 先验证 TestPyPI
+.\python\publish.ps1           # 确认后发布官方 PyPI
+```

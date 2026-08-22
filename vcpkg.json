@@ -1,6 +1,7 @@
 {
   "name": "water-structure",
   "version-string": "0.1.0",
+  "builtin-baseline": "45f9f39362a4c52e2b1fbe57b7e649db7f3d96d4",
   "description": "Streaming Minecraft structure format conversion library",
   "dependencies": [
     "nlohmann-json",
